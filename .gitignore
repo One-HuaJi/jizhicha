@@ -1,0 +1,34 @@
+# Flutter build outputs
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+Thumbs.db
+.DS_Store
+Desktop.ini
+
+# Rust build outputs
+huse-vpn-next/target/
+
+# Output artifacts (not in repo)
+jizhicha-output/
+*.zip
+*.apk
+*.log
+
+# Secrets / credentials
+*.key
+*.pem
+*.jks
+*.keystore
+
+# Local Flutter pub cache override
+pubspec.lock

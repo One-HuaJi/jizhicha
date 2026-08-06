@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "HUSE VPN Next",
+  "version": "0.1.0",
+  "identifier": "cn.huse.vpn.next",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "HUSE VPN Next",
+        "width": 520,
+        "height": 720,
+        "resizable": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "../../../com.two.huaji/campus-vpn/gui/src-tauri/icons/icon.ico"
+    ]
+  }
+}

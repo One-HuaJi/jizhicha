@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>校园 VPN 登录</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <button id="themeToggle" class="theme-toggle" title="切换深色/浅色模式" aria-label="切换深色/浅色模式">
+      <!-- 太阳图标 -->
+      <svg id="icon-sun" viewBox="0 0 24 24" style="display: none;">
+        <path d="M12 7a5 5 0 100 10 5 5 0 000-10zM2 13h2a1 1 0 100-2H2a1 1 0 100 2zm18 0h2a1 1 0 100-2h-2a1 1 0 100 2zM11 2v2a1 1 0 102 0V2a1 1 0 10-2 0zm0 18v2a1 1 0 102 0v-2a1 1 0 10-2 0zM5.99 4.58a1 1 0 10-1.41 1.41l1.41 1.41a1 1 0 101.41-1.41L5.99 4.58zm12.37 12.37a1 1 0 10-1.41 1.41l1.41 1.41a1 1 0 101.41-1.41l-1.41-1.41zm1.41-10.96a1 1 0 10-1.41-1.41l-1.41 1.41a1 1 0 101.41 1.41l1.41-1.41zM7.4 17.01a1 1 0 10-1.41-1.41l-1.41 1.41a1 1 0 101.41 1.41l1.41-1.41z"/>
+      </svg>
+      <!-- 月亮图标 -->
+      <svg id="icon-moon" viewBox="0 0 24 24">
+        <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+      </svg>
+    </button>
+
+    <main class="container">
+      <div class="brand">
+        <div class="brand-icon">
+          <svg viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8z"/></svg>
+        </div>
+        <h1>校园 VPN 登录</h1>
+        <p>湖南科技学院 · 教务网络接入</p>
+      </div>
+
+      <form id="loginForm">
+        <div class="form-group">
+          <label for="username">学号 / VPN 账号</label>
+          <input
+            type="text"
+            id="username"
+            name="username"
+            placeholder="请输入学号"
+            autocomplete="username"
+            required
+          />
+        </div>
+
+        <div class="form-group">
+          <label for="password">VPN 密码</label>
+          <input
+            type="password"
+            id="password"
+            name="password"
+            placeholder="请输入 VPN 密码"
+            autocomplete="current-password"
+            required
+          />
+          <p class="help-text">密码仅用于连接校园 VPN 网关，不会保存在本地或上传服务器。</p>
+        </div>
+
+        <div class="actions">
+          <button type="submit" class="btn btn-primary" id="submitBtn">
+            <span id="btnText">连接 VPN</span>
+          </button>
+          <button type="button" class="btn btn-outline" id="cancelBtn" disabled>
+            断开连接
+          </button>
+        </div>
+      </form>
+
+      <div id="status" class="status info" role="status" aria-live="polite"></div>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
