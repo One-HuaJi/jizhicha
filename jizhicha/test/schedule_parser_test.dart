@@ -1,7 +1,9 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:jizhicha/credential_store.dart';
 import 'package:jizhicha/main.dart';
+import 'package:jizhicha/schedule_cache_store.dart';
 
 // 验证课表解析，重点覆盖“课程名被 <span> 包裹”这一导致旧版返回空结果的 bug。
 void main() {
@@ -9,7 +11,8 @@ void main() {
       '<tr><th>节次/星期</th><th>周一</th><th>周二</th><th>周三</th><th>周四</th><th>周五</th><th>周六</th><th>周日</th></tr>';
 
   test('解析被 <span> 包裹课程名的课表（修复核心）', () {
-    final html = '''
+    final html =
+        '''
     <table id="timetable">
       $header
       <tr>
@@ -29,7 +32,8 @@ void main() {
   });
 
   test('兼容裸文本课程名（无 <span> 包裹，旧版可解析）', () {
-    final html = '''
+    final html =
+        '''
     <table id="timetable">
       $header
       <tr>
@@ -50,8 +54,12 @@ void main() {
 
   group('extractIframeSrc', () {
     test('双引号 src', () {
-      const html = '<iframe id="kb" src="/jsxsd/xskb/xskb_iframe.do?xnxq=2025-2026-2"></iframe>';
-      expect(extractIframeSrc(html), '/jsxsd/xskb/xskb_iframe.do?xnxq=2025-2026-2');
+      const html =
+          '<iframe id="kb" src="/jsxsd/xskb/xskb_iframe.do?xnxq=2025-2026-2"></iframe>';
+      expect(
+        extractIframeSrc(html),
+        '/jsxsd/xskb/xskb_iframe.do?xnxq=2025-2026-2',
+      );
     });
 
     test('单引号 src', () {
@@ -64,7 +72,10 @@ void main() {
     });
 
     test('忽略 javascript: 占位 iframe', () {
-      expect(extractIframeSrc("<iframe src='javascript:void(0)'></iframe>"), isNull);
+      expect(
+        extractIframeSrc("<iframe src='javascript:void(0)'></iframe>"),
+        isNull,
+      );
     });
   });
 
@@ -108,7 +119,8 @@ void main() {
 
     test('节次列 rowspan 合并：续行只有 7 格也能解析', () {
       // 第一行 8 格（含时间格）；第二行被 rowspan 合并，只有 7 格（无时间格）。
-      final html = '''
+      final html =
+          '''
       <table id="timetable">
         $header
         <tr>
@@ -133,7 +145,8 @@ void main() {
     });
 
     test('kbcontent1 不再被误杀（强智正经课程可能在此 class）', () {
-      final html = '''
+      final html =
+          '''
       <table id="timetable">
         $header
         <tr>
@@ -202,11 +215,26 @@ void main() {
 
     test('_weekSpansOverlap 多段相交判定', () {
       // 1-4,9-12 与 9-10 在 9-10 段相交 → true
-      expect(weekSpansOverlap(parseWeekSpans('1-4,9-12(周)'), parseWeekSpans('9-10(周)')), isTrue);
+      expect(
+        weekSpansOverlap(
+          parseWeekSpans('1-4,9-12(周)'),
+          parseWeekSpans('9-10(周)'),
+        ),
+        isTrue,
+      );
       // 1-4,9-12 与 5-6 完全不相交 → false
-      expect(weekSpansOverlap(parseWeekSpans('1-4,9-12(周)'), parseWeekSpans('5-6(周)')), isFalse);
+      expect(
+        weekSpansOverlap(
+          parseWeekSpans('1-4,9-12(周)'),
+          parseWeekSpans('5-6(周)'),
+        ),
+        isFalse,
+      );
       // 1-10 与 11-12 不相交 → false
-      expect(weekSpansOverlap(parseWeekSpans('1-10(周)'), parseWeekSpans('11-12(周)')), isFalse);
+      expect(
+        weekSpansOverlap(parseWeekSpans('1-10(周)'), parseWeekSpans('11-12(周)')),
+        isFalse,
+      );
     });
   });
 
@@ -264,7 +292,9 @@ void main() {
       final courses = parseScheduleHtml(html);
       final tue = courses.where((c) => c['day'] == '周二').toList();
       expect(tue.length, 3);
-      final week11 = tue.where((c) => weekInWeeks(c['weeks'] ?? '', 11)).toList();
+      final week11 = tue
+          .where((c) => weekInWeeks(c['weeks'] ?? '', 11))
+          .toList();
       expect(week11.length, 1);
       expect(week11.first['name'], '形势与政策（四）');
     });
@@ -289,7 +319,9 @@ void main() {
         {'name': '高等数学', 'weeks': '1-10(周)'},
         {'name': '形势与政策', 'weeks': '11-12(周)'},
       ];
-      final week11 = courses.where((c) => weekInWeeks(c['weeks']!, 11)).toList();
+      final week11 = courses
+          .where((c) => weekInWeeks(c['weeks']!, 11))
+          .toList();
       // 第11周不应再显示 1-10 周的高数（这是用户报告的 bug）
       expect(week11.any((c) => c['name'] == '高等数学'), isFalse);
       expect(week11.any((c) => c['name'] == '形势与政策'), isTrue);
@@ -310,45 +342,58 @@ void main() {
         expect(c['weeks'], isNotEmpty, reason: '课程 ${c['name']} 周次不应为空');
       }
       // 教师也应被解析出来（来自隐藏详情卡，单引号）
-      final withTeacher = courses.where((c) => (c['teacher'] ?? '').isNotEmpty).length;
+      final withTeacher = courses
+          .where((c) => (c['teacher'] ?? '').isNotEmpty)
+          .length;
       expect(withTeacher, greaterThan(0), reason: '至少应解析出部分教师');
     }, skip: html == null ? '本地无真实导出文件' : false);
 
     test('真实文件按周筛选：第11周不应显示 1-10 周的高数', () {
       if (html == null) return;
       final courses = parseScheduleHtml(html);
-      final week11 = courses.where((c) => weekInWeeks(c['weeks'] ?? '', 11)).toList();
+      final week11 = courses
+          .where((c) => weekInWeeks(c['weeks'] ?? '', 11))
+          .toList();
       // 高等数学D（二）实际周次为 1-10 周，第11周必须被过滤掉
-      expect(week11.any((c) => (c['name'] ?? '').contains('高等数学')), isFalse,
-          reason: '第11周不应显示 1-10 周的高数');
+      expect(
+        week11.any((c) => (c['name'] ?? '').contains('高等数学')),
+        isFalse,
+        reason: '第11周不应显示 1-10 周的高数',
+      );
       // 形势与政策（四）11-12 周在第11周应保留
-      expect(week11.any((c) => (c['name'] ?? '').contains('形势与政策')), isTrue,
-          reason: '第11周应保留 11-12 周的形势与政策');
+      expect(
+        week11.any((c) => (c['name'] ?? '').contains('形势与政策')),
+        isTrue,
+        reason: '第11周应保留 11-12 周的形势与政策',
+      );
     }, skip: html == null ? '本地无真实导出文件' : false);
   });
 
   group('体测评分（2014 标准）', () {
     test('bmiScore 男：正常/低体重/超重/肥胖', () {
       expect(bmiScore(20.5, true), 100);
-      expect(bmiScore(17.0, true), 80);   // 低体重
-      expect(bmiScore(25.0, true), 80);   // 超重
-      expect(bmiScore(30.0, true), 60);   // 肥胖
+      expect(bmiScore(17.0, true), 80); // 低体重
+      expect(bmiScore(25.0, true), 80); // 超重
+      expect(bmiScore(30.0, true), 60); // 肥胖
     });
     test('bmiScore 女：正常/低体重/超重/肥胖', () {
       expect(bmiScore(20.0, false), 100);
-      expect(bmiScore(16.5, false), 80);  // 低体重
-      expect(bmiScore(26.0, false), 80);  // 超重
-      expect(bmiScore(29.0, false), 60);  // 肥胖
+      expect(bmiScore(16.5, false), 80); // 低体重
+      expect(bmiScore(26.0, false), 80); // 超重
+      expect(bmiScore(29.0, false), 60); // 肥胖
     });
 
     test('fitScore 越高越好：肺活量男大一大二边界值', () {
       final t = fitHigher['M12_lung']!;
-      expect(fitScore(t, 5040, true), 100);  // 满分阈值
-      expect(fitScore(t, 4800, true), 90);   // 90 分阈值
-      expect(fitScore(t, 3100, true), 60);   // 60 分阈值
-      expect(fitScore(t, 2300, true), 10);   // 最低分阈值
-      expect(fitScore(t, 9999, true), 100);  // 超过满分取满分
-      expect(fitScore(t, 4860, true), closeTo(92.5, 0.001)); // 区间内插值：4920→95,4800→90 的中点
+      expect(fitScore(t, 5040, true), 100); // 满分阈值
+      expect(fitScore(t, 4800, true), 90); // 90 分阈值
+      expect(fitScore(t, 3100, true), 60); // 60 分阈值
+      expect(fitScore(t, 2300, true), 10); // 最低分阈值
+      expect(fitScore(t, 9999, true), 100); // 超过满分取满分
+      expect(
+        fitScore(t, 4860, true),
+        closeTo(92.5, 0.001),
+      ); // 区间内插值：4920→95,4800→90 的中点
     });
 
     test('fitScore 越低越好：50米男大一大二边界值', () {
@@ -356,7 +401,10 @@ void main() {
       expect(fitScore(t, 6.7, false), 100);
       expect(fitScore(t, 9.1, false), 60);
       expect(fitScore(t, 10.1, false), 10);
-      expect(fitScore(t, 6.85, false), closeTo(92.5, 0.001)); // 6.8→95,6.9→90 之间
+      expect(
+        fitScore(t, 6.85, false),
+        closeTo(92.5, 0.001),
+      ); // 6.8→95,6.9→90 之间
     });
 
     test('满分男大一大二：各项取满分，总分为 100', () {
@@ -373,13 +421,13 @@ void main() {
       final t = fitHigher['M12_pu']!;
       expect(fitScore(t, 19, true), 100);
       expect(fitScore(t, 15, true), 80);
-      expect(fitScore(t, 14, true), 76);   // 修复前缺这档
+      expect(fitScore(t, 14, true), 76); // 修复前缺这档
       expect(fitScore(t, 5, true), 10);
     });
     test('男生引体向上 M34 表存在且 20 次 = 100 分', () {
       final t = fitHigher['M34_pu']!;
       expect(fitScore(t, 20, true), 100);
-      expect(fitScore(t, 15, true), 76);   // 修复前缺这档
+      expect(fitScore(t, 15, true), 76); // 修复前缺这档
     });
     test('女生 1 分钟仰卧起坐 F12/F34 表存在', () {
       expect(fitHigher['F12_pu'], isNotNull);
@@ -465,6 +513,325 @@ void main() {
       expect(scoreLevel(59), '不及格');
       expect(scoreLevel(0), '不及格');
       expect(scoreLevel(null), '—');
+    });
+  });
+
+  // ==================== 成绩缓存：按学期增量合并 ====================
+  test('只替换成功返回的学期，失败学期保留旧成绩', () {
+    final merged = mergeGradesByTerms(
+      previous: [
+        {'term': '2025-2026-2', 'course': '旧数学', 'grade': '80'},
+        {'term': '2025-2026-1', 'course': '英语', 'grade': '90'},
+      ],
+      fetched: [
+        {'term': '2025-2026-2', 'course': '新数学', 'grade': '95'},
+      ],
+      replacedTerms: const ['2025-2026-2'],
+    );
+
+    expect(merged, [
+      {'term': '2025-2026-1', 'course': '英语', 'grade': '90'},
+      {'term': '2025-2026-2', 'course': '新数学', 'grade': '95'},
+    ]);
+  });
+
+  test('成功学期返回空成绩时会清除该学期旧记录', () {
+    final merged = mergeGradesByTerms(
+      previous: [
+        {'term': '2025-2026-2', 'course': '已撤销课程', 'grade': '80'},
+        {'term': '2025-2026-1', 'course': '英语', 'grade': '90'},
+      ],
+      fetched: const [],
+      replacedTerms: const ['2025-2026-2'],
+    );
+
+    expect(merged, [
+      {'term': '2025-2026-1', 'course': '英语', 'grade': '90'},
+    ]);
+  });
+
+  group('教务强制改密页面解析与密码校验', () {
+    test('解析官网身份核验页并确认返回账号完全一致', () {
+      const html = '''
+      <form id="Form1">
+        <input name="account" value="202400000000" readonly>
+        <input name="accounttype" value="2" type="hidden">
+        <input name="sfzjh" type="text">
+      </form>
+      ''';
+      final result = parsePasswordRecoveryAccountPage(
+        html,
+        expectedStudentId: '202400000000',
+      );
+      expect(result.studentId, '202400000000');
+      expect(result.accountType, '2');
+    });
+
+    test('身份核验页账号不一致时立即停止', () {
+      const html = '''
+      <form><input name="account" value="other"><input name="sfzjh"></form>
+      ''';
+      expect(
+        () => parsePasswordRecoveryAccountPage(
+          html,
+          expectedStudentId: '202400000000',
+        ),
+        throwsA(contains('账号与输入账号不一致')),
+      );
+    });
+
+    test('身份核验成功页优先解析表单，不被页面提示脚本误判', () {
+      const html = '''
+      <script>alert("请输入正确的身份证号");</script>
+      <form id="Form1">
+        <input name="account" value="202400000000" readonly>
+        <input name="sfzjh" type="text">
+      </form>
+      ''';
+      final result = parsePasswordRecoveryAccountPage(
+        html,
+        expectedStudentId: '202400000000',
+      );
+      expect(result.studentId, '202400000000');
+    });
+
+    test('未录入学号使用独立的账号错误提示', () {
+      const html = '<script>alert("用户名或密码错误！");</script>';
+      expect(
+        () => parsePasswordRecoveryAccountPage(
+          html,
+          expectedStudentId: '202400000000',
+        ),
+        throwsA(equals(passwordRecoveryStudentIdError)),
+      );
+    });
+
+    test('官网错误的身份证号提示也统一为学号错误', () {
+      const html = '<script>alert("请输入正确的身份证号");</script>';
+      expect(
+        () => parsePasswordRecoveryAccountPage(
+          html,
+          expectedStudentId: '202400000000',
+        ),
+        throwsA(equals(passwordRecoveryStudentIdError)),
+      );
+    });
+
+    test('兼容官网布尔/字符串 JSON 与成功页，同时拒绝未知响应', () {
+      final success = parsePasswordRecoveryResetResponse(
+        '{"success":true,"message":"密码已重置为身份证号码的后六位"}',
+      );
+      expect(success.success, isTrue);
+      expect(success.message, contains('后六位'));
+
+      final stringSuccess = parsePasswordRecoveryResetResponse(
+        '{"success":"true","msg":"密码重置成功"}',
+      );
+      expect(stringSuccess.success, isTrue);
+      expect(stringSuccess.message, '密码重置成功');
+
+      final htmlSuccess = parsePasswordRecoveryResetResponse(
+        '<html><body><div>密码已重置为身份证号码的后六位</div></body></html>',
+      );
+      expect(htmlSuccess.success, isTrue);
+
+      final alertSuccess = parsePasswordRecoveryResetResponse(
+        '<script>alert("密码重置成功");</script>',
+      );
+      expect(alertSuccess.success, isTrue);
+
+      final failure = parsePasswordRecoveryResetResponse(
+        '{"success":false,"message":"身份证件号错误"}',
+      );
+      expect(failure.success, isFalse);
+      expect(failure.message, '身份证件号错误');
+
+      final instructionalForm = parsePasswordRecoveryResetResponse('''
+        <form><input name="sfzjh"><p>提交后密码将重置为身份证后六位</p></form>
+      ''');
+      expect(instructionalForm.success, isFalse);
+
+      expect(parsePasswordRecoveryResetResponse('未知内容').success, isFalse);
+    });
+
+    test('校园内网探测必须识别真实教务页面特征', () {
+      expect(
+        isExpectedJwxtProbeResponse(
+          200,
+          '<form action="/jsxsd/xk/LoginToXk"><input name="RANDOMCODE"></form>',
+        ),
+        isTrue,
+      );
+      expect(
+        isExpectedJwxtProbeResponse(200, '<html>任意代理错误页面</html>'),
+        isFalse,
+      );
+      expect(isExpectedJwxtProbeResponse(502, '教务系统'), isFalse);
+      expect(isExpectedJwxtProbeResponse(200, ''), isFalse);
+    });
+
+    test('按中文标签动态识别四个字段及隐藏参数', () {
+      const html = r'''
+      <form action="/jsxsd/grsz/grsz_xgmm_save.do" method="post">
+        <input type="hidden" name="token" value="safe-token">
+        <input type="text" name="account" value="202400000000" readonly>
+        <table>
+          <tr><td>旧密码</td><td><input type="password" name="oldPwd"></td></tr>
+          <tr><td>新密码</td><td><input type="password" name="newPwd"></td></tr>
+          <tr><td>确认新密码</td><td><input type="password" name="confirmPwd"></td></tr>
+          <tr><td>新密码提示</td><td><input type="text" name="pwdHint"></td></tr>
+        </table>
+      </form>
+      ''';
+      final form = parseEducationPasswordChangeForm(html);
+      expect(form, isNotNull);
+      expect(form!.action, '/jsxsd/grsz/grsz_xgmm_save.do');
+      expect(form.oldPasswordField, 'oldPwd');
+      expect(form.newPasswordField, 'newPwd');
+      expect(form.confirmPasswordField, 'confirmPwd');
+      expect(form.passwordHintField, 'pwdHint');
+      expect(form.hiddenFields, {
+        'token': 'safe-token',
+        'account': '202400000000',
+      });
+    });
+
+    test('无中文标签时按三个密码框顺序安全回退', () {
+      const html = '''
+      <form action="xgmm_save.do">
+        <input type="password" name="p1">
+        <input type="password" name="p2">
+        <input type="password" name="p3">
+        <input type="text" name="hint">
+      </form>
+      ''';
+      final form = parseEducationPasswordChangeForm(html);
+      expect(form, isNotNull);
+      expect(form!.oldPasswordField, 'p1');
+      expect(form.newPasswordField, 'p2');
+      expect(form.confirmPasswordField, 'p3');
+      expect(form.passwordHintField, 'hint');
+    });
+
+    test('form action 为空时从官网内联脚本提取改密地址', () {
+      const html = r'''
+      <form action="#">
+        <table>
+          <tr><td>旧密码</td><td><input type="password" name="p1"></td></tr>
+          <tr><td>新密码</td><td><input type="password" name="p2"></td></tr>
+          <tr><td>确认新密码</td><td><input type="password" name="p3"></td></tr>
+          <tr><td>新密码提示</td><td><input type="text" name="hint"></td></tr>
+        </table>
+      </form>
+      <script>$.ajax({url:'/jsxsd/grsz/grsz_xgmm_save.do'});</script>
+      ''';
+      expect(
+        parseEducationPasswordChangeForm(html)!.action,
+        '/jsxsd/grsz/grsz_xgmm_save.do',
+      );
+    });
+
+    test('不完整页面拒绝提交，避免把密码发到错误字段', () {
+      expect(
+        parseEducationPasswordChangeForm(
+          '<form action="xgmm.do"><input type="password" name="only"></form>',
+        ),
+        isNull,
+      );
+    });
+
+    test('最终密码必须至少8位且同时包含字母和数字', () {
+      expect(isValidFinalEducationPassword('abc12345'), isTrue);
+      expect(isEducationPasswordSafeToStore('abc12345'), isTrue);
+      expect(isValidFinalEducationPassword('Abcdefg8!'), isTrue);
+      expect(isValidFinalEducationPassword('12345678'), isFalse);
+      expect(isValidFinalEducationPassword('abcdefgh'), isFalse);
+      expect(isValidFinalEducationPassword('a1b2c3'), isFalse);
+      expect(isEducationPasswordSafeToStore('123456'), isFalse);
+      expect(isEducationPasswordSafeToStore('12345X'), isFalse);
+    });
+
+    test('拒绝不一致、复用临时密码和泄露完整新密码的提示', () {
+      expect(
+        educationPasswordValidationError(
+          oldPassword: '123456',
+          newPassword: 'abc12345',
+          confirmPassword: 'abc12346',
+          passwordHint: '常用组合',
+        ),
+        contains('不一致'),
+      );
+      expect(
+        educationPasswordValidationError(
+          oldPassword: 'abc12345',
+          newPassword: 'abc12345',
+          confirmPassword: 'abc12345',
+          passwordHint: '常用组合',
+        ),
+        contains('不能与'),
+      );
+      expect(
+        educationPasswordValidationError(
+          oldPassword: '123456',
+          newPassword: 'abc12345',
+          confirmPassword: 'abc12345',
+          passwordHint: '我的abc12345',
+        ),
+        contains('不能包含'),
+      );
+    });
+
+    test('识别官网脚本 alert 与 showMsg 错误', () {
+      expect(
+        extractJwxtAlertMessage(
+          "<script>alert('验证码错误！');window.location='/'</script>",
+        ),
+        '验证码错误！',
+      );
+      expect(
+        extractJwxtAlertMessage('<font id="showMsg"> 密码错误 </font>'),
+        '密码错误',
+      );
+    });
+
+    test('识别改密成功页面的 showMsg', () {
+      final result = parseEducationPasswordChangeResponse(
+        statusCode: 200,
+        location: '',
+        raw: '<font id="showMsg">密码修改成功</font>',
+      );
+      expect(result.success, isTrue);
+    });
+
+    test('识别改密成功页面的脚本跳转', () {
+      final result = parseEducationPasswordChangeResponse(
+        statusCode: 200,
+        location: '',
+        raw:
+            r'''<script>window.location.href='/jsxsd/framework/xsmain';</script>''',
+      );
+      expect(result.success, isTrue);
+    });
+
+    test('302 回到改密页但带成功提示时仍认定成功', () {
+      final result = parseEducationPasswordChangeResponse(
+        statusCode: 302,
+        location: '/jsxsd/grsz/grsz_xgmm_beg.do',
+        raw: '<script>alert("密码修改成功");</script>',
+      );
+      expect(result.success, isTrue);
+    });
+
+    test('源码中的完整信息校验提示不能伪装成成功', () {
+      final result = parseEducationPasswordChangeResponse(
+        statusCode: 200,
+        location: '',
+        raw: '''
+        <form><input name="pwdts"></form>
+        <script>function check(){alert("请输入完整信息!");}</script>
+        ''',
+      );
+      expect(result.success, isFalse);
     });
   });
 }

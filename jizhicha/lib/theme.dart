@@ -39,7 +39,7 @@ class ThemeService {
         return '$localAppData${Platform.pathSeparator}jizhicha';
       }
     }
-    // Android / iOS / Linux / macOS 走 path_provider 沙盒目录，
+    // Android / Linux 走 path_provider 沙盒目录，
     // 否则会落到只读根目录而抛 FileSystemException。
     final docs = await getApplicationDocumentsDirectory();
     return docs.path;

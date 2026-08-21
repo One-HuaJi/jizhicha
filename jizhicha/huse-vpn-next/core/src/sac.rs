@@ -294,29 +294,44 @@ impl SacClient {
 /// virtual-adapter setup. The ticket is kept in memory and is never included
 /// in an error string or diagnostic payload.
 pub async fn notify_safeupdate(address: SocketAddr, ticket: &[u8; 32]) -> Result<()> {
-    let url = format!(
-        "https://{}/extra/safeupdate.php?ticket={}",
+    let request = format!(
+        "GET /extra/safeupdate.php?ticket={} HTTP/1.1\r\nHost: {}\r\nUser-Agent: HUSE-VPN-Next/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        hex::encode(ticket),
         address,
-        hex::encode(ticket)
     );
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| {
-            HuseVpnError::Authentication("failed to prepare Gateway session notification".into())
+    let response = tokio::time::timeout(Duration::from_secs(10), async {
+        // Reuse the Gateway-compatible TLS implementation so this auxiliary
+        // HTTPS request is protected by the same SPKI pin as SAC and NC.
+        let mut tls = RawTlsClient::connect(address).await?;
+        tls.write(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+            let record = tls.read_record().await?;
+            response.extend_from_slice(&record);
+            if response.len() > 64 * 1024 {
+                return Err(HuseVpnError::Protocol(
+                    "Gateway session notification headers were too large".into(),
+                ));
+            }
+        }
+        Ok::<_, HuseVpnError>(response)
+    })
+    .await
+    .map_err(|_| HuseVpnError::Authentication("Gateway session notification timed out".into()))??;
+    let status = String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| {
+            HuseVpnError::Protocol("Gateway session notification returned invalid HTTP".into())
         })?;
-    let response = client
-        .get(url)
-        .header(reqwest::header::USER_AGENT, "HUSE-VPN-Next/0.1")
-        .send()
-        .await
-        .map_err(|_| HuseVpnError::Authentication("Gateway session notification failed".into()))?;
-    eprintln!(
-        "HUSE VPN session notification response: HTTP {}",
-        response.status().as_u16()
-    );
+    if !(200..400).contains(&status) {
+        return Err(HuseVpnError::Authentication(format!(
+            "Gateway session notification returned HTTP {status}"
+        )));
+    }
+    eprintln!("HUSE VPN session notification response: HTTP {}", status);
     Ok(())
 }
 
