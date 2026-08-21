@@ -7,9 +7,33 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use x509_cert::der::Decode;
+use x509_cert::der::{Decode, Encode};
 
 const V12: [u8; 2] = [0x03, 0x03];
+const MAX_SERVER_HANDSHAKE_BYTES: usize = 1024 * 1024;
+
+/// SHA-256 pins of the DER-encoded SubjectPublicKeyInfo accepted for the
+/// school's fixed Gateway endpoint. The current key was independently read
+/// from `222.243.204.22:6443` on 2026-08-21. Keep the previous pin beside a
+/// replacement during a planned school-side key rotation, then remove it
+/// after the transition window.
+const GATEWAY_SPKI_SHA256_PINS: [[u8; 32]; 1] = [[
+    0x3e, 0xd8, 0x79, 0xfb, 0x63, 0x68, 0x6c, 0x3d, 0x14, 0xae, 0x54, 0x97, 0xc7, 0x0d, 0x68, 0x51,
+    0x97, 0x93, 0x44, 0xbd, 0xe4, 0x2b, 0x5b, 0x67, 0xa1, 0x16, 0x32, 0x78, 0xf8, 0xdf, 0x40, 0x13,
+]];
+
+fn verify_gateway_spki_pin(spki_der: &[u8]) -> Result<()> {
+    let digest = Sha256::digest(spki_der);
+    let mut actual = [0u8; 32];
+    actual.copy_from_slice(&digest);
+    if GATEWAY_SPKI_SHA256_PINS.contains(&actual) {
+        return Ok(());
+    }
+    Err(HuseVpnError::Tls(format!(
+        "Gateway certificate SPKI pin mismatch (received {})",
+        hex::encode(actual)
+    )))
+}
 
 fn p_sha256(secret: &[u8], seed: &[u8], len: usize) -> Vec<u8> {
     let mut out = Vec::new();
@@ -466,6 +490,7 @@ async fn read_sh(stream: &mut TcpStream) -> Result<([u8; 32], RsaPublicKey, Vec<
     let mut sr = [0u8; 32];
     let mut rsa = None;
     let mut ems = false;
+    let mut saw_server_hello = false;
     let mut hs = Vec::new();
     let mut p = 0;
     loop {
@@ -477,6 +502,11 @@ async fn read_sh(stream: &mut TcpStream) -> Result<([u8; 32], RsaPublicKey, Vec<
             return Err(HuseVpnError::Tls("EOF".into()));
         }
         buf.extend_from_slice(&t[..n]);
+        if buf.len() > MAX_SERVER_HANDSHAKE_BYTES {
+            return Err(HuseVpnError::Tls(
+                "Gateway TLS handshake exceeded the safety limit".into(),
+            ));
+        }
         while p + 5 <= buf.len() {
             if buf[p] != 0x16 {
                 p += 5 + u16::from_be_bytes([buf[p + 3], buf[p + 4]]) as usize;
@@ -500,6 +530,9 @@ async fn read_sh(stream: &mut TcpStream) -> Result<([u8; 32], RsaPublicKey, Vec<
                 }
                 match ty {
                     0x02 => {
+                        if hl < 38 {
+                            return Err(HuseVpnError::Tls("truncated ServerHello".into()));
+                        }
                         sr.copy_from_slice(&buf[b + 2..b + 2 + 32]);
                         let s = 2 + 32;
                         let sl = buf[b + s] as usize;
@@ -531,18 +564,40 @@ async fn read_sh(stream: &mut TcpStream) -> Result<([u8; 32], RsaPublicKey, Vec<
                                 xo += el;
                             }
                         }
+                        saw_server_hello = true;
                     }
                     0x0b => {
+                        if hl < 6 {
+                            return Err(HuseVpnError::Tls(
+                                "truncated Gateway certificate message".into(),
+                            ));
+                        }
                         let mut cq = b + 3;
                         let cl = ((buf[cq] as usize) << 16)
                             | ((buf[cq + 1] as usize) << 8)
                             | (buf[cq + 2] as usize);
                         cq += 3;
+                        if cl == 0 || cq + cl > b + hl {
+                            return Err(HuseVpnError::Tls(
+                                "invalid Gateway certificate length".into(),
+                            ));
+                        }
                         rsa = Some(parse_rsa(&buf[cq..cq + cl])?);
                     }
                     0x0e => {
-                        if let Some(r) = rsa {
-                            return Ok((sr, r, hs, ems));
+                        if saw_server_hello {
+                            if let Some(r) = rsa {
+                                return Ok((sr, r, hs, ems));
+                            }
+                        }
+                        if rsa.is_some() {
+                            return Err(HuseVpnError::Tls(
+                                "Gateway sent a certificate without ServerHello".into(),
+                            ));
+                        } else {
+                            return Err(HuseVpnError::Tls(
+                                "Gateway did not provide a certificate".into(),
+                            ));
                         }
                     }
                     _ => {}
@@ -557,11 +612,12 @@ async fn read_sh(stream: &mut TcpStream) -> Result<([u8; 32], RsaPublicKey, Vec<
 fn parse_rsa(der: &[u8]) -> Result<RsaPublicKey> {
     use x509_cert::Certificate;
     let c = Certificate::from_der(der).map_err(|e| HuseVpnError::Tls(format!("cert {e}")))?;
-    let spki_bytes = c
-        .tbs_certificate()
-        .subject_public_key_info()
-        .subject_public_key
-        .raw_bytes();
+    let spki = c.tbs_certificate().subject_public_key_info();
+    let spki_der = spki
+        .to_der()
+        .map_err(|e| HuseVpnError::Tls(format!("Gateway SPKI encoding failed: {e}")))?;
+    verify_gateway_spki_pin(&spki_der)?;
+    let spki_bytes = spki.subject_public_key.raw_bytes();
     // Use PKCS1 format (standard for BIT STRING content)
     RsaPublicKey::from_pkcs1_der(spki_bytes).map_err(|e| HuseVpnError::Tls(format!("rsa {e}")))
 }
@@ -678,6 +734,20 @@ impl AesCbc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+
+    #[test]
+    fn accepts_only_the_pinned_gateway_spki() {
+        let spki = BASE64
+            .decode("MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCxiIN/pAoIjnB9DjbRsQEQuNYbs/C51yzemJBXONrSNMIUINCG8ex7oPyYw+zGSwH/5sAF3eCxgkBQxHl0xd55+p/IBXZmJbkNYlEegdnWqA0NxDhMoTzq5uHbXz7FGV39ZJHw9CLxRE5Uq0NzlqsrdZCDHHed1fZQCngp6HPC/wIDAQAB")
+            .unwrap();
+        verify_gateway_spki_pin(&spki).unwrap();
+
+        let mut substituted = spki;
+        *substituted.last_mut().unwrap() ^= 1;
+        assert!(verify_gateway_spki_pin(&substituted).is_err());
+    }
 
     #[test]
     fn prf_matches_python() {

@@ -8,7 +8,10 @@ success shortcut, and no hard-coded credentials.
 
 The credential path is the native SAC exchange used by `gwsession.dll`, not
 the HTML login page. Each SAC request uses a fresh Gateway-compatible TLS
-connection; the login response yields the NC ticket directly.
+connection; the login response yields the NC ticket directly. The Gateway
+certificate is authenticated with an application-pinned SHA-256 SPKI digest;
+a mismatch aborts before credentials are submitted, and certificate checks
+must never be disabled as a workaround.
 
 Connection stages:
 

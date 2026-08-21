@@ -3,6 +3,32 @@ import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
 
+/// 用本次成功返回的学期成绩替换本地对应学期，同时保留其他学期。
+///
+/// [replacedTerms] 只应包含服务器返回了有效成绩表的学期；请求失败的学期
+/// 不在集合中，因此它们的旧缓存会继续保留。
+List<Map<String, String>> mergeGradesByTerms({
+  required Iterable<Map<String, String>> previous,
+  required Iterable<Map<String, String>> fetched,
+  required Iterable<String> replacedTerms,
+}) {
+  final terms = replacedTerms
+      .map((term) => term.trim())
+      .where((term) => term.isNotEmpty)
+      .toSet();
+  final merged = <Map<String, String>>[];
+  for (final grade in previous) {
+    final term = (grade['term'] ?? '').trim();
+    if (!terms.contains(term)) {
+      merged.add(Map<String, String>.from(grade));
+    }
+  }
+  for (final grade in fetched) {
+    merged.add(Map<String, String>.from(grade));
+  }
+  return merged;
+}
+
 /// 一个账号最近一次成功获取的学期课表。
 ///
 /// 这份缓存只保存课表字段、学号和保存时间；账号密码仍只保存在
@@ -69,7 +95,8 @@ class ScheduleCacheStore {
     // 与 UserDataCacheStore / AppSettings 走同一套平台分支，
     // 避免 Android 上落到只读根目录。
     if (Platform.isWindows) {
-      final base = Platform.environment['APPDATA'] ??
+      final base =
+          Platform.environment['APPDATA'] ??
           Platform.environment['HOME'] ??
           Directory.current.path;
       final folder = Directory(base);
@@ -154,12 +181,13 @@ class ScheduleCacheStore {
     await _writeRoot(root);
   }
 
-  static Future<void> clearAll() async {
+  static Future<bool> clearAll() async {
     try {
       final file = await _file();
       if (await file.exists()) await file.delete();
+      return !await file.exists();
     } catch (_) {
-      // 删除本地账户操作仍会完成安全存储的清理；下次查询会覆盖残留缓存。
+      return false;
     }
   }
 }
@@ -226,12 +254,13 @@ class UserDataCacheStore {
     final Directory root;
     if (Platform.isWindows) {
       // Windows 沿用 %APPDATA% 路径，保持现有用户数据兼容。
-      final base = Platform.environment['APPDATA'] ??
+      final base =
+          Platform.environment['APPDATA'] ??
           Platform.environment['HOME'] ??
           Directory.current.path;
       root = Directory('$base${Platform.pathSeparator}$_rootFolderName');
     } else {
-      // Android / iOS / Linux / macOS 必须写到应用沙盒目录，
+      // Android / Linux 必须写到应用沙盒目录，
       // 否则会落到只读根目录而报 FileSystemException(Read-only)。
       final dir = await getApplicationDocumentsDirectory();
       root = Directory('${dir.path}${Platform.pathSeparator}$_rootFolderName');
@@ -371,13 +400,15 @@ class UserDataCacheStore {
     }
   }
 
-  /// 合并保存本次成功获取的数据。某一学期偶发失败时，会保留此前已经存在的
-  /// 静态 HTML，避免一次不完整同步把旧课表删掉。
+  /// 合并保存本次成功获取的数据。默认保留已有课表；传入
+  /// [replaceSchedules] 时，先写入新的最新学期，再清理旧学期文件。
   static Future<void> saveSnapshot({
     required String studentId,
     required Map<String, String> scheduleHtmlByTerm,
     required List<Map<String, String>> grades,
     required bool replaceGrades,
+    Iterable<String> replaceGradeTerms = const [],
+    bool replaceSchedules = false,
   }) async {
     final normalized = studentId.trim();
     if (normalized.isEmpty) return;
@@ -401,6 +432,34 @@ class UserDataCacheStore {
       terms.add(term);
     }
 
+    // 新的同步策略只保留最新一期已经发布的课表。先把新文件写成功，
+    // 再删除其它旧学期，避免网络异常时把原本可离线查看的课表一并删掉。
+    if (replaceSchedules && scheduleHtmlByTerm.isNotEmpty) {
+      final keepTerms = scheduleHtmlByTerm.keys
+          .map((term) => term.trim())
+          .where((term) => term.isNotEmpty)
+          .toSet();
+      final staleFiles = <File>[];
+      await for (final entity in schedules.list()) {
+        if (entity is! File || !entity.path.endsWith('.html')) continue;
+        final name = entity.uri.pathSegments.isEmpty
+            ? ''
+            : entity.uri.pathSegments.last;
+        final stale = !keepTerms.any(
+          (term) => entity.path.endsWith('${_safeName(term)}.html'),
+        );
+        if (stale && name.isNotEmpty) staleFiles.add(entity);
+      }
+      for (final stale in staleFiles) {
+        try {
+          await stale.delete();
+        } catch (_) {}
+      }
+      terms
+        ..clear()
+        ..addAll(keepTerms);
+    }
+
     final gradesFile = File(
       '${account.path}${Platform.pathSeparator}$_gradesFileName',
     );
@@ -417,6 +476,15 @@ class UserDataCacheStore {
               .toList(growable: false),
         ),
       );
+      hasGrades = true;
+    } else if (replaceGradeTerms.isNotEmpty) {
+      final previousGrades = await loadGrades(normalized);
+      final mergedGrades = mergeGradesByTerms(
+        previous: previousGrades,
+        fetched: grades,
+        replacedTerms: replaceGradeTerms,
+      );
+      await _writeRecoverably(gradesFile, jsonEncode(mergedGrades));
       hasGrades = true;
     }
 
@@ -435,12 +503,13 @@ class UserDataCacheStore {
     );
   }
 
-  static Future<void> clearAll() async {
+  static Future<bool> clearAll() async {
     try {
       final root = await _root();
       if (await root.exists()) await root.delete(recursive: true);
+      return !await root.exists();
     } catch (_) {
-      // 删除账号时仍会继续清理安全存储和旧版课表缓存。
+      return false;
     }
   }
 }

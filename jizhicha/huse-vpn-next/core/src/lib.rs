@@ -2,7 +2,6 @@
 
 pub mod error;
 pub mod nc;
-pub mod portal;
 pub mod sac;
 pub mod tls;
 
@@ -13,4 +12,3 @@ pub mod tunnel;
 pub mod tunnel_android;
 
 pub use error::{HuseVpnError, Result};
-pub use portal::{PortalClient, PortalLogin};
