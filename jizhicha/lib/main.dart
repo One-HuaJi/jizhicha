@@ -15,7 +15,7 @@ import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
-import 'dart:async' show runZonedGuarded;
+import 'dart:async' show Timer, runZonedGuarded;
 import 'dart:io'
     show Directory, File, HttpClient, InternetAddress, Platform, Socket;
 
@@ -141,6 +141,107 @@ class _AppBootstrapPageState extends State<AppBootstrapPage> {
 
 // ==================== 网络核心（单例，Cookie共享） ====================
 enum GradeSyncScope { latest, all }
+
+enum SyncResource { schedule, grade }
+
+/// 手动课表/成绩查询共用的短冷却，避免用户连续点击导致教务系统重复
+/// 返回同一份页面或触发网关限流。冷却从请求开始计时，失败时也保留，
+/// 这样“重试”不会在几秒内形成请求风暴。
+class DataSyncCooldownController extends ChangeNotifier {
+  static const duration = Duration(seconds: 30);
+
+  DateTime? _scheduleUntil;
+  DateTime? _gradeUntil;
+  Timer? _timer;
+
+  DateTime? _untilFor(SyncResource resource) =>
+      resource == SyncResource.schedule ? _scheduleUntil : _gradeUntil;
+
+  Duration remaining(SyncResource resource, {DateTime? now}) {
+    final until = _untilFor(resource);
+    if (until == null) return Duration.zero;
+    final left = until.difference(now ?? DateTime.now());
+    return left.isNegative ? Duration.zero : left;
+  }
+
+  bool isCooling(SyncResource resource) => remaining(resource) > Duration.zero;
+
+  String remainingText(SyncResource resource) {
+    final seconds = remaining(resource).inSeconds.ceil();
+    return seconds <= 0 ? '' : '${seconds}s';
+  }
+
+  bool tryStartAll(Iterable<SyncResource> resources) {
+    final unique = resources.toSet();
+    if (unique.any(isCooling)) return false;
+    final until = DateTime.now().add(duration);
+    if (unique.contains(SyncResource.schedule)) _scheduleUntil = until;
+    if (unique.contains(SyncResource.grade)) _gradeUntil = until;
+    if (unique.isNotEmpty) {
+      _ensureTimer();
+      notifyListeners();
+    }
+    return true;
+  }
+
+  void _ensureTimer() {
+    _timer ??= Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!isCooling(SyncResource.schedule) && !isCooling(SyncResource.grade)) {
+        _timer?.cancel();
+        _timer = null;
+      }
+      notifyListeners();
+    });
+  }
+}
+
+final dataSyncCooldown = DataSyncCooldownController();
+
+/// 显示课表/成绩本次同步的 30 秒冷却状态。
+/// 页面本身监听 [dataSyncCooldown]，因此倒计时会在不重新进入页面的情况下
+/// 每秒刷新；没有冷却时不占用额外的布局空间。
+class _SyncCooldownIndicator extends StatelessWidget {
+  final SyncResource resource;
+
+  const _SyncCooldownIndicator({required this.resource});
+
+  @override
+  Widget build(BuildContext context) {
+    final remaining = dataSyncCooldown.remaining(resource);
+    if (remaining <= Duration.zero) return const SizedBox.shrink();
+    final seconds = remaining.inSeconds.ceil();
+    final totalMilliseconds =
+        DataSyncCooldownController.duration.inMilliseconds;
+    final progress = (1 - remaining.inMilliseconds / totalMilliseconds).clamp(
+      0.0,
+      1.0,
+    );
+    final label = resource == SyncResource.schedule ? '课表' : '成绩';
+    final colorScheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: '$label更新冷却中，还需 $seconds 秒',
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox.square(
+            dimension: 22,
+            child: CircularProgressIndicator(
+              value: progress,
+              strokeWidth: 3,
+              color: colorScheme.primary,
+              backgroundColor: colorScheme.surfaceContainerHighest,
+            ),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            '$label冷却 ${seconds}s',
+            style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 enum JwxtLoginStatus { success, passwordChangeRequired }
 
@@ -640,6 +741,7 @@ class JwxtClient {
   final CookieJar _cookieJar = CookieJar();
   late Dio _dio;
   bool isLoggedIn = false;
+  String? authenticatedStudentId;
   String? _kbjcmsidCache; // 缓存从表单动态读取的节次模式ID，避免每次查询重复 GET
   String? _vpnSourceAddress;
 
@@ -698,6 +800,7 @@ class JwxtClient {
     await _cookieJar.deleteAll();
     _kbjcmsidCache = null;
     isLoggedIn = false;
+    authenticatedStudentId = null;
   }
 
   /// FlClash 的 TUN 会接管未绑定源地址的 TCP 连接，即使 Windows 路由表
@@ -1146,6 +1249,7 @@ class JwxtClient {
       }
       if (lowerLoc.contains('framework') || lowerLoc.contains('xsmain')) {
         isLoggedIn = true;
+        authenticatedStudentId = id;
         return const JwxtLoginResult.success();
       }
     }
@@ -1169,6 +1273,7 @@ class JwxtClient {
         html.contains('学籍成绩') ||
         html.contains('framework')) {
       isLoggedIn = true;
+      authenticatedStudentId = id;
       return const JwxtLoginResult.success();
     }
     final plain = parse(html).body?.text.replaceAll(RegExp(r'\s+'), ' ').trim();
@@ -1810,6 +1915,8 @@ class OfflineSyncResult {
   final bool gradesUpdated;
   final bool schedulesUpdated;
   final bool schedulesSkipped;
+  final bool schedulesFetchedAll;
+  final bool gradesFetchedAll;
 
   const OfflineSyncResult({
     required this.savedTermCount,
@@ -1819,13 +1926,17 @@ class OfflineSyncResult {
     required this.gradesUpdated,
     required this.schedulesUpdated,
     required this.schedulesSkipped,
+    this.schedulesFetchedAll = false,
+    this.gradesFetchedAll = false,
   });
 }
 
 /// 教务认证成功后同步离线数据。
 ///
-/// 常规同步只查询最新可用学期成绩，避免每次登录都重新抓取全部旧成绩；
-/// 手动刷新成绩时传入 [GradeSyncScope.all]，才会查询所有配置学期。
+/// 首次认证会把所有配置学期中能成功返回的课表和成绩都写入本地；
+/// 已有本地快照后，普通登录只更新最新成绩，手动更新则可指定一个学期，
+/// 或通过 [GradeSyncScope.all] 查询全部成绩。课表首次全量抓取后不再删除
+/// 其它学期文件，指定学期更新也只替换对应缓存。
 /// 主页只读取这里写下来的本地静态文件，不会因为切换课表或成绩页面再次
 /// 访问校园网。
 Future<OfflineSyncResult> syncOfflineUserData({
@@ -1834,6 +1945,9 @@ Future<OfflineSyncResult> syncOfflineUserData({
   GradeSyncScope gradeSyncScope = GradeSyncScope.latest,
   bool syncSchedules = true,
   bool forceScheduleSync = false,
+  bool fetchAllSchedules = false,
+  String? scheduleTerm,
+  String? gradeTerm,
   bool syncGrades = true,
 }) async {
   final client = JwxtClient();
@@ -1841,15 +1955,55 @@ Future<OfflineSyncResult> syncOfflineUserData({
   final failedTerms = <String>[];
   final terms = AcademicCalendar.terms;
   final hadScheduleBefore = await _hasLocalSchedule(studentId);
+  final hadGradesBefore = await _hasLocalGrades(studentId);
+  final normalizedScheduleTerm = scheduleTerm?.trim();
+  final normalizedGradeTerm = gradeTerm?.trim();
   final shouldSyncSchedules =
-      syncSchedules && (forceScheduleSync || !hadScheduleBefore);
+      syncSchedules &&
+      (forceScheduleSync ||
+          fetchAllSchedules ||
+          normalizedScheduleTerm?.isNotEmpty == true ||
+          !hadScheduleBefore);
+  final schedulesFetchedAll =
+      shouldSyncSchedules &&
+      (fetchAllSchedules ||
+          (!hadScheduleBefore && normalizedScheduleTerm?.isNotEmpty != true));
+  final scheduleQueryTerms = normalizedScheduleTerm?.isNotEmpty == true
+      ? <String>[normalizedScheduleTerm!]
+      : terms;
+  final gradeQueryTerms = normalizedGradeTerm?.isNotEmpty == true
+      ? <String>[normalizedGradeTerm!]
+      : (gradeSyncScope == GradeSyncScope.all || !hadGradesBefore)
+      ? terms
+      : <String>[AcademicCalendar.latestAvailableTerm];
+  final gradesFetchedAll =
+      syncGrades &&
+      normalizedGradeTerm?.isNotEmpty != true &&
+      (gradeSyncScope == GradeSyncScope.all || !hadGradesBefore);
+
+  final resourcesToSync = <SyncResource>[
+    if (shouldSyncSchedules) SyncResource.schedule,
+    if (syncGrades) SyncResource.grade,
+  ];
+  if (!dataSyncCooldown.tryStartAll(resourcesToSync)) {
+    final blocked = resourcesToSync.firstWhere(
+      dataSyncCooldown.isCooling,
+      orElse: () => SyncResource.schedule,
+    );
+    final label = blocked == SyncResource.schedule ? '课表' : '成绩';
+    throw '$label更新冷却中，还需 ${dataSyncCooldown.remainingText(blocked)} 后重试';
+  }
 
   if (shouldSyncSchedules) {
-    // 只保存一个最新的、已经发布的学期。新学期可能已经出现在配置中，
-    // 但教务系统尚未发布课表，因此按新旧顺序逐个回退，直到拿到可解析课表。
-    for (var index = 0; index < terms.length; index++) {
-      final term = terms[index];
-      onProgress?.call('正在查找最新课表 ${index + 1}/${terms.length}：$term');
+    // 首次认证查询所有配置学期；普通/手动“最新”更新按新旧顺序回退，
+    // 新学期未发布时继续尝试第二新的已发布课表；指定学期只查那一学期。
+    for (var index = 0; index < scheduleQueryTerms.length; index++) {
+      final term = scheduleQueryTerms[index];
+      onProgress?.call(
+        schedulesFetchedAll
+            ? '正在获取课表 ${index + 1}/${scheduleQueryTerms.length}：$term'
+            : '正在查找最新课表：$term',
+      );
       try {
         final html = await client
             .fetchScheduleHtml(term)
@@ -1860,7 +2014,7 @@ Future<OfflineSyncResult> syncOfflineUserData({
           continue;
         }
         htmlByTerm[term] = html;
-        break;
+        if (!schedulesFetchedAll) break;
       } catch (_) {
         failedTerms.add(term);
       }
@@ -1869,11 +2023,13 @@ Future<OfflineSyncResult> syncOfflineUserData({
 
   GradeFetchResult gradeResult;
   if (syncGrades) {
-    final gradeTerms = gradeSyncScope == GradeSyncScope.all
-        ? terms
-        : <String>[AcademicCalendar.latestAvailableTerm];
+    final gradeTerms = gradeQueryTerms;
     onProgress?.call(
-      gradeSyncScope == GradeSyncScope.all ? '正在手动更新全部成绩…' : '正在更新最新学期成绩…',
+      gradesFetchedAll
+          ? '正在更新全部学期成绩…'
+          : normalizedGradeTerm?.isNotEmpty == true
+          ? '正在更新成绩：$normalizedGradeTerm…'
+          : '正在更新最新学期成绩…',
     );
     try {
       gradeResult = await client
@@ -1894,7 +2050,8 @@ Future<OfflineSyncResult> syncOfflineUserData({
   }
   if (htmlByTerm.isEmpty &&
       gradeResult.successfulTerms.isEmpty &&
-      !hadScheduleBefore) {
+      !hadScheduleBefore &&
+      !hadGradesBefore) {
     throw '教务认证成功，但未能获取可保存的课表或成绩，请稍后重新连接更新';
   }
 
@@ -1905,12 +2062,9 @@ Future<OfflineSyncResult> syncOfflineUserData({
     studentId: studentId,
     scheduleHtmlByTerm: htmlByTerm,
     grades: gradeResult.grades,
-    replaceGrades:
-        syncGrades &&
-        gradeSyncScope == GradeSyncScope.all &&
-        gradeResult.isComplete,
+    replaceGrades: syncGrades && gradesFetchedAll && gradeResult.isComplete,
     replaceGradeTerms: gradeResult.successfulTerms,
-    replaceSchedules: htmlByTerm.isNotEmpty,
+    replaceSchedules: false,
   );
   return OfflineSyncResult(
     savedTermCount: htmlByTerm.length,
@@ -1920,6 +2074,8 @@ Future<OfflineSyncResult> syncOfflineUserData({
     gradesUpdated: syncGrades && gradeResult.isComplete,
     schedulesUpdated: htmlByTerm.isNotEmpty,
     schedulesSkipped: syncSchedules && !shouldSyncSchedules,
+    schedulesFetchedAll: schedulesFetchedAll,
+    gradesFetchedAll: gradesFetchedAll,
   );
 }
 
@@ -1929,6 +2085,12 @@ Future<bool> _hasLocalSchedule(String studentId) async {
   final profile = await UserDataCacheStore.loadProfile(studentId);
   if (profile != null && profile.scheduleTerms.isNotEmpty) return true;
   return await ScheduleCacheStore.loadLatest(studentId) != null;
+}
+
+Future<bool> _hasLocalGrades(String studentId) async {
+  final profile = await UserDataCacheStore.loadProfile(studentId);
+  if (profile?.hasGrades == true) return true;
+  return (await UserDataCacheStore.loadGrades(studentId)).isNotEmpty;
 }
 
 // ==================== 设置持久化（本地文件，全程无云端） ====================
@@ -2480,13 +2642,24 @@ class CampusEnvironmentController extends ChangeNotifier {
   bool _checking = false;
   bool _actionLoading = false;
   bool? _online;
+  Future<void>? _detectTask;
 
   bool get checking => _checking;
   bool get actionLoading => _actionLoading;
   bool? get online => _online;
 
-  Future<void> detect() async {
-    if (_checking) return;
+  Future<void> detect() {
+    final running = _detectTask;
+    if (running != null) return running;
+    late final Future<void> task;
+    task = _detectInternal().whenComplete(() {
+      if (identical(_detectTask, task)) _detectTask = null;
+    });
+    _detectTask = task;
+    return task;
+  }
+
+  Future<void> _detectInternal() async {
     _checking = true;
     notifyListeners();
     try {
@@ -2680,6 +2853,9 @@ class VpnSetupPage extends StatefulWidget {
   final GradeSyncScope gradeSyncScope;
   final bool syncSchedules;
   final bool forceScheduleSync;
+  final bool fetchAllSchedules;
+  final String? scheduleTerm;
+  final String? gradeTerm;
   final bool syncGrades;
 
   const VpnSetupPage({
@@ -2688,6 +2864,9 @@ class VpnSetupPage extends StatefulWidget {
     this.gradeSyncScope = GradeSyncScope.latest,
     this.syncSchedules = true,
     this.forceScheduleSync = false,
+    this.fetchAllSchedules = false,
+    this.scheduleTerm,
+    this.gradeTerm,
     this.syncGrades = true,
     super.key,
   });
@@ -2786,6 +2965,9 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
             gradeSyncScope: widget.gradeSyncScope,
             syncSchedules: widget.syncSchedules,
             forceScheduleSync: widget.forceScheduleSync,
+            fetchAllSchedules: widget.fetchAllSchedules,
+            scheduleTerm: widget.scheduleTerm,
+            gradeTerm: widget.gradeTerm,
             syncGrades: widget.syncGrades,
           )
         : CampusNavigatorPage(studentId: studentId);
@@ -3877,6 +4059,9 @@ class EducationLoginPage extends StatefulWidget {
   final GradeSyncScope gradeSyncScope;
   final bool syncSchedules;
   final bool forceScheduleSync;
+  final bool fetchAllSchedules;
+  final String? scheduleTerm;
+  final String? gradeTerm;
   final bool syncGrades;
 
   const EducationLoginPage({
@@ -3885,6 +4070,9 @@ class EducationLoginPage extends StatefulWidget {
     this.gradeSyncScope = GradeSyncScope.latest,
     this.syncSchedules = true,
     this.forceScheduleSync = false,
+    this.fetchAllSchedules = false,
+    this.scheduleTerm,
+    this.gradeTerm,
     this.syncGrades = true,
     super.key,
   });
@@ -4136,7 +4324,9 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
     String? credentialNotice;
     final studentId = _studentIdCtrl.text.trim();
     final alreadyAuthenticated =
-        JwxtClient().isLoggedIn && _authenticatedStudentId == studentId;
+        JwxtClient().isLoggedIn &&
+        (JwxtClient().authenticatedStudentId == studentId ||
+            _authenticatedStudentId == studentId);
     if (studentId.isEmpty ||
         (!alreadyAuthenticated &&
             (_passwordCtrl.text.isEmpty || _captchaCtrl.text.trim().isEmpty))) {
@@ -4147,9 +4337,15 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
     setState(() {
       _loggingIn = true;
       _syncProgress = !widget.syncGrades
-          ? '正在手动保存最新课表…'
+          ? widget.fetchAllSchedules
+                ? '正在手动保存所有已知学期课表…'
+                : widget.scheduleTerm == null
+                ? '正在手动保存最新课表…'
+                : '正在手动保存课表：${widget.scheduleTerm}…'
           : alreadyAuthenticated
-          ? widget.gradeSyncScope == GradeSyncScope.all
+          ? widget.gradeTerm != null
+                ? '正在手动更新成绩：${widget.gradeTerm}…'
+                : widget.gradeSyncScope == GradeSyncScope.all
                 ? '正在手动更新全部成绩…'
                 : '正在更新最新学期成绩…'
           : '正在认证教务系统…';
@@ -4199,6 +4395,9 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
         gradeSyncScope: widget.gradeSyncScope,
         syncSchedules: widget.syncSchedules,
         forceScheduleSync: widget.forceScheduleSync,
+        fetchAllSchedules: widget.fetchAllSchedules,
+        scheduleTerm: widget.scheduleTerm,
+        gradeTerm: widget.gradeTerm,
         syncGrades: widget.syncGrades,
         onProgress: (message) {
           if (mounted) setState(() => _syncProgress = message);
@@ -4211,11 +4410,17 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
       final gradeSuffix = !widget.syncGrades || syncResult.gradesUpdated
           ? ''
           : '；成绩更新不完整，已保留原本地成绩';
-      final gradeScopeText = widget.gradeSyncScope == GradeSyncScope.all
+      final gradeScopeText = syncResult.gradesFetchedAll
           ? '全部成绩'
+          : widget.gradeTerm != null
+          ? '${widget.gradeTerm}成绩'
           : '最新学期成绩';
       final savedDataPrefix = syncResult.schedulesUpdated
-          ? widget.syncGrades
+          ? syncResult.schedulesFetchedAll
+                ? '已保存 ${syncResult.savedTermCount} 个学期课表'
+                : widget.scheduleTerm != null
+                ? '已更新 ${widget.scheduleTerm} 课表'
+                : widget.syncGrades
                 ? '已保存最新一期课表和 '
                 : '已保存最新一期课表'
           : syncResult.schedulesSkipped
@@ -5812,6 +6017,8 @@ class SchedulePage extends StatefulWidget {
 }
 
 class _SchedulePageState extends State<SchedulePage> {
+  static const _latestScheduleTermsValue = '__latest_schedule_term__';
+  static const _allScheduleTermsValue = '__all_schedule_terms__';
   final _scheduleRepaintKey = GlobalKey();
   List<String> _terms = const [];
   String _selectedTerm = AcademicCalendar.latestTerm;
@@ -5825,6 +6032,7 @@ class _SchedulePageState extends State<SchedulePage> {
   bool _showDiagnostics = false;
   bool _loadedFromCache = false;
   DateTime? _cachedAt;
+  String? _selectedScheduleUpdateTerm;
 
   // 设置（本地持久化）：本周视图高亮 + 按周筛选，均基于手动选定的"当前周次"。
   AppSettings? _settings;
@@ -5833,6 +6041,7 @@ class _SchedulePageState extends State<SchedulePage> {
     super.initState();
     _appSettingsRevision.addListener(_reloadSettings);
     _campusEnvironment.addListener(_refreshCampusEnvironment);
+    dataSyncCooldown.addListener(_refreshSyncCooldown);
     _initialize();
   }
 
@@ -5840,10 +6049,15 @@ class _SchedulePageState extends State<SchedulePage> {
   void dispose() {
     _appSettingsRevision.removeListener(_reloadSettings);
     _campusEnvironment.removeListener(_refreshCampusEnvironment);
+    dataSyncCooldown.removeListener(_refreshSyncCooldown);
     super.dispose();
   }
 
   void _refreshCampusEnvironment() {
+    if (mounted) setState(() {});
+  }
+
+  void _refreshSyncCooldown() {
     if (mounted) setState(() {});
   }
 
@@ -5871,14 +6085,92 @@ class _SchedulePageState extends State<SchedulePage> {
     if (mounted) await _detectCampusEnvironment();
   }
 
+  List<String> _scheduleUpdateTerms() {
+    final terms = <String>{...AcademicCalendar.terms, ..._terms}.toList();
+    terms.sort((a, b) {
+      final aIndex = AcademicCalendar.terms.indexOf(a);
+      final bIndex = AcademicCalendar.terms.indexOf(b);
+      if (aIndex >= 0 && bIndex >= 0) return aIndex.compareTo(bIndex);
+      if (aIndex >= 0) return -1;
+      if (bIndex >= 0) return 1;
+      return b.compareTo(a);
+    });
+    return terms;
+  }
+
+  Future<bool> _canReuseEducationSession() async {
+    if (_campusEnvironment.checking) await _detectCampusEnvironment();
+    if (_campusEnvironment.online != true) {
+      await _detectCampusEnvironment();
+    }
+    final client = JwxtClient();
+    return _campusEnvironment.online == true &&
+        client.isLoggedIn &&
+        client.authenticatedStudentId == widget.studentId;
+  }
+
   Future<void> _openManualScheduleSave() async {
+    final remaining = dataSyncCooldown.remaining(SyncResource.schedule);
+    if (remaining > Duration.zero) {
+      _showSyncCooldownMessage(SyncResource.schedule);
+      return;
+    }
+    final selected = _selectedScheduleUpdateTerm;
+    final fetchAll = selected == _allScheduleTermsValue;
+    final term = fetchAll ? null : selected;
+    if (await _canReuseEducationSession()) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+      try {
+        final result = await syncOfflineUserData(
+          studentId: widget.studentId,
+          syncSchedules: true,
+          forceScheduleSync: true,
+          fetchAllSchedules: fetchAll,
+          scheduleTerm: term,
+          syncGrades: false,
+          onProgress: (message) {
+            if (mounted) setState(() => _emptyMessage = message);
+          },
+        );
+        await _initialize();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                result.schedulesFetchedAll
+                    ? '已保存 ${result.savedTermCount} 个学期课表'
+                    : term == null
+                    ? '已更新最新一期课表'
+                    : '已更新 $term 课表',
+              ),
+            ),
+          );
+        }
+      } catch (error) {
+        if (mounted) setState(() => _error = '$error');
+      } finally {
+        if (mounted) setState(() => _loading = false);
+      }
+      return;
+    }
+
+    if (!mounted) return;
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => const VpnSetupPage(
+        builder: (_) => VpnSetupPage(
           mode: AppMode.education,
           forceScheduleSync: true,
+          fetchAllSchedules: fetchAll,
+          scheduleTerm: term,
           syncGrades: false,
-          initialNotice: '本次仅手动保存最新一期已发布课表',
+          initialNotice: fetchAll
+              ? '本次更新所有已知学期课表'
+              : term == null
+              ? '本次仅手动保存最新一期已发布课表'
+              : '本次仅更新 $term 课表',
         ),
       ),
     );
@@ -5886,6 +6178,15 @@ class _SchedulePageState extends State<SchedulePage> {
       await _initialize();
       await _detectCampusEnvironment();
     }
+  }
+
+  void _showSyncCooldownMessage(SyncResource resource) {
+    final remaining = dataSyncCooldown.remainingText(resource);
+    if (remaining.isEmpty || !mounted) return;
+    final label = resource == SyncResource.schedule ? '课表' : '成绩';
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('$label更新冷却中，还需 $remaining 后重试')));
   }
 
   Future<void> _handleCampusAcceleratorAction() async {
@@ -6029,6 +6330,10 @@ class _SchedulePageState extends State<SchedulePage> {
 
   @override
   Widget build(BuildContext context) {
+    final updateTerms = _scheduleUpdateTerms();
+    final selectedUpdateValue = _selectedScheduleUpdateTerm == null
+        ? _latestScheduleTermsValue
+        : _selectedScheduleUpdateTerm!;
     return Scaffold(
       appBar: AppBar(
         title: const Text('学期课表'),
@@ -6199,13 +6504,78 @@ class _SchedulePageState extends State<SchedulePage> {
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: OutlinedButton.icon(
-                onPressed: _loading ? null : _openManualScheduleSave,
-                icon: const Icon(Icons.cloud_download, size: 16),
-                label: const Text('手动保存最新课表'),
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: DropdownButtonFormField<String>(
+                        key: ValueKey(
+                          'schedule-update-$selectedUpdateValue-${updateTerms.join('|')}',
+                        ),
+                        initialValue:
+                            updateTerms.contains(selectedUpdateValue) ||
+                                selectedUpdateValue ==
+                                    _latestScheduleTermsValue ||
+                                selectedUpdateValue == _allScheduleTermsValue
+                            ? selectedUpdateValue
+                            : _latestScheduleTermsValue,
+                        decoration: const InputDecoration(
+                          labelText: '更新学期',
+                          prefixIcon: Icon(Icons.cloud_download),
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        items: [
+                          const DropdownMenuItem(
+                            value: _latestScheduleTermsValue,
+                            child: Text('最新一期（自动回退）'),
+                          ),
+                          const DropdownMenuItem(
+                            value: _allScheduleTermsValue,
+                            child: Text('所有已知学期'),
+                          ),
+                          ...updateTerms.map(
+                            (term) => DropdownMenuItem(
+                              value: term,
+                              child: Text(term),
+                            ),
+                          ),
+                        ],
+                        onChanged: _loading
+                            ? null
+                            : (value) {
+                                if (value == null) return;
+                                setState(() {
+                                  _selectedScheduleUpdateTerm =
+                                      value == _latestScheduleTermsValue
+                                      ? null
+                                      : value;
+                                });
+                              },
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    OutlinedButton.icon(
+                      onPressed:
+                          _loading ||
+                              dataSyncCooldown.isCooling(SyncResource.schedule)
+                          ? null
+                          : _openManualScheduleSave,
+                      icon: const Icon(Icons.sync, size: 18),
+                      label: const Text('更新课表'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: _SyncCooldownIndicator(
+                    resource: SyncResource.schedule,
+                  ),
+                ),
+              ],
             ),
           ),
           const Divider(),
@@ -7098,12 +7468,15 @@ class GradesPage extends StatefulWidget {
 }
 
 class _GradesPageState extends State<GradesPage> {
+  static const _latestGradeTermsValue = '__latest_grade_term__';
+  static const _allGradeTermsValue = '__all_grade_terms__';
   List<Map<String, String>> _grades = [];
   bool _loading = false;
   String? _error;
   AppSettings? _settings;
   DateTime? _cachedAt;
   bool _hasSavedSnapshot = false;
+  String? _selectedGradeUpdateTerm;
   String? _selectedGradeTerm;
   // 折叠状态：默认两个分组都展开；点击分组标题可切换
   bool _showDone = true;
@@ -7114,6 +7487,7 @@ class _GradesPageState extends State<GradesPage> {
     super.initState();
     _appSettingsRevision.addListener(_reloadDisplaySettings);
     _campusEnvironment.addListener(_refreshCampusEnvironment);
+    dataSyncCooldown.addListener(_refreshSyncCooldown);
     _loadLocal();
   }
 
@@ -7121,10 +7495,15 @@ class _GradesPageState extends State<GradesPage> {
   void dispose() {
     _appSettingsRevision.removeListener(_reloadDisplaySettings);
     _campusEnvironment.removeListener(_refreshCampusEnvironment);
+    dataSyncCooldown.removeListener(_refreshSyncCooldown);
     super.dispose();
   }
 
   void _refreshCampusEnvironment() {
+    if (mounted) setState(() {});
+  }
+
+  void _refreshSyncCooldown() {
     if (mounted) setState(() {});
   }
 
@@ -7137,16 +7516,82 @@ class _GradesPageState extends State<GradesPage> {
     if (mounted) await _campusEnvironment.detect();
   }
 
-  /// 手动刷新成绩时才查询全部配置学期；课表缓存保持不动，避免重复抓取。
-  Future<void> _openFullGradeUpdate() async {
+  Future<bool> _canReuseEducationSession() async {
+    if (_campusEnvironment.checking) await _campusEnvironment.detect();
+    if (_campusEnvironment.online != true) {
+      await _campusEnvironment.detect();
+    }
+    final client = JwxtClient();
+    return _campusEnvironment.online == true &&
+        client.isLoggedIn &&
+        client.authenticatedStudentId == widget.studentId;
+  }
+
+  void _showSyncCooldownMessage() {
+    final remaining = dataSyncCooldown.remainingText(SyncResource.grade);
+    if (remaining.isEmpty || !mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('成绩更新冷却中，还需 $remaining 后重试')));
+  }
+
+  /// 手动刷新成绩默认只请求最新学期；可切换为指定学期或全部已知学期。
+  /// 校园内网和当前教务会话都有效时直接请求，不重复打开认证页。
+  Future<void> _openGradeUpdate() async {
     if (_loading) return;
+    if (dataSyncCooldown.isCooling(SyncResource.grade)) {
+      _showSyncCooldownMessage();
+      return;
+    }
+    final selected = _selectedGradeUpdateTerm;
+    final fetchAll = selected == _allGradeTermsValue;
+    final term = fetchAll || selected == null ? null : selected;
+    final scope = fetchAll ? GradeSyncScope.all : GradeSyncScope.latest;
+    if (await _canReuseEducationSession()) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+      try {
+        final result = await syncOfflineUserData(
+          studentId: widget.studentId,
+          syncSchedules: false,
+          gradeSyncScope: scope,
+          gradeTerm: term,
+          syncGrades: true,
+        );
+        await _loadLocal();
+        if (mounted) {
+          final description = result.gradesFetchedAll
+              ? '已更新全部学期成绩（${result.gradeCount} 条）'
+              : term == null
+              ? '已更新最新学期成绩（${result.gradeCount} 条）'
+              : '已更新 $term 成绩（${result.gradeCount} 条）';
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(description)));
+        }
+      } catch (error) {
+        if (mounted) setState(() => _error = '$error');
+      } finally {
+        if (mounted) setState(() => _loading = false);
+      }
+      return;
+    }
+
+    if (!mounted) return;
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => const VpnSetupPage(
+        builder: (_) => VpnSetupPage(
           mode: AppMode.education,
-          gradeSyncScope: GradeSyncScope.all,
+          gradeSyncScope: scope,
           syncSchedules: false,
-          initialNotice: '本次只更新全部学期成绩，不会重新抓取课表',
+          gradeTerm: term,
+          initialNotice: fetchAll
+              ? '本次只更新全部已知学期成绩，不会重新抓取课表'
+              : term == null
+              ? '本次只更新最新学期成绩，不会重新抓取课表'
+              : '本次只更新 $term 成绩，不会重新抓取课表',
         ),
       ),
     );
@@ -7182,6 +7627,15 @@ class _GradesPageState extends State<GradesPage> {
         .where((term) => term.isNotEmpty)
         .toSet()
         .toList();
+    terms.sort((a, b) => _termSortKey(b).compareTo(_termSortKey(a)));
+    return terms;
+  }
+
+  List<String> _availableGradeUpdateTerms() {
+    final terms = <String>{
+      ...AcademicCalendar.terms,
+      ..._availableGradeTerms(),
+    }.toList();
     terms.sort((a, b) => _termSortKey(b).compareTo(_termSortKey(a)));
     return terms;
   }
@@ -7269,16 +7723,76 @@ class _GradesPageState extends State<GradesPage> {
         '${two(value.hour)}:${two(value.minute)}';
   }
 
-  Widget _buildFullGradeUpdateButton() {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-        child: OutlinedButton.icon(
-          onPressed: _loading ? null : _openFullGradeUpdate,
-          icon: const Icon(Icons.sync),
-          label: const Text('手动更新全部成绩'),
-        ),
+  Widget _buildGradeUpdateControls() {
+    final terms = _availableGradeUpdateTerms();
+    final selected = _selectedGradeUpdateTerm ?? _latestGradeTermsValue;
+    final selectedValue =
+        selected == _allGradeTermsValue ||
+            selected == _latestGradeTermsValue ||
+            terms.contains(selected)
+        ? selected
+        : _latestGradeTermsValue;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: DropdownButtonFormField<String>(
+                  key: ValueKey(
+                    'grade-update-$selectedValue-${terms.join('|')}',
+                  ),
+                  initialValue: selectedValue,
+                  decoration: const InputDecoration(
+                    labelText: '更新学期',
+                    prefixIcon: Icon(Icons.sync),
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  items: [
+                    const DropdownMenuItem(
+                      value: _latestGradeTermsValue,
+                      child: Text('最新学期'),
+                    ),
+                    const DropdownMenuItem(
+                      value: _allGradeTermsValue,
+                      child: Text('所有已知学期'),
+                    ),
+                    ...terms.map(
+                      (term) =>
+                          DropdownMenuItem(value: term, child: Text(term)),
+                    ),
+                  ],
+                  onChanged: _loading
+                      ? null
+                      : (value) {
+                          if (value == null) return;
+                          setState(() {
+                            _selectedGradeUpdateTerm =
+                                value == _latestGradeTermsValue ? null : value;
+                          });
+                        },
+                ),
+              ),
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed:
+                    _loading || dataSyncCooldown.isCooling(SyncResource.grade)
+                    ? null
+                    : _openGradeUpdate,
+                icon: const Icon(Icons.cloud_download, size: 18),
+                label: const Text('更新成绩'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: _SyncCooldownIndicator(resource: SyncResource.grade),
+          ),
+        ],
       ),
     );
   }
@@ -7423,7 +7937,7 @@ class _GradesPageState extends State<GradesPage> {
                   ),
                 ),
               ),
-            _buildFullGradeUpdateButton(),
+            _buildGradeUpdateControls(),
             Expanded(
               child: Center(
                 child: Text(
@@ -7469,7 +7983,7 @@ class _GradesPageState extends State<GradesPage> {
               ),
             ),
           ),
-          _buildFullGradeUpdateButton(),
+          _buildGradeUpdateControls(),
           _buildGradeTermSelector(settings),
           if (settings.gradeCategoryEnabled) ...[
             _buildArchiveSection(
