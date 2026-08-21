@@ -32,16 +32,10 @@ jizhicha-output/
 *.keystore
 **/key.properties
 
-# 本地交接材料与内部测试包，不进入公开源码提交
+# 本地交接材料与发布产物，不进入公开源码提交
 **/HANDOFF.md
 **/PROGRESS.md
-release/internal/*
-!release/internal/README.md
-release/Jizhicha-v1.0.2-Windows/
-release/*.sha1
-release/*.sha256
-release/official/*/*.sha1
-release/official/*/*.sha256
+/release/
 
 # Local Flutter pub cache override
 pubspec.lock
