@@ -82,9 +82,10 @@ async fn run_target_tunnel_inner(
         let device = tun2::create_as_async(&configuration)
             .map_err(|e| HuseVpnError::Tunnel(format!("failed to create Wintun adapter: {e}")))?;
         let prefixes = campus_route_prefixes(auth, targets);
+        let interface_index = tunnel_interface_index()?;
         let mut routes = Vec::with_capacity(prefixes.len());
         for prefix in prefixes {
-            routes.push(TargetRoute::install(prefix, TUN_NAME)?);
+            routes.push(TargetRoute::install(prefix, interface_index)?);
         }
         let (tun_writer, tun_reader) = device
             .split()
@@ -387,11 +388,22 @@ fn network_prefix(address: Ipv4Addr, mask: Ipv4Addr) -> Option<String> {
 
 struct TargetRoute {
     prefix: String,
+    interface_index: u32,
     installed: bool,
 }
 
 impl TargetRoute {
-    fn install(prefix: String, interface: &str) -> Result<Self> {
+    fn install(prefix: String, interface_index: u32) -> Result<Self> {
+        // A previous native session may have left an active route behind while
+        // its Wintun handle was being torn down.  Reuse it, and do not delete
+        // someone else's route when this session ends.
+        if route_exists(&prefix, interface_index) {
+            return Ok(Self {
+                prefix,
+                interface_index,
+                installed: false,
+            });
+        }
         let output = hidden_command("netsh")
             .args([
                 "interface",
@@ -399,7 +411,7 @@ impl TargetRoute {
                 "add",
                 "route",
                 &format!("prefix={prefix}"),
-                &format!("interface={interface}"),
+                &format!("interface={interface_index}"),
                 "nexthop=0.0.0.0",
                 "metric=1",
                 "store=active",
@@ -416,8 +428,27 @@ impl TargetRoute {
                 "failed to add target route: {detail}"
             )));
         }
+        // Windows updates the active route table asynchronously.  Give it a
+        // short grace period before declaring the tunnel unusable; this also
+        // catches a non-elevated netsh invocation deterministically.
+        let mut installed = false;
+        for attempt in 0..10 {
+            if route_exists(&prefix, interface_index) {
+                installed = true;
+                break;
+            }
+            if attempt < 9 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        if !installed {
+            return Err(HuseVpnError::Tunnel(format!(
+                "target route {prefix} was not installed on CampusVPN (interface {interface_index})"
+            )));
+        }
         Ok(Self {
             prefix,
+            interface_index,
             installed: true,
         })
     }
@@ -435,12 +466,62 @@ impl Drop for TargetRoute {
                 "delete",
                 "route",
                 &format!("prefix={}", self.prefix),
-                &format!("interface={TUN_NAME}"),
+                &format!("interface={}", self.interface_index),
                 "nexthop=0.0.0.0",
                 "store=active",
             ])
             .output();
     }
+}
+
+/// Resolve the Wintun interface by alias once and use its numeric index for
+/// every netsh operation.  `interface=CampusVPN` is accepted by some builds
+/// of netsh but is treated as an invalid interface on others, which leaves
+/// the adapter up without any target routes.
+fn tunnel_interface_index() -> Result<u32> {
+    let script = format!(
+        "Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceIndex",
+        TUN_NAME.replace('\'', "''")
+    );
+    let mut last_error = None;
+    for attempt in 0..20 {
+        let output = hidden_command("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .map_err(|e| {
+                HuseVpnError::Tunnel(format!("failed to inspect CampusVPN interface: {e}"))
+            })?;
+        if output.status.success() {
+            let value = String::from_utf8_lossy(&output.stdout);
+            if let Ok(index) = value.trim().parse::<u32>() {
+                return Ok(index);
+            }
+        }
+        last_error = Some(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        if attempt < 19 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    let detail = last_error.filter(|value| !value.is_empty());
+    Err(HuseVpnError::Tunnel(match detail {
+        Some(detail) => format!("CampusVPN interface index is unavailable: {detail}"),
+        None => "CampusVPN interface index is unavailable".into(),
+    }))
+}
+
+fn route_exists(prefix: &str, interface_index: u32) -> bool {
+    let script = format!(
+        "Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '{}' -InterfaceIndex {} -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object {{ 'ok' }}",
+        prefix.replace('\'', "''"),
+        interface_index
+    );
+    hidden_command("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map(|output| {
+            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
