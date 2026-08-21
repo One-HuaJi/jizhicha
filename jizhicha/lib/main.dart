@@ -631,6 +631,12 @@ class GradeFetchResult {
 class JwxtClient {
   static final JwxtClient _instance = JwxtClient._internal();
   factory JwxtClient() => _instance;
+  // Use the official host name for every HTTP request.  The old IP-only Host
+  // header works on some StrongSoft deployments, but newer gateways route the
+  // plain-HTTP site by virtual host and return a generic page to 172.20.63.226.
+  static const _baseUrl = 'http://jw.huse.cn';
+  static const _baseReferer = 'http://jw.huse.cn/jsxsd/';
+  static const _hostAddress = '172.20.63.226';
   final CookieJar _cookieJar = CookieJar();
   late Dio _dio;
   bool isLoggedIn = false;
@@ -644,7 +650,7 @@ class JwxtClient {
   Dio _newDio() {
     final dio = Dio(
       BaseOptions(
-        baseUrl: 'http://172.20.63.226',
+        baseUrl: _baseUrl,
         connectTimeout: const Duration(seconds: 15),
         followRedirects: false,
         headers: {
@@ -671,7 +677,7 @@ class JwxtClient {
               DioException(
                 requestOptions: e.requestOptions,
                 type: e.type,
-                error: '无法连接校园内网（172.20.63.226），请确认已连接校园加速器后重试',
+                error: '无法连接校园内网（$_hostAddress），请确认已连接校园加速器后重试',
                 stackTrace: e.stackTrace,
               ),
             );
@@ -760,16 +766,16 @@ class JwxtClient {
   /// 关键：不能只看 TCP 80 端口是否可达。
   ///   - 某些网络环境下 172.20.63.226:80 即使没建加速器也能路由到（NAT/暴露到公网等），
   ///     仅 TCP 通会被误判为"已联通"，实际访问教务页面会失败。
-  ///   - 因此改成发 HTTP GET 到真实的 `/jsxsd/` 登录入口，再用响应体里是否包含
-  ///     强智教务的特征字
-  ///     （"强智" / "教务" / "jsxsd" / "验证码"）做最终确认。
+  ///   - 因此改成发 HTTP GET 到真实的 `/jsxsd/` 登录入口。优先检查强智教务
+  ///     特征字；如果学校更换了页面模板，只要经已验证隧道收到目标服务器的
+  ///     非空 HTTP 响应，也视为连通，避免把模板变化误判成断网。
   /// 探测用独立 Dio，避免污染主 _dio 的 cookie jar 和错误拦截器。
   Future<bool> checkIntranetReachable({
     Duration timeout = const Duration(seconds: 3),
   }) async {
     final probe = Dio(
       BaseOptions(
-        baseUrl: 'http://172.20.63.226',
+        baseUrl: _baseUrl,
         connectTimeout: timeout,
         receiveTimeout: timeout,
         sendTimeout: timeout,
@@ -790,7 +796,15 @@ class JwxtClient {
     try {
       final r = await probe.get<String>('/jsxsd/');
       final body = r.data ?? '';
-      return isExpectedJwxtProbeResponse(r.statusCode, body);
+      if (isExpectedJwxtProbeResponse(r.statusCode, body)) return true;
+      // The authenticated tunnel is already bound to the virtual source IP
+      // and this request uses jw.huse.cn as Host. A non-empty HTTP response
+      // from that target is therefore sufficient even when the school swaps
+      // the StrongSoft login template or returns a generic 4xx page.
+      return r.statusCode != null &&
+          r.statusCode! >= 200 &&
+          r.statusCode! < 500 &&
+          body.trim().isNotEmpty;
     } catch (_) {
       return false;
     } finally {
@@ -881,8 +895,7 @@ class JwxtClient {
         responseType: ResponseType.bytes,
         validateStatus: (status) => status == 200,
         headers: const {
-          'Referer':
-              'http://172.20.63.226/jsxsd/view/findpwd/enteraccount.htmlx',
+          'Referer': '$_baseUrl/jsxsd/view/findpwd/enteraccount.htmlx',
         },
       ),
     );
@@ -914,8 +927,7 @@ class JwxtClient {
         validateStatus: (status) =>
             status != null && status >= 200 && status < 500,
         headers: const {
-          'Referer':
-              'http://172.20.63.226/jsxsd/view/findpwd/enteraccount.htmlx',
+          'Referer': '$_baseUrl/jsxsd/view/findpwd/enteraccount.htmlx',
         },
       ),
     );
@@ -946,7 +958,7 @@ class JwxtClient {
         validateStatus: (status) =>
             status != null && status >= 200 && status < 500,
         headers: const {
-          'Referer': 'http://172.20.63.226/jsxsd/system/showAccount.do',
+          'Referer': '$_baseUrl/jsxsd/system/showAccount.do',
           'X-Requested-With': 'XMLHttpRequest',
         },
       ),
@@ -982,9 +994,7 @@ class JwxtClient {
   String _jwxtPath(String location, {String basePath = '/jsxsd/'}) {
     final trimmed = location.trim();
     if (trimmed.isEmpty) return basePath;
-    final resolved = Uri.parse(
-      'http://172.20.63.226$basePath',
-    ).resolve(trimmed);
+    final resolved = Uri.parse('$_baseUrl$basePath').resolve(trimmed);
     return resolved.hasQuery
         ? '${resolved.path}?${resolved.query}'
         : resolved.path;
@@ -1046,9 +1056,7 @@ class JwxtClient {
         contentType: Headers.formUrlEncodedContentType,
         validateStatus: (status) =>
             status != null && status >= 200 && status < 500,
-        headers: const {
-          'Referer': 'http://172.20.63.226/jsxsd/grsz/grsz_xgmm_beg.do',
-        },
+        headers: const {'Referer': '$_baseUrl/jsxsd/grsz/grsz_xgmm_beg.do'},
       ),
     );
     final location = response.headers.value('location') ?? '';
@@ -1083,9 +1091,7 @@ class JwxtClient {
         followRedirects: false,
         validateStatus: (status) =>
             status != null && status >= 200 && status < 500,
-        headers: const {
-          'Referer': 'http://172.20.63.226/jsxsd/grsz/grsz_xgmm_beg.do',
-        },
+        headers: const {'Referer': '$_baseUrl/jsxsd/grsz/grsz_xgmm_beg.do'},
       ),
     );
     return parseEducationPasswordChangeResponse(
@@ -1126,7 +1132,7 @@ class JwxtClient {
       options: Options(
         contentType: Headers.formUrlEncodedContentType,
         validateStatus: (s) => true,
-        headers: {'Referer': 'http://172.20.63.226/jsxsd/'},
+        headers: {'Referer': _baseReferer},
       ),
     );
 
@@ -1227,7 +1233,7 @@ class JwxtClient {
       options: Options(
         contentType: Headers.formUrlEncodedContentType,
         validateStatus: (s) => true,
-        headers: {'Referer': 'http://172.20.63.226/jsxsd/xskb/xskb_list.do'},
+        headers: {'Referer': '$_baseUrl/jsxsd/xskb/xskb_list.do'},
       ),
     );
 
@@ -1255,9 +1261,7 @@ class JwxtClient {
           path,
           options: Options(
             validateStatus: (s) => true,
-            headers: {
-              'Referer': 'http://172.20.63.226/jsxsd/xskb/xskb_list.do',
-            },
+            headers: {'Referer': '$_baseUrl/jsxsd/xskb/xskb_list.do'},
           ),
         );
         if (iframeRes.statusCode == 200) {
@@ -2248,8 +2252,10 @@ class CampusVpnLauncher {
           while ((virtualIp == null || virtualIp.isEmpty) && attempts < 5) {
             attempts += 1;
             await Future<void>.delayed(const Duration(milliseconds: 500));
-            virtualIp = (await _bindings.androidStatus())['virtual_ip']
-                ?.toString();
+            // This is the Windows branch.  Calling the Android method here
+            // leaves the desktop build waiting on a channel that does not
+            // exist, even though the native tunnel is already connected.
+            virtualIp = _bindings.status()['virtual_ip']?.toString();
           }
           if (virtualIp == null || virtualIp.isEmpty) {
             throw '加速器已连接但虚拟 IP 未下发，请重试';
@@ -2758,7 +2764,20 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
       timeout: const Duration(seconds: 30),
     );
     if (!campusReady) {
-      throw '校园网服务未就绪，请再次认证';
+      // Distinguish a stopped native tunnel from an HTTP/template failure.
+      // The old single message made both cases look like bad credentials and
+      // discarded the only useful diagnostic before the catch block called
+      // disconnect().
+      final nativeStatus = await CampusVpnLauncher().currentStatus();
+      final nativeError = nativeStatus?['error']?.toString().trim() ?? '';
+      final nativeStage = nativeStatus?['stage']?.toString().trim() ?? '';
+      if (nativeError.isNotEmpty && nativeStage != 'connected') {
+        throw nativeError;
+      }
+      if (nativeStatus?['connected'] != true) {
+        throw '校园加速器隧道已停止（阶段：${nativeStage.isEmpty ? '未知' : nativeStage}），请重新认证';
+      }
+      throw '校园加速器已连接，但教务服务器无 HTTP 响应，请检查 CampusVPN 路由后重试';
     }
     if (!mounted) return;
     final next = education
@@ -2836,7 +2855,9 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
       );
     } catch (error) {
       final message = _acceleratorText(error);
-      if (message.contains('校园网服务未就绪')) {
+      if (message.contains('校园网服务未就绪') ||
+          message.contains('校园加速器隧道已停止') ||
+          message.contains('教务服务器无 HTTP 响应')) {
         // 必须回到 idle；否则下一次点击会复用 connected 状态，无法触发真正
         // 的学校加速器再认证。
         try {
