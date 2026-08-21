@@ -1,16 +1,20 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart'
     show Clipboard, ClipboardData, MethodChannel;
 import 'package:dio/dio.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
+import 'package:html/dom.dart' as html_dom;
 import 'package:html/parser.dart' show parse;
+import 'package:image/image.dart' as img;
 import 'package:ffi/ffi.dart' as ffi_utils;
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'dart:async' show runZonedGuarded;
 import 'dart:io'
     show Directory, File, HttpClient, InternetAddress, Platform, Socket;
@@ -136,11 +140,490 @@ class _AppBootstrapPageState extends State<AppBootstrapPage> {
 }
 
 // ==================== 网络核心（单例，Cookie共享） ====================
+enum GradeSyncScope { latest, all }
+
+enum JwxtLoginStatus { success, passwordChangeRequired }
+
+class JwxtLoginResult {
+  final JwxtLoginStatus status;
+  final EducationPasswordChangeForm? passwordChangeForm;
+
+  const JwxtLoginResult._(this.status, [this.passwordChangeForm]);
+
+  const JwxtLoginResult.success() : this._(JwxtLoginStatus.success);
+
+  const JwxtLoginResult.passwordChangeRequired(EducationPasswordChangeForm form)
+    : this._(JwxtLoginStatus.passwordChangeRequired, form);
+
+  bool get isSuccess => status == JwxtLoginStatus.success;
+}
+
+class EducationPasswordChangeForm {
+  final String action;
+  final String oldPasswordField;
+  final String newPasswordField;
+  final String confirmPasswordField;
+  final String passwordHintField;
+  final Map<String, String> hiddenFields;
+
+  const EducationPasswordChangeForm({
+    required this.action,
+    required this.oldPasswordField,
+    required this.newPasswordField,
+    required this.confirmPasswordField,
+    required this.passwordHintField,
+    required this.hiddenFields,
+  });
+}
+
+class PasswordRecoveryAccountResult {
+  final String studentId;
+  final String accountType;
+
+  const PasswordRecoveryAccountResult({
+    required this.studentId,
+    required this.accountType,
+  });
+}
+
+class PasswordRecoveryResetResult {
+  final bool success;
+  final String message;
+
+  const PasswordRecoveryResetResult({
+    required this.success,
+    required this.message,
+  });
+}
+
+class EducationPasswordChangeResult {
+  final bool success;
+  final String message;
+
+  const EducationPasswordChangeResult({
+    required this.success,
+    required this.message,
+  });
+}
+
+bool isValidFinalEducationPassword(String password) {
+  return isEducationPasswordSafeToStore(password);
+}
+
+String? educationPasswordValidationError({
+  required String oldPassword,
+  required String newPassword,
+  required String confirmPassword,
+  required String passwordHint,
+}) {
+  if (oldPassword.isEmpty ||
+      newPassword.isEmpty ||
+      confirmPassword.isEmpty ||
+      passwordHint.trim().isEmpty) {
+    return '请完整填写旧密码、新密码、确认新密码和新密码提示';
+  }
+  if (!isValidFinalEducationPassword(newPassword)) {
+    return '新密码至少 8 位，并且必须同时包含字母和数字';
+  }
+  if (newPassword != confirmPassword) return '两次输入的新密码不一致';
+  if (newPassword == oldPassword) return '新密码不能与临时旧密码相同';
+  if (passwordHint.toLowerCase().contains(newPassword.toLowerCase())) {
+    return '新密码提示不能包含完整的新密码';
+  }
+  return null;
+}
+
+String _compactHtmlText(String value) =>
+    value.replaceAll(RegExp(r'\s+'), ' ').trim();
+
+String? extractJwxtAlertMessage(String html) {
+  final messages = _extractJwxtAlertMessages(html);
+  if (messages.isNotEmpty) return messages.first;
+  final showMessage = _compactHtmlText(
+    parse(html).querySelector('#showMsg')?.text ?? '',
+  );
+  return showMessage.isEmpty ? null : showMessage;
+}
+
+List<String> _extractJwxtAlertMessages(String html) {
+  final messages = RegExp(
+    r'''alert\s*\(\s*['"]([^'"]+)['"]\s*\)''',
+    caseSensitive: false,
+  ).allMatches(html).map((match) => _compactHtmlText(match.group(1) ?? ''));
+  return messages
+      .where((message) => message.isNotEmpty)
+      .toList(growable: false);
+}
+
+bool _isPasswordChangeSuccessMessage(String value) {
+  final normalized = _compactHtmlText(value);
+  return RegExp(
+    r'(密码\s*(?:修改|设置|更新|保存|重置)\s*成功|'
+    r'(?:修改|设置|更新|保存)\s*(?:新)?密码\s*成功|'
+    r'(?:修改|设置|更新|保存|提交|操作)\s*成功)',
+  ).hasMatch(normalized);
+}
+
+bool _isPasswordChangeFailureMessage(String value) {
+  final normalized = _compactHtmlText(value);
+  return RegExp(r'(失败|错误|不正确|不能为空|请输入完整|未成功|无效|拒绝|不符合)').hasMatch(normalized);
+}
+
+EducationPasswordChangeResult parseEducationPasswordChangeResponse({
+  required int? statusCode,
+  required String location,
+  required String raw,
+}) {
+  final lowerLocation = location.toLowerCase();
+  if (lowerLocation.contains('framework') || lowerLocation.contains('xsmain')) {
+    return const EducationPasswordChangeResult(
+      success: true,
+      message: '新密码设置成功',
+    );
+  }
+
+  final normalizedRaw = raw.trim();
+  try {
+    final decoded = jsonDecode(normalizedRaw);
+    if (decoded is Map) {
+      final successValue = decoded['success'];
+      final success =
+          successValue == true ||
+          successValue?.toString().toLowerCase() == 'true';
+      final message =
+          decoded['message']?.toString().trim() ??
+          (success ? '新密码设置成功' : '新密码设置失败');
+      return EducationPasswordChangeResult(success: success, message: message);
+    }
+  } catch (_) {
+    // 官网常返回 HTML/脚本，继续按页面响应解析。
+  }
+
+  final document = parse(normalizedRaw);
+  final showMessage = _compactHtmlText(
+    document.querySelector('#showMsg')?.text ?? '',
+  );
+  final bodyMessage = _compactHtmlText(document.body?.text ?? '');
+  final visibleMessages = <String>[
+    if (showMessage.isNotEmpty) showMessage,
+    if (bodyMessage.isNotEmpty && bodyMessage != showMessage) bodyMessage,
+  ];
+
+  // 页面正文或 #showMsg 是服务器明确展示给用户的结果，优先于脚本中的
+  // 表单校验提示，避免把页面源码里的“请输入完整信息”误当成实际结果。
+  for (final message in visibleMessages) {
+    if (_isPasswordChangeSuccessMessage(message)) {
+      return EducationPasswordChangeResult(success: true, message: message);
+    }
+  }
+  for (final message in visibleMessages) {
+    if (_isPasswordChangeFailureMessage(message)) {
+      return EducationPasswordChangeResult(success: false, message: message);
+    }
+  }
+
+  final scripts = _extractJwxtAlertMessages(normalizedRaw);
+  final scriptSuccess = scripts.where(_isPasswordChangeSuccessMessage);
+  if (scriptSuccess.isNotEmpty) {
+    return EducationPasswordChangeResult(
+      success: true,
+      message: scriptSuccess.first,
+    );
+  }
+  final scriptFailure = scripts.where(_isPasswordChangeFailureMessage);
+  if (scriptFailure.isNotEmpty) {
+    return EducationPasswordChangeResult(
+      success: false,
+      message: scriptFailure.first,
+    );
+  }
+
+  // 某些版本不使用 HTTP Location，而是用脚本跳转到首页。
+  final scriptedLocation = RegExp(
+    r'''(?:location(?:\.href)?|window\.location(?:\.href)?|'''
+    r'''top\.location(?:\.href)?|parent\.location(?:\.href)?)\s*'''
+    r'''(?:=\s*|\.replace\s*\(\s*)['"]([^'"]+)['"]''',
+    caseSensitive: false,
+  ).firstMatch(normalizedRaw)?.group(1);
+  final lowerScriptedLocation = scriptedLocation?.toLowerCase() ?? '';
+  if (lowerScriptedLocation.contains('framework') ||
+      lowerScriptedLocation.contains('xsmain')) {
+    return const EducationPasswordChangeResult(
+      success: true,
+      message: '新密码设置成功',
+    );
+  }
+
+  final message = visibleMessages.isNotEmpty
+      ? visibleMessages.first
+      : scripts.isNotEmpty
+      ? scripts.first
+      : '学校未返回可识别的改密结果，请勿重复提交并联系教务处确认';
+  return EducationPasswordChangeResult(success: false, message: message);
+}
+
+const passwordRecoveryStudentIdError = '学号格式错误或未录入数据';
+
+String normalizePasswordRecoveryAccountError(String message) {
+  final normalized = _compactHtmlText(message);
+  // 强智教务对“学号不存在/未录入”的返回文案不固定，有的版本会复用
+  // 登录页的“用户名或密码错误”，也有版本会错误地提示身份证号。
+  // 这些都发生在第一步账号验证阶段，不能原样展示给用户造成误解。
+  if (normalized.contains('用户名或密码错误') ||
+      normalized.contains('账号不存在') ||
+      normalized.contains('帐号不存在') ||
+      normalized.contains('学号不存在') ||
+      normalized.contains('请输入正确的身份证号')) {
+    return passwordRecoveryStudentIdError;
+  }
+  return message;
+}
+
+PasswordRecoveryAccountResult parsePasswordRecoveryAccountPage(
+  String html, {
+  required String expectedStudentId,
+}) {
+  final normalizedId = expectedStudentId.trim();
+  final document = parse(html);
+  final identityInput = document.querySelector('input[name="sfzjh"]');
+  final accountInput = document.querySelector('input[name="account"]');
+  // 官网成功页偶尔会同时带一段提示脚本。只要身份证表单和账号字段
+  // 完整存在，就应优先按成功页解析，不能被页面中无关的 alert 拦截。
+  if (identityInput != null && accountInput != null) {
+    final returnedAccount = accountInput.attributes['value']?.trim() ?? '';
+    if (returnedAccount != normalizedId) {
+      throw '学校返回的账号与输入账号不一致，已停止重置';
+    }
+    final accountType =
+        document
+            .querySelector('input[name="accounttype"]')
+            ?.attributes['value']
+            ?.trim() ??
+        '2';
+    return PasswordRecoveryAccountResult(
+      studentId: returnedAccount,
+      accountType: accountType,
+    );
+  }
+
+  final message = extractJwxtAlertMessage(html);
+  if (message != null && message.isNotEmpty) {
+    throw normalizePasswordRecoveryAccountError(message);
+  }
+  throw '学校找回密码页面结构发生变化，请稍后重试';
+}
+
+PasswordRecoveryResetResult parsePasswordRecoveryResetResponse(String raw) {
+  final normalized = raw.trim();
+  try {
+    final decoded = jsonDecode(normalized);
+    if (decoded is Map) {
+      final successValue = decoded['success'] ?? decoded['result'];
+      final normalizedSuccess = successValue?.toString().trim().toLowerCase();
+      final success =
+          successValue == true ||
+          successValue == 1 ||
+          normalizedSuccess == 'true' ||
+          normalizedSuccess == '1' ||
+          normalizedSuccess == 'success' ||
+          normalizedSuccess == 'ok';
+      return PasswordRecoveryResetResult(
+        success: success,
+        message:
+            decoded['message']?.toString().trim() ??
+            decoded['msg']?.toString().trim() ??
+            (success ? '密码重置成功' : '密码重置失败'),
+      );
+    }
+  } catch (_) {}
+
+  bool isSuccessMessage(String value) {
+    final text = _compactHtmlText(value);
+    return RegExp(
+      r'(密码\s*(?:已)?重置\s*成功|重置\s*密码\s*成功|密码\s*已重置为|密码\s*重置为.{0,30}后六位|操作\s*成功)',
+    ).hasMatch(text);
+  }
+
+  bool isFailureMessage(String value) {
+    return RegExp(
+      r'(失败|错误|不正确|无效|未录入|不存在|不能为空|验证码有误)',
+    ).hasMatch(_compactHtmlText(value));
+  }
+
+  final document = parse(normalized);
+  final messages = <String>[
+    ..._extractJwxtAlertMessages(normalized),
+    _compactHtmlText(document.querySelector('#showMsg')?.text ?? ''),
+  ].where((message) => message.isNotEmpty).toList(growable: false);
+  for (final message in messages) {
+    if (isFailureMessage(message)) {
+      return PasswordRecoveryResetResult(success: false, message: message);
+    }
+    if (isSuccessMessage(message)) {
+      return PasswordRecoveryResetResult(success: true, message: message);
+    }
+  }
+
+  // Some StrongSoft variants return a small success page instead of JSON.
+  // Only inspect body text when the identity form is no longer present, so
+  // instructional text on the original form cannot impersonate success.
+  final stillOnIdentityForm =
+      document.querySelector('input[name="sfzjh"]') != null;
+  final bodyMessage = _compactHtmlText(document.body?.text ?? '');
+  if (!stillOnIdentityForm && isSuccessMessage(bodyMessage)) {
+    return PasswordRecoveryResetResult(
+      success: true,
+      message: bodyMessage.isEmpty ? '密码重置成功' : bodyMessage,
+    );
+  }
+  if (isFailureMessage(bodyMessage)) {
+    return PasswordRecoveryResetResult(success: false, message: bodyMessage);
+  }
+  return PasswordRecoveryResetResult(
+    success: false,
+    message: messages.isNotEmpty
+        ? messages.first
+        : '学校未返回可识别的重置结果，请勿重复提交并联系教务处确认',
+  );
+}
+
+bool isExpectedJwxtProbeResponse(int? statusCode, String body) {
+  if (statusCode == null || statusCode < 200 || statusCode >= 500) return false;
+  final lower = body.toLowerCase();
+  if (lower.isEmpty) return false;
+  return lower.contains('logintoxk') ||
+      lower.contains('randomcode') ||
+      lower.contains('verifycode.servlet') ||
+      (lower.contains('jsxsd') &&
+          (body.contains('强智') || body.contains('教务') || body.contains('验证码')));
+}
+
+String _nearbyInputText(html_dom.Element input) {
+  html_dom.Element? current = input.parent;
+  for (var depth = 0; current != null && depth < 5; depth++) {
+    final text = _compactHtmlText(current.text);
+    if (text.isNotEmpty) return text;
+    current = current.parent;
+  }
+  return '';
+}
+
+/// 从学校“密码过于简单”页面动态解析字段名与提交地址。强智不同版本的
+/// 字段名不完全一致，因此不硬编码旧/新密码参数，避免升级后把密码填错字段。
+EducationPasswordChangeForm? parseEducationPasswordChangeForm(
+  String html, {
+  String fallbackAction = '/jsxsd/grsz/grsz_xgmm_beg.do',
+}) {
+  final document = parse(html);
+  html_dom.Element? form;
+  for (final candidate in document.querySelectorAll('form')) {
+    final text = _compactHtmlText(candidate.text);
+    final action = candidate.attributes['action']?.toLowerCase() ?? '';
+    if ((text.contains('旧密码') && text.contains('新密码')) ||
+        action.contains('xgmm')) {
+      form = candidate;
+      break;
+    }
+  }
+  if (form == null) return null;
+  final selectedForm = form;
+
+  final hiddenFields = <String, String>{};
+  final passwordInputs = <html_dom.Element>[];
+  final textInputs = <html_dom.Element>[];
+  String? oldField;
+  String? newField;
+  String? confirmField;
+  String? hintField;
+
+  for (final input in selectedForm.querySelectorAll('input')) {
+    final name = input.attributes['name']?.trim() ?? '';
+    if (name.isEmpty || input.attributes.containsKey('disabled')) continue;
+    final type = (input.attributes['type'] ?? 'text').toLowerCase();
+    final value = input.attributes['value'] ?? '';
+    if (type == 'hidden' || input.attributes.containsKey('readonly')) {
+      hiddenFields[name] = value;
+      continue;
+    }
+    if (type == 'password') passwordInputs.add(input);
+    if (type == 'text') textInputs.add(input);
+
+    final nearby = _nearbyInputText(input);
+    if (nearby.contains('确认新密码')) {
+      confirmField = name;
+    } else if (nearby.contains('旧密码')) {
+      oldField = name;
+    } else if (nearby.contains('新密码提示') || nearby.contains('密码提示')) {
+      hintField = name;
+    } else if (nearby.contains('新密码')) {
+      newField = name;
+    }
+  }
+
+  final passwordNames = passwordInputs
+      .map((input) => input.attributes['name']?.trim() ?? '')
+      .where((name) => name.isNotEmpty)
+      .toList(growable: false);
+  if (oldField == null && passwordNames.isNotEmpty) {
+    oldField = passwordNames[0];
+  }
+  if (newField == null && passwordNames.length > 1) {
+    newField = passwordNames[1];
+  }
+  if (confirmField == null && passwordNames.length > 2) {
+    confirmField = passwordNames[2];
+  }
+  if (hintField == null) {
+    for (final input in textInputs.reversed) {
+      if (input.attributes.containsKey('readonly')) continue;
+      final name = input.attributes['name']?.trim() ?? '';
+      if (name.isNotEmpty) {
+        hintField = name;
+        break;
+      }
+    }
+  }
+
+  if (oldField == null ||
+      newField == null ||
+      confirmField == null ||
+      hintField == null) {
+    return null;
+  }
+  var action = selectedForm.attributes['action']?.trim();
+  if (action == null ||
+      action.isEmpty ||
+      action == '#' ||
+      action.toLowerCase().startsWith('javascript:')) {
+    final scriptedAction = RegExp(
+      r'''(?:url\s*:\s*|action\s*=\s*)['"]([^'"]*xgmm[^'"]*)['"]''',
+      caseSensitive: false,
+    ).firstMatch(html)?.group(1);
+    action = scriptedAction?.trim();
+  }
+  return EducationPasswordChangeForm(
+    action: action == null || action.isEmpty ? fallbackAction : action,
+    oldPasswordField: oldField,
+    newPasswordField: newField,
+    confirmPasswordField: confirmField,
+    passwordHintField: hintField,
+    hiddenFields: hiddenFields,
+  );
+}
+
 class GradeFetchResult {
   final List<Map<String, String>> grades;
   final List<String> failedTerms;
 
-  const GradeFetchResult({required this.grades, required this.failedTerms});
+  /// 学校返回了有效成绩表的学期。即使表格为空，也算该学期查询成功，
+  /// 这样本地缓存可以正确清除该学期已经不存在的旧成绩。
+  final List<String> successfulTerms;
+
+  const GradeFetchResult({
+    required this.grades,
+    required this.failedTerms,
+    this.successfulTerms = const [],
+  });
 
   bool get isComplete => failedTerms.isEmpty;
 }
@@ -258,6 +741,16 @@ class JwxtClient {
         _newDirectHttpClient();
   }
 
+  /// The school JWXT endpoint itself only exposes HTTP. Sensitive requests
+  /// are therefore allowed only after the native layer has authenticated the
+  /// pinned Gateway certificate and assigned a tunnel source address. The
+  /// HTTP packets then travel inside that verified encrypted tunnel.
+  void _requireVerifiedCampusTunnel() {
+    if (_vpnSourceAddress == null) {
+      throw '安全保护：未检测到经过网关身份校验的校园加速器隧道，请先重新连接加速器';
+    }
+  }
+
   String _b64(String s) => base64Encode(utf8.encode(s));
 
   /// 探测校园内网（172.20.63.226）是否真正可达。
@@ -297,17 +790,11 @@ class JwxtClient {
     try {
       final r = await probe.get<String>('/jsxsd/');
       final body = r.data ?? '';
-      // 只要目标内网服务器返回了 HTTP 响应就算"可达"。特征字只作为
-      // 正常页面的补充判断，避免页面模板变化时把已连通误报为超时。
-      return (r.statusCode ?? 0) >= 200 &&
-          (r.statusCode ?? 0) < 500 &&
-          (body.contains('强智') ||
-              body.contains('教务') ||
-              body.contains('jsxsd') ||
-              body.contains('验证码') ||
-              body.isNotEmpty);
+      return isExpectedJwxtProbeResponse(r.statusCode, body);
     } catch (_) {
       return false;
+    } finally {
+      probe.close(force: true);
     }
   }
 
@@ -367,6 +854,7 @@ class JwxtClient {
 
   /// 获取验证码
   Future<Uint8List> getCaptcha() async {
+    _requireVerifiedCampusTunnel();
     await _dio.get('/jsxsd/');
     final res = await _dio.get(
       '/jsxsd/verifycode.servlet',
@@ -375,11 +863,243 @@ class JwxtClient {
     return Uint8List.fromList(res.data);
   }
 
+  /// 建立官方“忘记密码”会话并获取该会话对应的验证码。必须先访问入口页，
+  /// 否则验证码 Cookie 与后续 showAccount.do 请求可能不属于同一会话。
+  Future<Uint8List> beginPasswordRecovery() async {
+    _requireVerifiedCampusTunnel();
+    await resetSession();
+    final page = await _dio.get(
+      '/jsxsd/view/findpwd/enteraccount.htmlx',
+      options: Options(validateStatus: (status) => status == 200),
+    );
+    if (!page.data.toString().contains('/jsxsd/system/showAccount.do')) {
+      throw '学校忘记密码页面暂不可用，请稍后重试';
+    }
+    final response = await _dio.get<List<int>>(
+      '/jsxsd/verifycode.servlet?t=${DateTime.now().millisecondsSinceEpoch}',
+      options: Options(
+        responseType: ResponseType.bytes,
+        validateStatus: (status) => status == 200,
+        headers: const {
+          'Referer':
+              'http://172.20.63.226/jsxsd/view/findpwd/enteraccount.htmlx',
+        },
+      ),
+    );
+    final bytes = response.data;
+    if (bytes == null || bytes.isEmpty) throw '获取找回密码验证码失败';
+    return Uint8List.fromList(bytes);
+  }
+
+  Future<PasswordRecoveryAccountResult> verifyPasswordRecoveryAccount({
+    required String studentId,
+    required String captcha,
+  }) async {
+    _requireVerifiedCampusTunnel();
+    final normalizedId = studentId.trim();
+    final normalizedCaptcha = captcha.trim().toLowerCase();
+    if (normalizedId.isEmpty || normalizedCaptcha.isEmpty) {
+      throw '请输入学号和验证码';
+    }
+    final response = await _dio.post<String>(
+      '/jsxsd/system/showAccount.do',
+      data: {
+        'account': normalizedId,
+        'encoded': _b64(normalizedId),
+        'RANDOMCODE': normalizedCaptcha,
+      },
+      options: Options(
+        responseType: ResponseType.plain,
+        contentType: Headers.formUrlEncodedContentType,
+        validateStatus: (status) =>
+            status != null && status >= 200 && status < 500,
+        headers: const {
+          'Referer':
+              'http://172.20.63.226/jsxsd/view/findpwd/enteraccount.htmlx',
+        },
+      ),
+    );
+    return parsePasswordRecoveryAccountPage(
+      response.data ?? '',
+      expectedStudentId: normalizedId,
+    );
+  }
+
+  Future<PasswordRecoveryResetResult> resetPasswordWithIdentity({
+    required PasswordRecoveryAccountResult account,
+    required String identityNumber,
+  }) async {
+    _requireVerifiedCampusTunnel();
+    final identity = identityNumber.trim();
+    if (identity.length < 4) throw '请输入正确的身份证件号';
+    final response = await _dio.post<String>(
+      '/jsxsd/system/resetPasswd.do',
+      data: {
+        'account': account.studentId,
+        'accounttype': account.accountType,
+        'sfzjh': identity,
+        'encoded': _b64(account.studentId),
+      },
+      options: Options(
+        responseType: ResponseType.plain,
+        contentType: Headers.formUrlEncodedContentType,
+        validateStatus: (status) =>
+            status != null && status >= 200 && status < 500,
+        headers: const {
+          'Referer': 'http://172.20.63.226/jsxsd/system/showAccount.do',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+      ),
+    );
+    final initial = parsePasswordRecoveryResetResponse(response.data ?? '');
+    if (initial.success) return initial;
+
+    final location = response.headers.value('location')?.trim() ?? '';
+    final statusCode = response.statusCode ?? 0;
+    final isRedirect = statusCode >= 300 && statusCode < 400;
+    if (!isRedirect || location.isEmpty) return initial;
+    final absolute = Uri.tryParse(location);
+    if (absolute?.hasScheme == true &&
+        absolute!.host != '172.20.63.226' &&
+        absolute.host.toLowerCase() != 'jw.huse.cn') {
+      return initial;
+    }
+
+    // Some versions commit the reset and then redirect to a page containing
+    // the actual result. Follow one same-host GET without resubmitting the ID.
+    final follow = await _dio.get<String>(
+      _jwxtPath(location, basePath: '/jsxsd/view/findpwd/enteraccount.htmlx'),
+      options: Options(
+        responseType: ResponseType.plain,
+        followRedirects: false,
+        validateStatus: (status) =>
+            status != null && status >= 200 && status < 500,
+      ),
+    );
+    return parsePasswordRecoveryResetResponse(follow.data ?? '');
+  }
+
+  String _jwxtPath(String location, {String basePath = '/jsxsd/'}) {
+    final trimmed = location.trim();
+    if (trimmed.isEmpty) return basePath;
+    final resolved = Uri.parse(
+      'http://172.20.63.226$basePath',
+    ).resolve(trimmed);
+    return resolved.hasQuery
+        ? '${resolved.path}?${resolved.query}'
+        : resolved.path;
+  }
+
+  Future<EducationPasswordChangeForm> _loadPasswordChangeForm(
+    String location,
+  ) async {
+    final path = _jwxtPath(location, basePath: '/jsxsd/grsz/grsz_xgmm_beg.do');
+    final response = await _dio.get<String>(
+      path,
+      options: Options(
+        responseType: ResponseType.plain,
+        validateStatus: (status) => status == 200,
+      ),
+    );
+    final form = parseEducationPasswordChangeForm(
+      response.data ?? '',
+      fallbackAction: path,
+    );
+    if (form == null) {
+      throw '教务系统要求修改密码，但无法识别学校的改密页面，请勿保存临时密码';
+    }
+    return form;
+  }
+
+  Future<EducationPasswordChangeResult> submitRequiredPasswordChange({
+    required EducationPasswordChangeForm form,
+    required String oldPassword,
+    required String newPassword,
+    required String confirmPassword,
+    required String passwordHint,
+  }) async {
+    _requireVerifiedCampusTunnel();
+    final validation = educationPasswordValidationError(
+      oldPassword: oldPassword,
+      newPassword: newPassword,
+      confirmPassword: confirmPassword,
+      passwordHint: passwordHint,
+    );
+    if (validation != null) throw validation;
+    final data = <String, String>{
+      ...form.hiddenFields,
+      form.oldPasswordField: oldPassword,
+      form.newPasswordField: newPassword,
+      form.confirmPasswordField: confirmPassword,
+      form.passwordHintField: passwordHint.trim(),
+    };
+    final path = _jwxtPath(
+      form.action,
+      basePath: '/jsxsd/grsz/grsz_xgmm_beg.do',
+    );
+    final response = await _dio.post<String>(
+      path,
+      data: data,
+      options: Options(
+        responseType: ResponseType.plain,
+        followRedirects: false,
+        contentType: Headers.formUrlEncodedContentType,
+        validateStatus: (status) =>
+            status != null && status >= 200 && status < 500,
+        headers: const {
+          'Referer': 'http://172.20.63.226/jsxsd/grsz/grsz_xgmm_beg.do',
+        },
+      ),
+    );
+    final location = response.headers.value('location') ?? '';
+    final raw = response.data?.trim() ?? '';
+    final result = parseEducationPasswordChangeResponse(
+      statusCode: response.statusCode,
+      location: location,
+      raw: raw,
+    );
+    final isRedirect =
+        response.statusCode != null &&
+        response.statusCode! >= 300 &&
+        response.statusCode! < 400;
+    if (result.success ||
+        !isRedirect ||
+        location.trim().isEmpty ||
+        location.contains('://')) {
+      return result;
+    }
+
+    // 有些版本改密后先 302 回到改密入口，再在下一次 GET 中展示“修改成功”；
+    // 只看第一跳会把已经成功的密码修改误报为失败。这里最多跟随一次跳转，
+    // 不会再次提交密码，也不会对外部地址发起请求。
+    final redirectPath = _jwxtPath(
+      location,
+      basePath: '/jsxsd/grsz/grsz_xgmm_beg.do',
+    );
+    final follow = await _dio.get<String>(
+      redirectPath,
+      options: Options(
+        responseType: ResponseType.plain,
+        followRedirects: false,
+        validateStatus: (status) =>
+            status != null && status >= 200 && status < 500,
+        headers: const {
+          'Referer': 'http://172.20.63.226/jsxsd/grsz/grsz_xgmm_beg.do',
+        },
+      ),
+    );
+    return parseEducationPasswordChangeResponse(
+      statusCode: follow.statusCode,
+      location: follow.headers.value('location') ?? '',
+      raw: follow.data?.trim() ?? '',
+    );
+  }
+
   /// 登录
-  Future<bool> login(String id, String pwd, String code) async {
-    // 验证码区分大小写；这里明确只去掉输入框首尾空白，绝不调用
-    // toUpperCase()/toLowerCase()，提交值必须与用户输入保持完全一致。
-    final captcha = code.trim();
+  Future<JwxtLoginResult> login(String id, String pwd, String code) async {
+    _requireVerifiedCampusTunnel();
+    // 教务验证码统一按小写提交，避免用户照着图片输入大写时被误判。
+    final captcha = code.trim().toLowerCase();
     final logonRes = await _dio.get(
       '/Logon.do?method=logon',
       options: Options(validateStatus: (s) => true),
@@ -413,13 +1133,25 @@ class JwxtClient {
     if (res.statusCode == 302 || res.statusCode == 301) {
       final loc = res.headers.value('location') ?? '';
       final lowerLoc = loc.toLowerCase();
+      if (lowerLoc.contains('grsz_xgmm')) {
+        isLoggedIn = false;
+        final form = await _loadPasswordChangeForm(loc);
+        return JwxtLoginResult.passwordChangeRequired(form);
+      }
       if (lowerLoc.contains('framework') || lowerLoc.contains('xsmain')) {
         isLoggedIn = true;
-        return true;
+        return const JwxtLoginResult.success();
       }
     }
 
     final html = res.data.toString();
+    if (html.contains('密码过于简单') || html.contains('grsz_xgmm')) {
+      isLoggedIn = false;
+      final form =
+          parseEducationPasswordChangeForm(html) ??
+          await _loadPasswordChangeForm('/jsxsd/grsz/grsz_xgmm_beg.do');
+      return JwxtLoginResult.passwordChangeRequired(form);
+    }
     final errorMatch = RegExp(
       r'<font[^>]*id="showMsg"[^>]*>(.*?)</font>',
       dotAll: true,
@@ -431,7 +1163,7 @@ class JwxtClient {
         html.contains('学籍成绩') ||
         html.contains('framework')) {
       isLoggedIn = true;
-      return true;
+      return const JwxtLoginResult.success();
     }
     final plain = parse(html).body?.text.replaceAll(RegExp(r'\s+'), ' ').trim();
     final hint = plain == null || plain.isEmpty
@@ -439,7 +1171,7 @@ class JwxtClient {
         : plain.length > 100
         ? plain.substring(0, 100)
         : plain;
-    throw hint == null ? '教务登录失败：请检查教务密码和验证码（验证码区分大小写）' : '教务登录失败：$hint';
+    throw hint == null ? '教务登录失败：请检查教务密码和验证码' : '教务登录失败：$hint';
   }
 
   /// 获取课表（POST带完整表单参数）；内部委托给 fetchScheduleHtml + parseScheduleHtml
@@ -461,6 +1193,7 @@ class JwxtClient {
   /// 仅抓取课表原始 HTML 字符串（含可能的 iframe 自动跟随），不解析。
   /// 暴露为 public 是为了让 UI 层在解析失败时把原始 HTML 保存下来用于排查。
   Future<String> fetchScheduleHtml(String term) async {
+    _requireVerifiedCampusTunnel();
     // 1) 先 GET 课表页面：建立页面上下文（金智教务直接 POST 常返回空），
     //    并从表单中读取本校真实的 kbjcmsid（节次模式ID，各校不同，硬编码极易查不到课）。
     String kbjcmsid = _kbjcmsidCache ?? '8E05FF03C15B4CD7AD02FA8443BB4BF6';
@@ -552,13 +1285,19 @@ class JwxtClient {
     }
   }
 
-  /// 获取成绩（所有学期）
-  Future<GradeFetchResult> getAllGrades() async {
-    final terms = AcademicCalendar.terms;
+  /// 获取指定学期的成绩；未传参数时保留全量抓取行为，供手动刷新使用。
+  Future<GradeFetchResult> getAllGrades({Iterable<String>? terms}) async {
+    _requireVerifiedCampusTunnel();
+    final requestedTerms = (terms ?? AcademicCalendar.terms)
+        .map((term) => term.trim())
+        .where((term) => term.isNotEmpty)
+        .toSet()
+        .toList(growable: false);
 
     final List<Map<String, String>> allGrades = [];
     final failedTerms = <String>[];
-    for (final term in terms) {
+    final successfulTerms = <String>[];
+    for (final term in requestedTerms) {
       try {
         final res = await _dio.post(
           '/jsxsd/kscj/cjcx_list',
@@ -577,6 +1316,7 @@ class JwxtClient {
           failedTerms.add(term);
           continue;
         }
+        successfulTerms.add(term);
         final grades = _parseGradeHtml(responseHtml);
         allGrades.addAll(grades);
       } catch (_) {
@@ -591,7 +1331,11 @@ class JwxtClient {
     }).toList();
 
     unique.sort((a, b) => (b['term'] ?? '').compareTo(a['term'] ?? ''));
-    return GradeFetchResult(grades: unique, failedTerms: failedTerms);
+    return GradeFetchResult(
+      grades: unique,
+      failedTerms: failedTerms,
+      successfulTerms: successfulTerms,
+    );
   }
 
   /// 解析成绩HTML
@@ -1039,6 +1783,19 @@ class AcademicCalendar {
 
   static bool isBeforeLatestTermQueryDate(DateTime now) =>
       now.isBefore(latestTermQueryDate);
+
+  /// 返回已经开始的、按学期列表顺序排列的第一个学期。
+  ///
+  /// [latestTerm] 可能会在新学期开始前提前写入配置；成绩快速同步不能在
+  /// 这个时间点查询一个尚未开放的学期，否则会漏掉当前仍在展示成绩的学期。
+  static String get latestAvailableTerm {
+    final now = DateTime.now();
+    for (final term in terms) {
+      final start = termStartDates[term];
+      if (start == null || !start.isAfter(now)) return term;
+    }
+    return terms.first;
+  }
 }
 
 class OfflineSyncResult {
@@ -1047,6 +1804,8 @@ class OfflineSyncResult {
   final List<String> failedTerms;
   final List<String> failedGradeTerms;
   final bool gradesUpdated;
+  final bool schedulesUpdated;
+  final bool schedulesSkipped;
 
   const OfflineSyncResult({
     required this.savedTermCount,
@@ -1054,64 +1813,118 @@ class OfflineSyncResult {
     required this.failedTerms,
     required this.failedGradeTerms,
     required this.gradesUpdated,
+    required this.schedulesUpdated,
+    required this.schedulesSkipped,
   });
 }
 
-/// 教务认证成功后执行一次完整同步。主页只读取这里写下来的本地静态文件，
-/// 不会因为切换课表或成绩页面再次访问校园网。
+/// 教务认证成功后同步离线数据。
+///
+/// 常规同步只查询最新可用学期成绩，避免每次登录都重新抓取全部旧成绩；
+/// 手动刷新成绩时传入 [GradeSyncScope.all]，才会查询所有配置学期。
+/// 主页只读取这里写下来的本地静态文件，不会因为切换课表或成绩页面再次
+/// 访问校园网。
 Future<OfflineSyncResult> syncOfflineUserData({
   required String studentId,
   void Function(String message)? onProgress,
+  GradeSyncScope gradeSyncScope = GradeSyncScope.latest,
+  bool syncSchedules = true,
+  bool forceScheduleSync = false,
+  bool syncGrades = true,
 }) async {
   final client = JwxtClient();
   final htmlByTerm = <String, String>{};
   final failedTerms = <String>[];
   final terms = AcademicCalendar.terms;
+  final hadScheduleBefore = await _hasLocalSchedule(studentId);
+  final shouldSyncSchedules =
+      syncSchedules && (forceScheduleSync || !hadScheduleBefore);
 
-  for (var index = 0; index < terms.length; index++) {
-    final term = terms[index];
-    onProgress?.call('正在保存课表 ${index + 1}/${terms.length}：$term');
-    try {
-      final html = await client
-          .fetchScheduleHtml(term)
-          .timeout(const Duration(seconds: 30));
-      if (html.trim().isEmpty) throw '课表响应为空';
-      htmlByTerm[term] = html;
-    } catch (_) {
-      failedTerms.add(term);
+  if (shouldSyncSchedules) {
+    // 只保存一个最新的、已经发布的学期。新学期可能已经出现在配置中，
+    // 但教务系统尚未发布课表，因此按新旧顺序逐个回退，直到拿到可解析课表。
+    for (var index = 0; index < terms.length; index++) {
+      final term = terms[index];
+      onProgress?.call('正在查找最新课表 ${index + 1}/${terms.length}：$term');
+      try {
+        final html = await client
+            .fetchScheduleHtml(term)
+            .timeout(const Duration(seconds: 30));
+        if (html.trim().isEmpty) throw '课表响应为空';
+        if (parseScheduleHtml(html).isEmpty) {
+          // 空表通常表示该学期尚未发布；继续尝试第二新学期。
+          continue;
+        }
+        htmlByTerm[term] = html;
+        break;
+      } catch (_) {
+        failedTerms.add(term);
+      }
     }
   }
 
-  onProgress?.call('正在保存全部成绩…');
   GradeFetchResult gradeResult;
-  try {
-    gradeResult = await client.getAllGrades().timeout(
-      const Duration(minutes: 2),
+  if (syncGrades) {
+    final gradeTerms = gradeSyncScope == GradeSyncScope.all
+        ? terms
+        : <String>[AcademicCalendar.latestAvailableTerm];
+    onProgress?.call(
+      gradeSyncScope == GradeSyncScope.all ? '正在手动更新全部成绩…' : '正在更新最新学期成绩…',
     );
-  } catch (_) {
-    gradeResult = GradeFetchResult(
-      grades: const [],
-      failedTerms: List<String>.from(terms),
+    try {
+      gradeResult = await client
+          .getAllGrades(terms: gradeTerms)
+          .timeout(const Duration(minutes: 2));
+    } catch (_) {
+      gradeResult = GradeFetchResult(
+        grades: const [],
+        failedTerms: List<String>.from(gradeTerms),
+      );
+    }
+  } else {
+    gradeResult = const GradeFetchResult(
+      grades: [],
+      failedTerms: [],
+      successfulTerms: [],
     );
   }
-  if (htmlByTerm.isEmpty && gradeResult.grades.isEmpty) {
+  if (htmlByTerm.isEmpty &&
+      gradeResult.successfulTerms.isEmpty &&
+      !hadScheduleBefore) {
     throw '教务认证成功，但未能获取可保存的课表或成绩，请稍后重新连接更新';
   }
 
-  onProgress?.call('正在写入本地离线主页…');
+  if (htmlByTerm.isNotEmpty || gradeResult.successfulTerms.isNotEmpty) {
+    onProgress?.call('正在写入本地离线主页…');
+  }
   await UserDataCacheStore.saveSnapshot(
     studentId: studentId,
     scheduleHtmlByTerm: htmlByTerm,
     grades: gradeResult.grades,
-    replaceGrades: gradeResult.isComplete,
+    replaceGrades:
+        syncGrades &&
+        gradeSyncScope == GradeSyncScope.all &&
+        gradeResult.isComplete,
+    replaceGradeTerms: gradeResult.successfulTerms,
+    replaceSchedules: htmlByTerm.isNotEmpty,
   );
   return OfflineSyncResult(
     savedTermCount: htmlByTerm.length,
     gradeCount: gradeResult.grades.length,
     failedTerms: failedTerms,
     failedGradeTerms: gradeResult.failedTerms,
-    gradesUpdated: gradeResult.isComplete,
+    gradesUpdated: syncGrades && gradeResult.isComplete,
+    schedulesUpdated: htmlByTerm.isNotEmpty,
+    schedulesSkipped: syncSchedules && !shouldSyncSchedules,
   );
+}
+
+/// 判断当前账号是否已经有可展示的课表。兼容早期版本的单学期缓存，
+/// 这样普通登录不会因为升级后找不到 profile 而重复抓取全部课表。
+Future<bool> _hasLocalSchedule(String studentId) async {
+  final profile = await UserDataCacheStore.loadProfile(studentId);
+  if (profile != null && profile.scheduleTerms.isNotEmpty) return true;
+  return await ScheduleCacheStore.loadLatest(studentId) != null;
 }
 
 // ==================== 设置持久化（本地文件，全程无云端） ====================
@@ -1127,12 +1940,14 @@ Future<OfflineSyncResult> syncOfflineUserData({
 /// —— 成绩设置 ——
 /// - [gradeCategoryEnabled]：是否启用"已完成 / 历史补考·重修"分类（关闭则所有课混在一组）。
 /// - [gradeSortByYear]：按开课时间（学年）排序，以更大学年为顶，倒序展示。
+/// - [gradeTermFilterEnabled]：是否显示成绩学期筛选器，默认开启。
 class AppSettings {
   bool highlightCurrentWeek;
   bool filterByWeek;
   int currentWeek;
   bool gradeCategoryEnabled;
   bool gradeSortByYear;
+  bool gradeTermFilterEnabled;
 
   AppSettings({
     this.highlightCurrentWeek = false,
@@ -1140,23 +1955,25 @@ class AppSettings {
     this.currentWeek = 1,
     this.gradeCategoryEnabled = true,
     this.gradeSortByYear = true,
+    this.gradeTermFilterEnabled = true,
   });
 
   static const _fileName = 'jizhicha_settings.json';
   // schemaVersion 仅用于老版本 settings.json 的字段迁移；当前版本无加速器字段。
-  static const _schemaVersion = 4;
+  static const _schemaVersion = 5;
 
   /// 配置文件路径：优先用系统用户目录（Windows %APPDATA%），保证桌面端可写且稳定；
   /// 移动端没有这些环境变量，要回退到平台沙盒目录，否则会落到只读根目录。
   static Future<File> _file() async {
     final Directory folder;
     if (Platform.isWindows) {
-      final base = Platform.environment['APPDATA'] ??
+      final base =
+          Platform.environment['APPDATA'] ??
           Platform.environment['HOME'] ??
           Directory.current.path;
       folder = Directory(base);
     } else {
-      // Android / iOS / Linux / macOS 使用 path_provider 提供的应用文档目录，
+      // Android / Linux 使用 path_provider 提供的应用文档目录，
       // 避免 FileSystemException: Creation failed '/...' (OS Error: Read-only file system)。
       final dir = await getApplicationDocumentsDirectory();
       folder = dir;
@@ -1184,6 +2001,8 @@ class AppSettings {
             currentWeek: json['currentWeek'] as int? ?? 1,
             gradeCategoryEnabled: json['gradeCategoryEnabled'] as bool? ?? true,
             gradeSortByYear: json['gradeSortByYear'] as bool? ?? true,
+            gradeTermFilterEnabled:
+                json['gradeTermFilterEnabled'] as bool? ?? true,
           );
         }
         return AppSettings(
@@ -1192,6 +2011,8 @@ class AppSettings {
           currentWeek: json['currentWeek'] as int? ?? 1,
           gradeCategoryEnabled: json['gradeCategoryEnabled'] as bool? ?? true,
           gradeSortByYear: json['gradeSortByYear'] as bool? ?? true,
+          gradeTermFilterEnabled:
+              json['gradeTermFilterEnabled'] as bool? ?? true,
         );
       }
     } catch (_) {}
@@ -1209,18 +2030,25 @@ class AppSettings {
           'currentWeek': currentWeek,
           'gradeCategoryEnabled': gradeCategoryEnabled,
           'gradeSortByYear': gradeSortByYear,
+          'gradeTermFilterEnabled': gradeTermFilterEnabled,
         }),
       );
     } catch (_) {}
   }
 }
 
-/// IndexedStack 会保留课表、成绩与设置页各自的 State。设置写入本地文件后，
+/// 首页的页面栈会保留课表、成绩与设置页各自的 State。设置写入本地文件后，
 /// 通过统一修订号通知其它仍在内存中的页面立即重新读取，避免必须重启或重新登录。
 final ValueNotifier<int> _appSettingsRevision = ValueNotifier<int>(0);
 
-String _acceleratorText(Object value) =>
-    '$value'.replaceAll(RegExp('vpn', caseSensitive: false), '加速器');
+String _acceleratorText(Object value) {
+  final text = '$value';
+  if (text.toLowerCase().contains('spki pin mismatch')) {
+    return '加速器网关身份验证失败：服务器证书与应用内置安全指纹不一致。'
+        '为保护账号密码，连接已中止，请联系作者核对网关证书。';
+  }
+  return text.replaceAll(RegExp('vpn', caseSensitive: false), '加速器');
+}
 
 void _notifyAppSettingsChanged() {
   _appSettingsRevision.value += 1;
@@ -1420,7 +2248,8 @@ class CampusVpnLauncher {
           while ((virtualIp == null || virtualIp.isEmpty) && attempts < 5) {
             attempts += 1;
             await Future<void>.delayed(const Duration(milliseconds: 500));
-            virtualIp = _bindings.status()['virtual_ip']?.toString();
+            virtualIp = (await _bindings.androidStatus())['virtual_ip']
+                ?.toString();
           }
           if (virtualIp == null || virtualIp.isEmpty) {
             throw '加速器已连接但虚拟 IP 未下发，请重试';
@@ -1842,8 +2671,20 @@ class _ModeCard extends StatelessWidget {
 class VpnSetupPage extends StatefulWidget {
   final AppMode mode;
   final String? initialNotice;
+  final GradeSyncScope gradeSyncScope;
+  final bool syncSchedules;
+  final bool forceScheduleSync;
+  final bool syncGrades;
 
-  const VpnSetupPage({required this.mode, this.initialNotice, super.key});
+  const VpnSetupPage({
+    required this.mode,
+    this.initialNotice,
+    this.gradeSyncScope = GradeSyncScope.latest,
+    this.syncSchedules = true,
+    this.forceScheduleSync = false,
+    this.syncGrades = true,
+    super.key,
+  });
 
   @override
   State<VpnSetupPage> createState() => _VpnSetupPageState();
@@ -1854,6 +2695,7 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
   final _passwordCtrl = TextEditingController();
   List<StoredAccount> _savedAccounts = const [];
   bool _submitting = false;
+  AppMode? _connectingMode;
   String? _error;
   String? _progress;
   bool _initialNoticeShown = false;
@@ -1920,7 +2762,13 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
     }
     if (!mounted) return;
     final next = education
-        ? EducationLoginPage(studentId: studentId)
+        ? EducationLoginPage(
+            studentId: studentId,
+            gradeSyncScope: widget.gradeSyncScope,
+            syncSchedules: widget.syncSchedules,
+            forceScheduleSync: widget.forceScheduleSync,
+            syncGrades: widget.syncGrades,
+          )
         : CampusNavigatorPage(studentId: studentId);
     Navigator.of(
       context,
@@ -1934,14 +2782,15 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
       setState(() => _error = '请输入学号和加速器密码');
       return;
     }
+    final selectedMode = targetMode ?? widget.mode;
     FocusScope.of(context).unfocus();
     setState(() {
       _submitting = true;
+      _connectingMode = selectedMode;
       _error = null;
       _progress = '正在启动校园加速器…';
     });
     try {
-      final selectedMode = targetMode ?? widget.mode;
       final launcher = CampusVpnLauncher();
       final currentStatus = await launcher.currentStatus();
       if (currentStatus?['connected'] == true) {
@@ -2001,14 +2850,15 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
           ? '上次没有正常下线，请再认证一次'
           : lowerMessage.contains('gateway session setup timed out')
           ? '学校加速器网关响应超时，已自动重试，请稍候后再次认证'
-          : message.contains('SAC LOGIN rejected')
-          ? '学校加速器认证失败：请确认这里填写的是学校加速器密码。右侧的教务密码会在加速器连接成功后下一页输入。\n$message'
+          : lowerMessage.contains('sac login rejected')
+          ? '加速器认证失败（默认为身份证后六位数字）,请检查是否填入错误密码'
           : message;
       if (mounted) setState(() => _error = displayMessage);
     } finally {
       if (mounted) {
         setState(() {
           _submitting = false;
+          _connectingMode = null;
           _progress = null;
         });
       }
@@ -2019,6 +2869,23 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
   Widget build(BuildContext context) {
     const title = '连接校园加速器';
     final colorScheme = Theme.of(context).colorScheme;
+    final connectingVpn = _submitting && _connectingMode == AppMode.vpnOnly;
+    final connectingEducation =
+        _submitting && _connectingMode == AppMode.education;
+    FilledButtonThemeData? connectionButtonTheme(bool active) {
+      if (!_submitting) return null;
+      return FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          disabledBackgroundColor: active
+              ? colorScheme.primary
+              : colorScheme.surfaceContainerHighest,
+          disabledForegroundColor: active
+              ? colorScheme.onPrimary
+              : colorScheme.onSurfaceVariant,
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(title: Text(title)),
       body: SafeArea(
@@ -2086,31 +2953,37 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
                   Row(
                     children: [
                       Expanded(
-                        child: FilledButton.icon(
-                          onPressed: _submitting
-                              ? null
-                              : () => _connect(targetMode: AppMode.vpnOnly),
-                          icon: _submitting
-                              ? _ButtonSpinner(color: colorScheme.onPrimary)
-                              : const Icon(Icons.vpn_lock),
-                          label: Text(
-                            _submitting ? '正在连接…' : '仅启动加速器',
+                        child: FilledButtonTheme(
+                          data:
+                              connectionButtonTheme(connectingVpn) ??
+                              const FilledButtonThemeData(),
+                          child: FilledButton.icon(
+                            onPressed: _submitting
+                                ? null
+                                : () => _connect(targetMode: AppMode.vpnOnly),
+                            icon: connectingVpn
+                                ? _ButtonSpinner(color: colorScheme.onPrimary)
+                                : const Icon(Icons.vpn_lock),
+                            label: Text(connectingVpn ? '正在连接…' : '仅启动加速器'),
                           ),
                         ),
                       ),
                       const SizedBox(width: 12),
                       Expanded(
-                        child: FilledButton.icon(
-                          onPressed: _submitting
-                              ? null
-                              : () => _connect(targetMode: AppMode.education),
-                          icon: _submitting
-                              ? _ButtonSpinner(color: colorScheme.onPrimary)
-                              : const Icon(Icons.school),
-                          label: Text(
-                            _submitting
-                                ? '正在连接…'
-                                : '启动加速器并查询教务',
+                        child: FilledButtonTheme(
+                          data:
+                              connectionButtonTheme(connectingEducation) ??
+                              const FilledButtonThemeData(),
+                          child: FilledButton.icon(
+                            onPressed: _submitting
+                                ? null
+                                : () => _connect(targetMode: AppMode.education),
+                            icon: connectingEducation
+                                ? _ButtonSpinner(color: colorScheme.onPrimary)
+                                : const Icon(Icons.school),
+                            label: Text(
+                              connectingEducation ? '正在连接…' : '启动加速器并查询教务',
+                            ),
                           ),
                         ),
                       ),
@@ -2123,15 +2996,23 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
                     child: FilledButton.icon(
                       onPressed:
                           _submitting ||
-                              (!Platform.isWindows &&
-                                  !Platform.isAndroid &&
-                                  !Platform.isIOS)
-                              ? null
-                              : () => _connect(targetMode: AppMode.vpnOnly),
+                              (!Platform.isWindows && !Platform.isAndroid)
+                          ? null
+                          : () => _connect(targetMode: AppMode.vpnOnly),
                       style: FilledButton.styleFrom(
                         minimumSize: const Size.fromHeight(54),
+                        disabledBackgroundColor: _submitting
+                            ? connectingVpn
+                                  ? colorScheme.primary
+                                  : colorScheme.surfaceContainerHighest
+                            : null,
+                        disabledForegroundColor: _submitting
+                            ? connectingVpn
+                                  ? colorScheme.onPrimary
+                                  : colorScheme.onSurfaceVariant
+                            : null,
                       ),
-                      icon: _submitting
+                      icon: connectingVpn
                           ? SizedBox(
                               width: 18,
                               height: 18,
@@ -2141,9 +3022,7 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
                               ),
                             )
                           : const Icon(Icons.vpn_lock),
-                      label: Text(
-                        _submitting ? '正在连接…' : '仅启动加速器',
-                      ),
+                      label: Text(connectingVpn ? '正在连接…' : '仅启动加速器'),
                     ),
                   ),
                   const SizedBox(height: 12),
@@ -2152,15 +3031,23 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
                     child: FilledButton.icon(
                       onPressed:
                           _submitting ||
-                              (!Platform.isWindows &&
-                                  !Platform.isAndroid &&
-                                  !Platform.isIOS)
-                              ? null
-                              : () => _connect(targetMode: AppMode.education),
+                              (!Platform.isWindows && !Platform.isAndroid)
+                          ? null
+                          : () => _connect(targetMode: AppMode.education),
                       style: FilledButton.styleFrom(
                         minimumSize: const Size.fromHeight(54),
+                        disabledBackgroundColor: _submitting
+                            ? connectingEducation
+                                  ? colorScheme.primary
+                                  : colorScheme.surfaceContainerHighest
+                            : null,
+                        disabledForegroundColor: _submitting
+                            ? connectingEducation
+                                  ? colorScheme.onPrimary
+                                  : colorScheme.onSurfaceVariant
+                            : null,
                       ),
-                      icon: _submitting
+                      icon: connectingEducation
                           ? SizedBox(
                               width: 18,
                               height: 18,
@@ -2170,9 +3057,7 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
                               ),
                             )
                           : const Icon(Icons.school),
-                      label: Text(
-                        _submitting ? '正在连接…' : '启动加速器并查询教务',
-                      ),
+                      label: Text(connectingEducation ? '正在连接…' : '启动加速器并查询教务'),
                     ),
                   ),
                 ],
@@ -2245,13 +3130,741 @@ class _ButtonSpinner extends StatelessWidget {
   }
 }
 
+enum _PasswordRecoveryStep { account, identity, success }
+
+class PasswordRecoveryOutcome {
+  final String studentId;
+  final bool localCredentialsInvalidated;
+
+  const PasswordRecoveryOutcome({
+    required this.studentId,
+    required this.localCredentialsInvalidated,
+  });
+}
+
+class EducationPasswordChangedOutcome {
+  final String studentId;
+  final String newPassword;
+
+  const EducationPasswordChangedOutcome({
+    required this.studentId,
+    required this.newPassword,
+  });
+}
+
+class EducationPasswordRecoveryPage extends StatefulWidget {
+  final String initialStudentId;
+
+  const EducationPasswordRecoveryPage({
+    required this.initialStudentId,
+    super.key,
+  });
+
+  @override
+  State<EducationPasswordRecoveryPage> createState() =>
+      _EducationPasswordRecoveryPageState();
+}
+
+class _EducationPasswordRecoveryPageState
+    extends State<EducationPasswordRecoveryPage> {
+  late final TextEditingController _studentIdCtrl;
+  final _captchaCtrl = TextEditingController();
+  final _identityCtrl = TextEditingController();
+  _PasswordRecoveryStep _step = _PasswordRecoveryStep.account;
+  PasswordRecoveryAccountResult? _verifiedAccount;
+  Uint8List? _captchaBytes;
+  bool _loadingCaptcha = false;
+  bool _submitting = false;
+  bool _showIdentity = false;
+  bool _localCredentialsInvalidated = false;
+  String? _error;
+  String? _successMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _studentIdCtrl = TextEditingController(text: widget.initialStudentId);
+    _loadRecoveryCaptcha();
+  }
+
+  @override
+  void dispose() {
+    _studentIdCtrl.dispose();
+    _captchaCtrl.dispose();
+    _identityCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadRecoveryCaptcha({bool clearError = true}) async {
+    if (_loadingCaptcha || _submitting) return;
+    setState(() {
+      _loadingCaptcha = true;
+      _captchaBytes = null;
+      _captchaCtrl.clear();
+      if (clearError) _error = null;
+    });
+    try {
+      final bytes = await JwxtClient().beginPasswordRecovery().timeout(
+        const Duration(seconds: 15),
+      );
+      if (mounted) setState(() => _captchaBytes = bytes);
+    } catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    } finally {
+      if (mounted) setState(() => _loadingCaptcha = false);
+    }
+  }
+
+  Future<void> _verifyAccount() async {
+    if (_submitting || _loadingCaptcha) return;
+    final studentId = _studentIdCtrl.text.trim();
+    final captcha = _captchaCtrl.text.trim();
+    if (studentId.isEmpty || captcha.isEmpty) {
+      setState(() => _error = '请输入学生学号和验证码');
+      return;
+    }
+    if (!RegExp(r'^\d+$').hasMatch(studentId)) {
+      setState(() => _error = passwordRecoveryStudentIdError);
+      return;
+    }
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    try {
+      final result = await JwxtClient().verifyPasswordRecoveryAccount(
+        studentId: studentId,
+        captcha: captcha,
+      );
+      if (!mounted) return;
+      setState(() {
+        _verifiedAccount = result;
+        _studentIdCtrl.text = result.studentId;
+        _step = _PasswordRecoveryStep.identity;
+        _captchaCtrl.clear();
+        _captchaBytes = null;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _error = '$error';
+        _submitting = false;
+      });
+      await _loadRecoveryCaptcha(clearError: false);
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  Future<void> _resetWithIdentity() async {
+    if (_submitting) return;
+    final account = _verifiedAccount;
+    final identity = _identityCtrl.text.trim();
+    if (account == null) {
+      setState(() => _error = '账号验证会话已失效，请返回上一步重新验证');
+      return;
+    }
+    if (identity.length < 4) {
+      setState(() => _error = '请输入正确的身份证件号');
+      return;
+    }
+    final confirmed =
+        await showDialog<bool>(
+          context: context,
+          builder: (context) {
+            final colorScheme = Theme.of(context).colorScheme;
+            return AlertDialog(
+              title: Text(
+                '确认重置教务密码？',
+                style: TextStyle(
+                  color: colorScheme.onSurface,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              content: Text(
+                '确认后，学校会把教务密码重置为身份证件号后六位。旧教务密码会立即从本机删除，临时密码不会保存。',
+                style: TextStyle(color: colorScheme.onSurface),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('确认重置'),
+                ),
+              ],
+            );
+          },
+        ) ??
+        false;
+    if (!confirmed || !mounted) return;
+
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    try {
+      final result = await JwxtClient().resetPasswordWithIdentity(
+        account: account,
+        identityNumber: identity,
+      );
+      if (!result.success) throw result.message;
+
+      // 服务器已经完成重置后，立刻擦除身份证输入和本地旧密码。即使后续
+      // 页面关闭，也不会把旧密码或身份证件号留在控制器/安全存储中。
+      _identityCtrl.clear();
+      final invalidated = await CredentialStore.invalidateEducationPassword(
+        account.studentId,
+      );
+      await JwxtClient().resetSession();
+      if (!mounted) return;
+      setState(() {
+        _localCredentialsInvalidated = invalidated;
+        _successMessage = result.message;
+        _step = _PasswordRecoveryStep.success;
+      });
+    } catch (error) {
+      _identityCtrl.clear();
+      if (mounted) setState(() => _error = '$error');
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  void _backToAccountStep() {
+    if (_submitting) return;
+    setState(() {
+      _step = _PasswordRecoveryStep.account;
+      _verifiedAccount = null;
+      _identityCtrl.clear();
+      _error = null;
+    });
+    _loadRecoveryCaptcha();
+  }
+
+  Widget _stepHeader(ColorScheme colorScheme) {
+    final current = switch (_step) {
+      _PasswordRecoveryStep.account => 1,
+      _PasswordRecoveryStep.identity => 2,
+      _PasswordRecoveryStep.success => 3,
+    };
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        for (var i = 1; i <= 3; i++) ...[
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 220),
+            width: 32,
+            height: 32,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: i <= current
+                  ? colorScheme.primary
+                  : colorScheme.surfaceContainerHighest,
+            ),
+            child: Text(
+              '$i',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: i <= current
+                    ? colorScheme.onPrimary
+                    : colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+          if (i < 3)
+            Container(
+              width: 48,
+              height: 2,
+              color: i < current
+                  ? colorScheme.primary
+                  : colorScheme.outlineVariant,
+            ),
+        ],
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return PopScope(
+      canPop: !_submitting && _step != _PasswordRecoveryStep.success,
+      child: Scaffold(
+        appBar: AppBar(title: const Text('找回教务密码')),
+        body: SafeArea(
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 620),
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
+                children: [
+                  _stepHeader(colorScheme),
+                  const SizedBox(height: 24),
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 240),
+                    child: switch (_step) {
+                      _PasswordRecoveryStep.account => _buildAccountStep(
+                        colorScheme,
+                      ),
+                      _PasswordRecoveryStep.identity => _buildIdentityStep(
+                        colorScheme,
+                      ),
+                      _PasswordRecoveryStep.success => _buildSuccessStep(
+                        colorScheme,
+                      ),
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAccountStep(ColorScheme colorScheme) {
+    return Column(
+      key: const ValueKey('password-recovery-account'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          '第一步：验证学生账号',
+          textAlign: TextAlign.center,
+          style: Theme.of(context).textTheme.titleLarge,
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _studentIdCtrl,
+          keyboardType: TextInputType.number,
+          enabled: !_submitting,
+          decoration: const InputDecoration(
+            labelText: '学生学号',
+            prefixIcon: Icon(Icons.badge_outlined),
+          ),
+        ),
+        const SizedBox(height: 16),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _captchaCtrl,
+                enabled: !_submitting,
+                keyboardType: TextInputType.visiblePassword,
+                textCapitalization: TextCapitalization.none,
+                autocorrect: false,
+                enableSuggestions: false,
+                onChanged: (value) {
+                  final lower = value.toLowerCase();
+                  if (lower == value) return;
+                  _captchaCtrl.value = _captchaCtrl.value.copyWith(
+                    text: lower,
+                    selection: TextSelection.collapsed(offset: lower.length),
+                    composing: TextRange.empty,
+                  );
+                },
+                decoration: const InputDecoration(
+                  labelText: '验证码',
+                  prefixIcon: Icon(Icons.verified_outlined),
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            InkWell(
+              onTap: _loadingCaptcha || _submitting
+                  ? null
+                  : _loadRecoveryCaptcha,
+              borderRadius: BorderRadius.circular(10),
+              child: Container(
+                width: 128,
+                height: 58,
+                decoration: BoxDecoration(
+                  color: colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: colorScheme.outlineVariant),
+                ),
+                alignment: Alignment.center,
+                child: _loadingCaptcha
+                    ? const SizedBox.square(
+                        dimension: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : _captchaBytes == null
+                    ? const Icon(Icons.refresh)
+                    : Image.memory(_captchaBytes!, fit: BoxFit.contain),
+              ),
+            ),
+          ],
+        ),
+        if (_error != null) ...[
+          const SizedBox(height: 16),
+          _ErrorBox(message: _error!),
+        ],
+        const SizedBox(height: 20),
+        FilledButton.icon(
+          onPressed: _submitting || _loadingCaptcha || _captchaBytes == null
+              ? null
+              : _verifyAccount,
+          icon: _submitting
+              ? const SizedBox.square(
+                  dimension: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.arrow_forward),
+          label: Text(_submitting ? '正在验证…' : '下一步：身份验证'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildIdentityStep(ColorScheme colorScheme) {
+    return Column(
+      key: const ValueKey('password-recovery-identity'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          '第二步：核验身份证件号',
+          textAlign: TextAlign.center,
+          style: Theme.of(context).textTheme.titleLarge,
+        ),
+        const SizedBox(height: 12),
+        Text(
+          '登录账号：${_verifiedAccount?.studentId ?? '-'}',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: colorScheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 20),
+        TextField(
+          controller: _identityCtrl,
+          enabled: !_submitting,
+          obscureText: !_showIdentity,
+          keyboardType: TextInputType.visiblePassword,
+          autocorrect: false,
+          enableSuggestions: false,
+          decoration: InputDecoration(
+            labelText: '身份证件号',
+            prefixIcon: const Icon(Icons.credit_card),
+            suffixIcon: IconButton(
+              tooltip: _showIdentity ? '隐藏' : '显示',
+              onPressed: () => setState(() => _showIdentity = !_showIdentity),
+              icon: Icon(
+                _showIdentity ? Icons.visibility_off : Icons.visibility,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Text(
+          '身份证件号仅提交给学校教务系统，不会写入本机文件或安全存储。',
+          style: TextStyle(color: colorScheme.onSurfaceVariant),
+        ),
+        if (_error != null) ...[
+          const SizedBox(height: 16),
+          _ErrorBox(message: _error!),
+        ],
+        const SizedBox(height: 20),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton(
+                onPressed: _submitting ? null : _backToAccountStep,
+                child: const Text('上一步'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: _submitting ? null : _resetWithIdentity,
+                icon: _submitting
+                    ? const SizedBox.square(
+                        dimension: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.restart_alt),
+                label: Text(_submitting ? '正在重置…' : '重置密码'),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSuccessStep(ColorScheme colorScheme) {
+    return Column(
+      key: const ValueKey('password-recovery-success'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Icon(Icons.check_circle, size: 64, color: colorScheme.primary),
+        const SizedBox(height: 14),
+        Text(
+          '密码已由学校重置',
+          textAlign: TextAlign.center,
+          style: Theme.of(context).textTheme.titleLarge,
+        ),
+        const SizedBox(height: 12),
+        Text(_successMessage ?? '密码已重置为身份证件号后六位', textAlign: TextAlign.center),
+        const SizedBox(height: 18),
+        Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: _localCredentialsInvalidated
+                ? colorScheme.primaryContainer.withAlpha(110)
+                : colorScheme.errorContainer,
+            borderRadius: BorderRadius.circular(14),
+          ),
+          child: Text(
+            _localCredentialsInvalidated
+                ? '旧教务密码已从本地删除。请返回登录页，手动输入身份证后六位临时密码；临时密码不会保存。登录后请按提示设置至少 8 位且同时包含字母、数字的新密码。'
+                : '学校已完成重置，但本地安全存储清理未能确认。应用仍会禁止保存 6 位数字临时密码；请返回后不要选择任何旧账号密码，并尽快完成强制改密。',
+          ),
+        ),
+        const SizedBox(height: 22),
+        FilledButton.icon(
+          onPressed: () => Navigator.pop(
+            context,
+            PasswordRecoveryOutcome(
+              studentId: _verifiedAccount!.studentId,
+              localCredentialsInvalidated: _localCredentialsInvalidated,
+            ),
+          ),
+          icon: const Icon(Icons.login),
+          label: const Text('返回教务登录'),
+        ),
+      ],
+    );
+  }
+}
+
+class EducationRequiredPasswordChangePage extends StatefulWidget {
+  final String studentId;
+  final EducationPasswordChangeForm form;
+
+  const EducationRequiredPasswordChangePage({
+    required this.studentId,
+    required this.form,
+    super.key,
+  });
+
+  @override
+  State<EducationRequiredPasswordChangePage> createState() =>
+      _EducationRequiredPasswordChangePageState();
+}
+
+class _EducationRequiredPasswordChangePageState
+    extends State<EducationRequiredPasswordChangePage> {
+  final _oldPasswordCtrl = TextEditingController();
+  final _newPasswordCtrl = TextEditingController();
+  final _confirmPasswordCtrl = TextEditingController();
+  final _hintCtrl = TextEditingController();
+  bool _submitting = false;
+  bool _showPasswords = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _oldPasswordCtrl.clear();
+    _newPasswordCtrl.clear();
+    _confirmPasswordCtrl.clear();
+    _hintCtrl.clear();
+    _oldPasswordCtrl.dispose();
+    _newPasswordCtrl.dispose();
+    _confirmPasswordCtrl.dispose();
+    _hintCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_submitting) return;
+    final oldPassword = _oldPasswordCtrl.text;
+    final newPassword = _newPasswordCtrl.text;
+    final confirmPassword = _confirmPasswordCtrl.text;
+    final hint = _hintCtrl.text.trim();
+    final validation = educationPasswordValidationError(
+      oldPassword: oldPassword,
+      newPassword: newPassword,
+      confirmPassword: confirmPassword,
+      passwordHint: hint,
+    );
+    if (validation != null) {
+      setState(() => _error = validation);
+      return;
+    }
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    try {
+      final result = await JwxtClient().submitRequiredPasswordChange(
+        form: widget.form,
+        oldPassword: oldPassword,
+        newPassword: newPassword,
+        confirmPassword: confirmPassword,
+        passwordHint: hint,
+      );
+      if (!result.success) throw result.message;
+      if (!mounted) return;
+      final outcome = EducationPasswordChangedOutcome(
+        studentId: widget.studentId,
+        newPassword: newPassword,
+      );
+      _oldPasswordCtrl.clear();
+      _newPasswordCtrl.clear();
+      _confirmPasswordCtrl.clear();
+      _hintCtrl.clear();
+      Navigator.pop(context, outcome);
+    } catch (error) {
+      if (mounted) setState(() => _error = '$error');
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return PopScope(
+      canPop: !_submitting,
+      child: Scaffold(
+        appBar: AppBar(title: const Text('设置新的教务密码')),
+        body: SafeArea(
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 620),
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
+                children: [
+                  Icon(Icons.password, size: 54, color: colorScheme.primary),
+                  const SizedBox(height: 14),
+                  Text(
+                    '密码过于简单，请重新设置',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '登录账号：${widget.studentId}',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: colorScheme.onSurfaceVariant),
+                  ),
+                  const SizedBox(height: 20),
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: colorScheme.primaryContainer.withAlpha(110),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: const Text(
+                      '旧密码是刚才用于登录的临时密码；最终新密码至少 8 位，并且必须同时包含字母和数字。',
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  TextField(
+                    controller: _oldPasswordCtrl,
+                    enabled: !_submitting,
+                    obscureText: !_showPasswords,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: const InputDecoration(
+                      labelText: '旧密码（临时密码）',
+                      prefixIcon: Icon(Icons.lock_clock_outlined),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: _newPasswordCtrl,
+                    enabled: !_submitting,
+                    obscureText: !_showPasswords,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: const InputDecoration(
+                      labelText: '新密码',
+                      prefixIcon: Icon(Icons.lock_reset),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: _confirmPasswordCtrl,
+                    enabled: !_submitting,
+                    obscureText: !_showPasswords,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: const InputDecoration(
+                      labelText: '确认新密码',
+                      prefixIcon: Icon(Icons.verified_user_outlined),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  TextField(
+                    controller: _hintCtrl,
+                    enabled: !_submitting,
+                    decoration: const InputDecoration(
+                      labelText: '新密码提示',
+                      prefixIcon: Icon(Icons.lightbulb_outline),
+                      suffixIcon: Tooltip(
+                        message: '作者的话：教务系统预留，目前作用未知',
+                        child: Icon(Icons.help_outline),
+                      ),
+                    ),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('显示密码'),
+                    value: _showPasswords,
+                    onChanged: _submitting
+                        ? null
+                        : (value) => setState(() => _showPasswords = value),
+                  ),
+                  Text(
+                    '新密码和密码提示只会提交给学校；应用仅在学校明确返回修改成功后保存最终新密码。',
+                    style: TextStyle(color: colorScheme.onSurfaceVariant),
+                  ),
+                  if (_error != null) ...[
+                    const SizedBox(height: 16),
+                    _ErrorBox(message: _error!),
+                  ],
+                  const SizedBox(height: 20),
+                  FilledButton.icon(
+                    onPressed: _submitting ? null : _submit,
+                    icon: _submitting
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.save),
+                    label: Text(_submitting ? '正在提交学校…' : '保存新密码'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class EducationLoginPage extends StatefulWidget {
   final String studentId;
   final bool autoFillSavedAccount;
+  final GradeSyncScope gradeSyncScope;
+  final bool syncSchedules;
+  final bool forceScheduleSync;
+  final bool syncGrades;
 
   const EducationLoginPage({
     required this.studentId,
     this.autoFillSavedAccount = false,
+    this.gradeSyncScope = GradeSyncScope.latest,
+    this.syncSchedules = true,
+    this.forceScheduleSync = false,
+    this.syncGrades = true,
     super.key,
   });
 
@@ -2267,9 +3880,12 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
   Uint8List? _captchaBytes;
   bool _loadingCaptcha = false;
   bool _loggingIn = false;
+  bool _openingPasswordRecovery = false;
+  bool _passwordResetPendingInMemory = false;
   String? _syncProgress;
   String? _authenticatedStudentId;
   String? _error;
+  String? _notice;
 
   @override
   void initState() {
@@ -2321,6 +3937,7 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
   }
 
   Future<void> _refreshCaptcha({bool clearError = true}) async {
+    if (_loadingCaptcha) return;
     final previousError = clearError ? null : _error;
     setState(() {
       _loadingCaptcha = true;
@@ -2365,7 +3982,7 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
   }
 
   Future<void> _returnToMain() async {
-    if (_loggingIn) return;
+    if (_loggingIn || _openingPasswordRecovery) return;
     await JwxtClient().resetSession();
     if (!mounted) return;
     Navigator.of(context).pushAndRemoveUntil(
@@ -2376,7 +3993,126 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
     );
   }
 
+  Future<void> _openPasswordRecovery() async {
+    if (_loggingIn || _openingPasswordRecovery) return;
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _openingPasswordRecovery = true;
+      _error = null;
+      _notice = '正在确认校园内网连接…';
+    });
+    try {
+      final reachable = await JwxtClient().waitForIntranet(
+        timeout: const Duration(seconds: 15),
+      );
+      if (!mounted) return;
+      if (!reachable) {
+        setState(() {
+          _notice = null;
+          _error = '忘记密码页面只能在校园内网中使用，请先确认校园加速器已连接';
+        });
+        return;
+      }
+      setState(() => _notice = null);
+      final outcome = await Navigator.of(context).push<PasswordRecoveryOutcome>(
+        MaterialPageRoute(
+          builder: (_) => EducationPasswordRecoveryPage(
+            initialStudentId: _studentIdCtrl.text.trim(),
+          ),
+        ),
+      );
+      if (!mounted) return;
+
+      // 找回流程会使用独立验证码会话。无论用户完成还是取消，返回登录页
+      // 后都重新建立登录验证码，避免拿找回密码的 Cookie 去提交登录。
+      await JwxtClient().resetSession();
+      _captchaCtrl.clear();
+      _authenticatedStudentId = null;
+      if (outcome != null) {
+        _studentIdCtrl.text = outcome.studentId;
+        _passwordCtrl.clear();
+        _passwordResetPendingInMemory = true;
+        await _loadSavedAccounts();
+        if (!mounted) return;
+        setState(() {
+          _savedAccounts = _savedAccounts
+              .where((account) => account.username != outcome.studentId)
+              .toList(growable: false);
+          _passwordCtrl.clear();
+          _notice = outcome.localCredentialsInvalidated
+              ? '旧教务密码已删除。请手动输入身份证后六位临时密码；该临时密码不会保存。'
+              : '学校已完成重置。应用会禁止保存 6 位数字临时密码，请勿继续使用任何旧密码。';
+        });
+      }
+      await _refreshCaptcha(clearError: false);
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _notice = null;
+          _error = '无法打开忘记密码流程：$error';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _openingPasswordRecovery = false);
+    }
+  }
+
+  Future<void> _completeRequiredPasswordChange({
+    required String studentId,
+    required EducationPasswordChangeForm form,
+  }) async {
+    final outcome = await Navigator.of(context)
+        .push<EducationPasswordChangedOutcome>(
+          MaterialPageRoute(
+            builder: (_) => EducationRequiredPasswordChangePage(
+              studentId: studentId,
+              form: form,
+            ),
+          ),
+        );
+    if (!mounted) return;
+    if (outcome == null) {
+      setState(() {
+        _error = '必须完成新密码设置后才能继续；临时密码没有保存';
+      });
+      return;
+    }
+
+    final saved = await CredentialStore.save(
+      StoredAccountKind.education,
+      username: outcome.studentId,
+      password: outcome.newPassword,
+    );
+    if (saved) {
+      await CredentialStore.clearEducationPasswordResetPending(
+        outcome.studentId,
+      );
+    }
+    await JwxtClient().resetSession();
+    if (!mounted) return;
+    _authenticatedStudentId = null;
+    _passwordResetPendingInMemory = !saved;
+    _captchaCtrl.clear();
+    _passwordCtrl.text = saved ? outcome.newPassword : '';
+    await _loadSavedAccounts();
+    if (!mounted) return;
+    setState(() {
+      if (!saved) {
+        _savedAccounts = _savedAccounts
+            .where((account) => account.username != outcome.studentId)
+            .toList(growable: false);
+        _passwordCtrl.clear();
+      }
+      _notice = saved
+          ? '新密码设置成功并已安全保存。请重新输入验证码，用新密码登录。'
+          : '学校已确认新密码设置成功，但本地安全存储写入失败。请手动输入新密码重新登录。';
+      _error = null;
+    });
+    await _refreshCaptcha(clearError: false);
+  }
+
   Future<void> _login() async {
+    String? credentialNotice;
     final studentId = _studentIdCtrl.text.trim();
     final alreadyAuthenticated =
         JwxtClient().isLoggedIn && _authenticatedStudentId == studentId;
@@ -2389,27 +4125,60 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
     FocusScope.of(context).unfocus();
     setState(() {
       _loggingIn = true;
-      _syncProgress = alreadyAuthenticated ? '正在重新保存离线数据…' : '正在认证教务系统…';
+      _syncProgress = !widget.syncGrades
+          ? '正在手动保存最新课表…'
+          : alreadyAuthenticated
+          ? widget.gradeSyncScope == GradeSyncScope.all
+                ? '正在手动更新全部成绩…'
+                : '正在更新最新学期成绩…'
+          : '正在认证教务系统…';
       _error = null;
     });
     try {
       if (!alreadyAuthenticated) {
-        final ok = await JwxtClient().login(
+        final loginPassword = _passwordCtrl.text;
+        final loginResult = await JwxtClient().login(
           studentId,
-          _passwordCtrl.text,
+          loginPassword,
           _captchaCtrl.text.trim(),
         );
-        if (!ok) throw '教务系统未返回登录成功状态';
+        if (loginResult.status == JwxtLoginStatus.passwordChangeRequired) {
+          await _completeRequiredPasswordChange(
+            studentId: studentId,
+            form: loginResult.passwordChangeForm!,
+          );
+          return;
+        }
+        if (!loginResult.isSuccess) throw '教务系统未返回登录成功状态';
         _authenticatedStudentId = studentId;
-        await CredentialStore.save(
-          StoredAccountKind.education,
-          username: studentId,
-          password: _passwordCtrl.text,
-        );
+        final resetPending =
+            _passwordResetPendingInMemory ||
+            await CredentialStore.isEducationPasswordResetPending(studentId);
+        final maySave =
+            !resetPending || isValidFinalEducationPassword(loginPassword);
+        if (maySave) {
+          final saved = await CredentialStore.save(
+            StoredAccountKind.education,
+            username: studentId,
+            password: loginPassword,
+          );
+          if (saved && resetPending) {
+            await CredentialStore.clearEducationPasswordResetPending(studentId);
+            _passwordResetPendingInMemory = false;
+          } else if (!saved) {
+            credentialNotice = '当前密码不符合最终强密码规则或安全存储写入失败，未保存到本地';
+          }
+        } else {
+          credentialNotice = '当前使用的是临时密码，已禁止保存；请尽快设置最终新密码';
+        }
         await _loadSavedAccounts();
       }
       final syncResult = await syncOfflineUserData(
         studentId: studentId,
+        gradeSyncScope: widget.gradeSyncScope,
+        syncSchedules: widget.syncSchedules,
+        forceScheduleSync: widget.forceScheduleSync,
+        syncGrades: widget.syncGrades,
         onProgress: (message) {
           if (mounted) setState(() => _syncProgress = message);
         },
@@ -2418,15 +4187,34 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
       final failedSuffix = syncResult.failedTerms.isEmpty
           ? ''
           : '；${syncResult.failedTerms.length} 个学期暂未更新，已保留原本地数据';
-      final gradeSuffix = syncResult.gradesUpdated ? '' : '；成绩更新不完整，已保留原本地成绩';
+      final gradeSuffix = !widget.syncGrades || syncResult.gradesUpdated
+          ? ''
+          : '；成绩更新不完整，已保留原本地成绩';
+      final gradeScopeText = widget.gradeSyncScope == GradeSyncScope.all
+          ? '全部成绩'
+          : '最新学期成绩';
+      final savedDataPrefix = syncResult.schedulesUpdated
+          ? widget.syncGrades
+                ? '已保存最新一期课表和 '
+                : '已保存最新一期课表'
+          : syncResult.schedulesSkipped
+          ? '本地已有课表，跳过课表保存；'
+          : widget.syncSchedules
+          ? '本次未找到已发布课表；'
+          : '已更新 ';
+      final gradeDescription = widget.syncGrades
+          ? '${syncResult.gradeCount} 条$gradeScopeText'
+          : '';
+      final notice = widget.syncGrades
+          ? '$savedDataPrefix$gradeDescription$failedSuffix$gradeSuffix'
+          : '$savedDataPrefix${failedSuffix.isEmpty ? '' : failedSuffix}';
+      final completeNotice = credentialNotice == null
+          ? notice
+          : '$notice；$credentialNotice';
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute(
-          builder: (_) => HomePage(
-            studentId: studentId,
-            initialNotice:
-                '已保存 ${syncResult.savedTermCount} 个学期课表和 '
-                '${syncResult.gradeCount} 条成绩$failedSuffix$gradeSuffix',
-          ),
+          builder: (_) =>
+              HomePage(studentId: studentId, initialNotice: completeNotice),
         ),
         (_) => false,
       );
@@ -2455,7 +4243,9 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
       appBar: AppBar(
         leadingWidth: 106,
         leading: TextButton.icon(
-          onPressed: _loggingIn ? null : _returnToMain,
+          onPressed: _loggingIn || _openingPasswordRecovery
+              ? null
+              : _returnToMain,
           icon: const Icon(Icons.arrow_back, size: 23),
           label: const Text('返回', style: TextStyle(fontSize: 17)),
         ),
@@ -2478,12 +4268,6 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
                     fontSize: 22,
                     fontWeight: FontWeight.w700,
                   ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '加速器已连接；认证后会一次性保存全部课表与成绩，之后可离线查看',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: colorScheme.onSurfaceVariant),
                 ),
                 const SizedBox(height: 28),
                 TextField(
@@ -2515,6 +4299,18 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
                         textCapitalization: TextCapitalization.none,
                         autocorrect: false,
                         enableSuggestions: false,
+                        onChanged: (value) {
+                          final lower = value.toLowerCase();
+                          if (lower != value) {
+                            _captchaCtrl.value = _captchaCtrl.value.copyWith(
+                              text: lower,
+                              selection: TextSelection.collapsed(
+                                offset: lower.length,
+                              ),
+                              composing: TextRange.empty,
+                            );
+                          }
+                        },
                         decoration: const InputDecoration(
                           labelText: '验证码',
                           prefixIcon: Icon(Icons.verified_outlined),
@@ -2523,7 +4319,12 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
                     ),
                     const SizedBox(width: 12),
                     InkWell(
-                      onTap: _loadingCaptcha ? null : _refreshCaptcha,
+                      onTap:
+                          _loadingCaptcha ||
+                              _loggingIn ||
+                              _openingPasswordRecovery
+                          ? null
+                          : _refreshCaptcha,
                       borderRadius: BorderRadius.circular(10),
                       child: Container(
                         width: 128,
@@ -2556,26 +4357,84 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
                 const SizedBox(height: 20),
                 if (_error != null) _ErrorBox(message: _error!),
                 if (_error != null) const SizedBox(height: 16),
-                SizedBox(
-                  height: 54,
-                  child: FilledButton.icon(
-                    onPressed: _loggingIn ? null : _login,
-                    icon: _loggingIn
-                        ? SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              color: colorScheme.onPrimary,
-                            ),
-                          )
-                        : const Icon(Icons.login),
-                    label: Text(
-                      _loggingIn ? (_syncProgress ?? '正在登录教务…') : '登录并保存离线数据',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+                if (_notice != null) ...[
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: colorScheme.primaryContainer.withAlpha(110),
+                      borderRadius: BorderRadius.circular(14),
                     ),
+                    child: Text(_notice!),
                   ),
+                  const SizedBox(height: 16),
+                ],
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final loginButton = SizedBox(
+                      height: 54,
+                      child: FilledButton.icon(
+                        onPressed: _loggingIn || _openingPasswordRecovery
+                            ? null
+                            : _login,
+                        icon: _loggingIn
+                            ? SizedBox(
+                                width: 18,
+                                height: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: colorScheme.onPrimary,
+                                ),
+                              )
+                            : const Icon(Icons.login),
+                        label: Text(
+                          _loggingIn
+                              ? (_syncProgress ?? '正在登录教务…')
+                              : '登录并保存离线数据',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    );
+                    final forgotButton = SizedBox(
+                      height: 54,
+                      child: OutlinedButton.icon(
+                        onPressed: _loggingIn || _openingPasswordRecovery
+                            ? null
+                            : _openPasswordRecovery,
+                        icon: _openingPasswordRecovery
+                            ? const SizedBox.square(
+                                dimension: 17,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.help_outline),
+                        label: Text(
+                          _openingPasswordRecovery ? '正在检查…' : '忘记密码',
+                        ),
+                      ),
+                    );
+                    if (constraints.maxWidth >= 520) {
+                      return Row(
+                        children: [
+                          Expanded(child: loginButton),
+                          const SizedBox(width: 12),
+                          SizedBox(width: 150, child: forgotButton),
+                        ],
+                      );
+                    }
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        loginButton,
+                        const SizedBox(height: 10),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: forgotButton,
+                        ),
+                      ],
+                    );
+                  },
                 ),
               ],
             ),
@@ -2961,13 +4820,23 @@ class _LoginPageState extends State<LoginPage> {
     }
     setState(() => _loading = true);
     try {
-      final ok = await JwxtClient().login(id, pwd, code);
-      if (ok && mounted) {
-        await CredentialStore.save(
-          StoredAccountKind.education,
-          username: id,
-          password: pwd,
-        );
+      final loginResult = await JwxtClient().login(id, pwd, code);
+      if (loginResult.status == JwxtLoginStatus.passwordChangeRequired) {
+        throw '教务系统要求设置新的强密码，请返回新版教务登录页完成修改；临时密码未保存';
+      }
+      if (loginResult.isSuccess && mounted) {
+        final resetPending =
+            await CredentialStore.isEducationPasswordResetPending(id);
+        if (!resetPending || isValidFinalEducationPassword(pwd)) {
+          final saved = await CredentialStore.save(
+            StoredAccountKind.education,
+            username: id,
+            password: pwd,
+          );
+          if (saved && resetPending) {
+            await CredentialStore.clearEducationPasswordResetPending(id);
+          }
+        }
         await syncOfflineUserData(studentId: id);
         if (!mounted) return;
         Navigator.pushReplacement(
@@ -3212,6 +5081,18 @@ class _LoginPageState extends State<LoginPage> {
                         hintText: '按图片原样输入',
                         prefixIcon: Icon(Icons.security),
                       ),
+                      onChanged: (value) {
+                        final lower = value.toLowerCase();
+                        if (lower != value) {
+                          _codeCtrl.value = _codeCtrl.value.copyWith(
+                            text: lower,
+                            selection: TextSelection.collapsed(
+                              offset: lower.length,
+                            ),
+                            composing: TextRange.empty,
+                          );
+                        }
+                      },
                       maxLength: 4,
                     ),
                   ),
@@ -3415,15 +5296,33 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
+    final pages = <Widget>[
+      SchedulePage(studentId: widget.studentId),
+      GradesPage(studentId: widget.studentId),
+      const FitnessPage(),
+      SettingsPage(studentId: widget.studentId),
+    ];
     return Scaffold(
-      // body 用 IndexedStack 保留各页面 State（切回时不重置表单/滚动位置）。
-      body: IndexedStack(
-        index: _index,
+      // 保留每个页面 State，并用轻微淡入/平移动画切换，避免底部导航
+      // 点击后页面像被硬切开一样割裂。
+      body: Stack(
+        fit: StackFit.expand,
         children: [
-          SchedulePage(studentId: widget.studentId),
-          GradesPage(studentId: widget.studentId),
-          const FitnessPage(),
-          SettingsPage(studentId: widget.studentId),
+          for (var i = 0; i < pages.length; i++)
+            IgnorePointer(
+              ignoring: i != _index,
+              child: AnimatedOpacity(
+                opacity: i == _index ? 1 : 0,
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeOutCubic,
+                child: AnimatedSlide(
+                  offset: i == _index ? Offset.zero : const Offset(0.025, 0),
+                  duration: const Duration(milliseconds: 260),
+                  curve: Curves.easeOutCubic,
+                  child: pages[i],
+                ),
+              ),
+            ),
         ],
       ),
       bottomNavigationBar: NavigationBar(
@@ -3551,9 +5450,16 @@ class _SettingsPageState extends State<SettingsPage> {
       await CampusVpnLauncher().logout();
       await JwxtClient().resetSession();
       final credentialsDeleted = await CredentialStore.deleteAll();
-      if (!credentialsDeleted) throw '无法删除本地加密账号';
-      await UserDataCacheStore.clearAll();
-      await ScheduleCacheStore.clearAll();
+      final userDataDeleted = await UserDataCacheStore.clearAll();
+      final scheduleDeleted = await ScheduleCacheStore.clearAll();
+      final failures = <String>[
+        if (!credentialsDeleted) '加密账号',
+        if (!userDataDeleted) '成绩与课表快照',
+        if (!scheduleDeleted) '旧版课表缓存',
+      ];
+      if (failures.isNotEmpty) {
+        throw '无法彻底删除：${failures.join('、')}';
+      }
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute(builder: (_) => const AppBootstrapPage()),
@@ -3749,6 +5655,25 @@ class _SettingsPageState extends State<SettingsPage> {
                           _persist(notify: true);
                         },
                 ),
+                const Divider(height: 1),
+                SwitchListTile(
+                  title: const Text(
+                    '按学期筛选成绩',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: const Text('已默认开启：在成绩页选择“全部学期”或指定学期，只展示对应学期的成绩。'),
+                  secondary: Icon(
+                    Icons.filter_list,
+                    color: colorScheme.primary,
+                  ),
+                  value: s.gradeTermFilterEnabled,
+                  onChanged: _settings == null
+                      ? null
+                      : (v) {
+                          setState(() => _settings!.gradeTermFilterEnabled = v);
+                          _persist(notify: true);
+                        },
+                ),
               ],
             ),
           ),
@@ -3819,7 +5744,10 @@ class _SettingsPageState extends State<SettingsPage> {
             padding: const EdgeInsets.symmetric(horizontal: 8),
             child: Text(
               '该项目处于测试阶段，发现bug属于特性，请多多反馈或提出issue',
-              style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+              style: TextStyle(
+                fontSize: 12,
+                color: colorScheme.onSurfaceVariant,
+              ),
               textAlign: TextAlign.center,
             ),
           ),
@@ -3851,6 +5779,8 @@ class _SettingsPageState extends State<SettingsPage> {
 }
 
 // ==================== 课表页（带学期选择） ====================
+enum _ScheduleExportFormat { jpg, png, html }
+
 class SchedulePage extends StatefulWidget {
   final String studentId;
 
@@ -3861,6 +5791,7 @@ class SchedulePage extends StatefulWidget {
 }
 
 class _SchedulePageState extends State<SchedulePage> {
+  final _scheduleRepaintKey = GlobalKey();
   List<String> _terms = const [];
   String _selectedTerm = AcademicCalendar.latestTerm;
   List<Map<String, String>> _courses = [];
@@ -3917,6 +5848,23 @@ class _SchedulePageState extends State<SchedulePage> {
       ),
     );
     if (mounted) await _detectCampusEnvironment();
+  }
+
+  Future<void> _openManualScheduleSave() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => const VpnSetupPage(
+          mode: AppMode.education,
+          forceScheduleSync: true,
+          syncGrades: false,
+          initialNotice: '本次仅手动保存最新一期已发布课表',
+        ),
+      ),
+    );
+    if (mounted) {
+      await _initialize();
+      await _detectCampusEnvironment();
+    }
   }
 
   Future<void> _handleCampusAcceleratorAction() async {
@@ -4169,15 +6117,17 @@ class _SchedulePageState extends State<SchedulePage> {
                     },
             ),
           ),
-          // 第二行：导出 HTML + 周次选择（按设置页的"本周视图/按周筛选"决定是否显示与高亮）
+          // 第二行：导出课表 + 周次选择（按设置页的"本周视图/按周筛选"决定是否显示与高亮）
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
             child: Row(
               children: [
                 OutlinedButton.icon(
-                  onPressed: _lastRawHtml.isEmpty ? null : _exportScheduleHtml,
+                  onPressed: _lastRawHtml.isEmpty
+                      ? null
+                      : _chooseScheduleExport,
                   icon: const Icon(Icons.save_alt, size: 16),
-                  label: const Text('导出课表HTML'),
+                  label: const Text('导出课表'),
                 ),
                 const Spacer(),
                 // 仅当开启"本周视图"或"按周筛选"时才需要选择周次
@@ -4226,20 +6176,41 @@ class _SchedulePageState extends State<SchedulePage> {
               ],
             ),
           ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton.icon(
+                onPressed: _loading ? null : _openManualScheduleSave,
+                icon: const Icon(Icons.cloud_download, size: 16),
+                label: const Text('手动保存最新课表'),
+              ),
+            ),
+          ),
           const Divider(),
           Expanded(
-            child: _error != null
-                ? _buildErrorView(context)
-                : _courses.isEmpty
-                ? Center(
-                    child: Text(
-                      _loading ? '正在读取本地课表…' : (_emptyMessage ?? '暂无本地课表数据'),
-                      style: TextStyle(
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  )
-                : _buildScheduleTable(),
+            child: RepaintBoundary(
+              key: _scheduleRepaintKey,
+              child: ColoredBox(
+                color: Theme.of(context).scaffoldBackgroundColor,
+                child: _error != null
+                    ? _buildErrorView(context)
+                    : _courses.isEmpty
+                    ? Center(
+                        child: Text(
+                          _loading
+                              ? '正在读取本地课表…'
+                              : (_emptyMessage ?? '暂无本地课表数据'),
+                          style: TextStyle(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      )
+                    : _buildScheduleTable(),
+              ),
+            ),
           ),
         ],
       ),
@@ -4520,71 +6491,105 @@ class _SchedulePageState extends State<SchedulePage> {
 
     // 3) 表体：本周视图开启时，把"当前周次"传下去做高亮
     final highlightWeek = _s.highlightCurrentWeek ? _s.currentWeek : null;
-    final rows = <TableRow>[];
-    for (final time in orderedTimes) {
-      rows.add(
-        TableRow(
-          children: [
-            _buildTimeCell(time),
-            for (final d in dayOrder)
-              _buildDayCell(tableData[time]?[d] ?? const [], highlightWeek),
-          ],
-        ),
-      );
-    }
 
-    // 4) 渲染：双向滚动（横向保证小屏可看全 8 列，纵向保证多节次可滚动）
-    return SingleChildScrollView(
-      scrollDirection: Axis.vertical,
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        child: Padding(
-          padding: const EdgeInsets.all(8),
-          child: Table(
-            defaultColumnWidth: const FixedColumnWidth(112),
-            columnWidths: const {0: FixedColumnWidth(96)},
-            border: TableBorder(
-              horizontalInside: BorderSide(
-                color: Theme.of(context).colorScheme.outlineVariant,
-                width: 0.5,
-              ),
-              verticalInside: BorderSide(
-                color: Theme.of(context).colorScheme.outlineVariant,
-                width: 0.5,
-              ),
-              top: BorderSide(color: Theme.of(context).colorScheme.outline),
-              bottom: BorderSide(color: Theme.of(context).colorScheme.outline),
-              left: BorderSide(color: Theme.of(context).colorScheme.outline),
-              right: BorderSide(color: Theme.of(context).colorScheme.outline),
+    // 4) 渲染：宽屏宽列；窄屏缩列让周一~周五可见，周六日横向滑动
+    final widthCtx = context;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final screenWidth = constraints.maxWidth;
+        final isNarrow = screenWidth < 600;
+
+        // 手机端列宽：6 列可见 (节次 + 周一~周五)，超出部分滑动
+        const timeWidth = 34.0;
+        final dayWidth = isNarrow
+            ? ((screenWidth - timeWidth - 8) / 5).clamp(48.0, 72.0)
+            : 112.0;
+        final tPad = isNarrow ? 4.0 : 8.0;
+        final fSize = isNarrow ? 12.0 : 13.0;
+
+        final tableRows = <TableRow>[];
+        for (final time in orderedTimes) {
+          tableRows.add(
+            TableRow(
+              children: [
+                _buildTimeCell(time),
+                for (final d in dayOrder)
+                  _buildDayCell(
+                    tableData[time]?[d] ?? const [],
+                    highlightWeek,
+                    isNarrow,
+                  ),
+              ],
             ),
-            children: [
-              TableRow(
-                decoration: BoxDecoration(
-                  color: Theme.of(
-                    context,
-                  ).colorScheme.primaryContainer.withAlpha(102),
+          );
+        }
+
+        return SingleChildScrollView(
+          scrollDirection: Axis.vertical,
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Padding(
+              padding: EdgeInsets.all(tPad),
+              child: Table(
+                defaultColumnWidth: FixedColumnWidth(dayWidth),
+                columnWidths: isNarrow
+                    ? const {0: FixedColumnWidth(timeWidth)}
+                    : const {0: FixedColumnWidth(96)},
+                border: TableBorder(
+                  horizontalInside: BorderSide(
+                    color: Theme.of(widthCtx).colorScheme.outlineVariant,
+                    width: 0.5,
+                  ),
+                  verticalInside: BorderSide(
+                    color: Theme.of(widthCtx).colorScheme.outlineVariant,
+                    width: 0.5,
+                  ),
+                  top: BorderSide(
+                    color: Theme.of(widthCtx).colorScheme.outline,
+                  ),
+                  bottom: BorderSide(
+                    color: Theme.of(widthCtx).colorScheme.outline,
+                  ),
+                  left: BorderSide(
+                    color: Theme.of(widthCtx).colorScheme.outline,
+                  ),
+                  right: BorderSide(
+                    color: Theme.of(widthCtx).colorScheme.outline,
+                  ),
                 ),
                 children: [
-                  _buildHeaderCell('节次', isFirst: true),
-                  for (var i = 0; i < dayOrder.length; i++)
-                    _buildHeaderCell(dayOrder[i]),
+                  TableRow(
+                    decoration: BoxDecoration(
+                      color: Theme.of(
+                        widthCtx,
+                      ).colorScheme.primaryContainer.withAlpha(102),
+                    ),
+                    children: [
+                      _buildHeaderCell('节', fontSize: fSize),
+                      for (var i = 0; i < dayOrder.length; i++)
+                        _buildHeaderCell(
+                          isNarrow ? dayOrder[i][1] : dayOrder[i],
+                          fontSize: fSize,
+                        ),
+                    ],
+                  ),
+                  ...tableRows,
                 ],
               ),
-              ...rows,
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
-  Widget _buildHeaderCell(String text, {bool isFirst = false}) {
+  Widget _buildHeaderCell(String text, {double fontSize = 13}) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 6),
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
       alignment: Alignment.center,
       child: Text(
         text,
-        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+        style: TextStyle(fontWeight: FontWeight.bold, fontSize: fontSize),
       ),
     );
   }
@@ -4629,6 +6634,7 @@ class _SchedulePageState extends State<SchedulePage> {
   Widget _buildDayCell(
     List<Map<String, String>> courses, [
     int? highlightWeek,
+    bool isNarrow = false,
   ]) {
     if (courses.isEmpty) {
       return Container(
@@ -4702,7 +6708,7 @@ class _SchedulePageState extends State<SchedulePage> {
       first = false;
 
       if (idxs.length == 1) {
-        children.add(_buildCourseEntry(courses[idxs.first]));
+        children.add(_buildCourseEntry(courses[idxs.first], isNarrow));
       } else {
         // 合并冲突簇的各段区间，求真实的覆盖区间作为标签（支持多段）。
         // 例如 A=1-4,9-12 与 C=9-10 冲突，标签应显示二者真实重叠的 "9-12周"，
@@ -4812,27 +6818,98 @@ class _SchedulePageState extends State<SchedulePage> {
     );
   }
 
-  /// 把最近一次抓到的课表 HTML 落盘到本地（debug 用），便于排错。
-  Future<void> _exportScheduleHtml() async {
+  Future<void> _chooseScheduleExport() async {
+    if (_lastRawHtml.isEmpty || !mounted) return;
+    final format = await showDialog<_ScheduleExportFormat>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('选择课表导出格式'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, _ScheduleExportFormat.jpg),
+            child: const ListTile(
+              leading: Icon(Icons.photo, color: Colors.deepOrange),
+              title: Text('JPG（默认）'),
+              subtitle: Text('适合手机相册与分享，按当前窗口尺寸导出'),
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, _ScheduleExportFormat.png),
+            child: const ListTile(
+              leading: Icon(Icons.image),
+              title: Text('PNG'),
+              subtitle: Text('无损图片，保留当前窗口尺寸'),
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, _ScheduleExportFormat.html),
+            child: const ListTile(
+              leading: Icon(Icons.code),
+              title: Text('HTML'),
+              subtitle: Text('导出教务系统返回的原始课表页面'),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (format == null || !mounted) return;
+    await _exportSchedule(format);
+  }
+
+  Future<Directory> _scheduleExportDirectory() async {
+    if (Platform.isWindows) return Directory.current;
+    return getApplicationDocumentsDirectory();
+  }
+
+  /// 导出当前屏幕可见的课表区域。手机端的 RepaintBoundary 覆盖实际窗口
+  /// 分辨率，并使用设备像素比生成清晰图片；桌面端则按窗口大小导出。
+  Future<void> _exportSchedule(_ScheduleExportFormat format) async {
     if (_lastRawHtml.isEmpty) return;
     final messenger = ScaffoldMessenger.of(context);
     try {
-      // 桌面端走当前工作目录；移动端走应用文档目录（沙盒，可写）。
-      String dir = Directory.current.path;
-      try {
-        if (!Platform.isWindows) {
-          dir = (await getApplicationDocumentsDirectory()).path;
-        }
-      } catch (_) {}
+      final dir = await _scheduleExportDirectory();
       final stamp = DateTime.now()
           .toIso8601String()
           .replaceAll(':', '-')
           .split('.')
           .first;
+      final extension = switch (format) {
+        _ScheduleExportFormat.jpg => 'jpg',
+        _ScheduleExportFormat.png => 'png',
+        _ScheduleExportFormat.html => 'html',
+      };
       final file = File(
-        '$dir${Platform.pathSeparator}jizhicha_schedule_$stamp.html',
+        '${dir.path}${Platform.pathSeparator}jizhicha_schedule_${_selectedTerm}_$stamp.$extension',
       );
-      await file.writeAsString(_lastRawHtml);
+
+      if (format == _ScheduleExportFormat.html) {
+        await file.writeAsString(_lastRawHtml, flush: true);
+      } else {
+        if (_courses.isEmpty) throw '当前学期没有可导出的课程';
+        await WidgetsBinding.instance.endOfFrame;
+        if (!mounted) return;
+        final renderObject = _scheduleRepaintKey.currentContext
+            ?.findRenderObject();
+        if (renderObject is! RenderRepaintBoundary) {
+          throw '课表尚未完成渲染，请稍后再试';
+        }
+        final media = MediaQuery.of(context);
+        final ratio = media.devicePixelRatio.clamp(1.0, 3.0).toDouble();
+        final image = await renderObject.toImage(pixelRatio: ratio);
+        try {
+          final byteData = await image.toByteData(
+            format: ui.ImageByteFormat.png,
+          );
+          if (byteData == null) throw '无法生成课表图片';
+          final pngBytes = byteData.buffer.asUint8List();
+          final bytes = format == _ScheduleExportFormat.png
+              ? pngBytes
+              : img.encodeJpg(img.decodePng(pngBytes)!, quality: 92);
+          await file.writeAsBytes(bytes, flush: true);
+        } finally {
+          image.dispose();
+        }
+      }
       messenger.showSnackBar(SnackBar(content: Text('已导出：${file.path}')));
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('导出失败：$e')));
@@ -4936,37 +7013,39 @@ class _SchedulePageState extends State<SchedulePage> {
     );
   }
 
-  Widget _buildCourseEntry(Map<String, String> c) {
+  Widget _buildCourseEntry(Map<String, String> c, [bool isNarrow = false]) {
     final name = (c['name'] ?? '').trim();
     final teacher = (c['teacher'] ?? '').trim();
     final room = (c['room'] ?? '').trim();
+    final nameSize = isNarrow ? 11.0 : 12.0;
+    final subSize = isNarrow ? 9.0 : 10.0;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
         Text(
           name.isNotEmpty ? name : '(未知课程)',
+          maxLines: isNarrow ? null : 2,
+          overflow: isNarrow ? null : TextOverflow.ellipsis,
           style: TextStyle(
             fontWeight: FontWeight.bold,
-            fontSize: 12,
+            fontSize: nameSize,
             color: name.isNotEmpty
                 ? Theme.of(context).colorScheme.onSurface
                 : Theme.of(context).colorScheme.onSurfaceVariant,
           ),
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
         ),
         if (teacher.isNotEmpty)
           Padding(
-            padding: const EdgeInsets.only(top: 2),
+            padding: const EdgeInsets.only(top: 1),
             child: Text(
               '@$teacher',
+              maxLines: isNarrow ? null : 1,
+              overflow: isNarrow ? null : TextOverflow.ellipsis,
               style: TextStyle(
-                fontSize: 10,
+                fontSize: subSize,
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
               ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
             ),
           ),
         if (room.isNotEmpty)
@@ -4974,12 +7053,12 @@ class _SchedulePageState extends State<SchedulePage> {
             padding: const EdgeInsets.only(top: 1),
             child: Text(
               '📍$room',
+              maxLines: isNarrow ? null : 1,
+              overflow: isNarrow ? null : TextOverflow.ellipsis,
               style: TextStyle(
-                fontSize: 10,
+                fontSize: subSize,
                 color: Theme.of(context).colorScheme.onSurfaceVariant,
               ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
             ),
           ),
       ],
@@ -5004,6 +7083,7 @@ class _GradesPageState extends State<GradesPage> {
   AppSettings? _settings;
   DateTime? _cachedAt;
   bool _hasSavedSnapshot = false;
+  String? _selectedGradeTerm;
   // 折叠状态：默认两个分组都展开；点击分组标题可切换
   bool _showDone = true;
   bool _showRetry = true;
@@ -5036,6 +7116,22 @@ class _GradesPageState extends State<GradesPage> {
     if (mounted) await _campusEnvironment.detect();
   }
 
+  /// 手动刷新成绩时才查询全部配置学期；课表缓存保持不动，避免重复抓取。
+  Future<void> _openFullGradeUpdate() async {
+    if (_loading) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => const VpnSetupPage(
+          mode: AppMode.education,
+          gradeSyncScope: GradeSyncScope.all,
+          syncSchedules: false,
+          initialNotice: '本次只更新全部学期成绩，不会重新抓取课表',
+        ),
+      ),
+    );
+    if (mounted) await _loadLocal();
+  }
+
   Future<void> _handleCampusAcceleratorAction() async {
     if (_campusEnvironment.checking || _campusEnvironment.actionLoading) return;
     if (_campusEnvironment.online != true) {
@@ -5059,6 +7155,16 @@ class _GradesPageState extends State<GradesPage> {
     });
   }
 
+  List<String> _availableGradeTerms() {
+    final terms = _grades
+        .map((grade) => (grade['term'] ?? '').trim())
+        .where((term) => term.isNotEmpty)
+        .toSet()
+        .toList();
+    terms.sort((a, b) => _termSortKey(b).compareTo(_termSortKey(a)));
+    return terms;
+  }
+
   Future<void> _loadLocal() async {
     setState(() {
       _loading = true;
@@ -5074,6 +7180,15 @@ class _GradesPageState extends State<GradesPage> {
           _settings = s;
           _cachedAt = profile?.savedAt;
           _hasSavedSnapshot = profile?.hasGrades == true;
+          final terms = data
+              .map((grade) => (grade['term'] ?? '').trim())
+              .where((term) => term.isNotEmpty)
+              .toSet();
+          if (_selectedGradeTerm != null &&
+              _selectedGradeTerm != '全部学期' &&
+              !terms.contains(_selectedGradeTerm)) {
+            _selectedGradeTerm = null;
+          }
           _loading = false;
         });
       }
@@ -5131,6 +7246,53 @@ class _GradesPageState extends State<GradesPage> {
     String two(int number) => number.toString().padLeft(2, '0');
     return '${value.year}-${two(value.month)}-${two(value.day)} '
         '${two(value.hour)}:${two(value.minute)}';
+  }
+
+  Widget _buildFullGradeUpdateButton() {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+        child: OutlinedButton.icon(
+          onPressed: _loading ? null : _openFullGradeUpdate,
+          icon: const Icon(Icons.sync),
+          label: const Text('手动更新全部成绩'),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGradeTermSelector(AppSettings settings) {
+    if (!settings.gradeTermFilterEnabled) return const SizedBox.shrink();
+    final terms = _availableGradeTerms();
+    final selected =
+        _selectedGradeTerm != null && terms.contains(_selectedGradeTerm)
+        ? _selectedGradeTerm!
+        : '全部学期';
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+      child: DropdownButtonFormField<String>(
+        key: ValueKey('grade-term-$selected-${terms.join('|')}'),
+        initialValue: selected,
+        decoration: const InputDecoration(
+          labelText: '成绩学期',
+          prefixIcon: Icon(Icons.filter_list),
+          border: OutlineInputBorder(),
+        ),
+        items: [
+          const DropdownMenuItem(value: '全部学期', child: Text('全部学期')),
+          ...terms.map(
+            (term) => DropdownMenuItem(value: term, child: Text(term)),
+          ),
+        ],
+        onChanged: (value) {
+          if (value == null) return;
+          setState(() {
+            _selectedGradeTerm = value == '全部学期' ? null : value;
+          });
+        },
+      ),
+    );
   }
 
   /// 把成绩归档：
@@ -5240,6 +7402,7 @@ class _GradesPageState extends State<GradesPage> {
                   ),
                 ),
               ),
+            _buildFullGradeUpdateButton(),
             Expanded(
               child: Center(
                 child: Text(
@@ -5253,7 +7416,15 @@ class _GradesPageState extends State<GradesPage> {
       );
     }
     final settings = _settings ?? AppSettings();
-    final archived = _archiveGrades(_grades);
+    final selectedTerm = settings.gradeTermFilterEnabled
+        ? _selectedGradeTerm
+        : null;
+    final gradesForDisplay = selectedTerm == null
+        ? _grades
+        : _grades
+              .where((grade) => (grade['term'] ?? '').trim() == selectedTerm)
+              .toList(growable: false);
+    final archived = _archiveGrades(gradesForDisplay);
     final done = archived.where((a) => !a.isFail).toList();
     final retry = archived.where((a) => a.isFail).toList();
     if (settings.gradeSortByYear) {
@@ -5277,6 +7448,8 @@ class _GradesPageState extends State<GradesPage> {
               ),
             ),
           ),
+          _buildFullGradeUpdateButton(),
+          _buildGradeTermSelector(settings),
           if (settings.gradeCategoryEnabled) ...[
             _buildArchiveSection(
               '已完成',
