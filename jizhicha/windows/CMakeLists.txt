@@ -81,6 +81,13 @@ set(HUSE_WINTUN_DLL "${HUSE_VPN_SOURCE_DIR}/target/release/wintun.dll")
 if(NOT EXISTS "${HUSE_WINTUN_DLL}")
   set(HUSE_WINTUN_DLL "${HUSE_VPN_SOURCE_DIR}/target/debug/wintun.dll")
 endif()
+# Keep the signed runtime DLL in the source tree as a final fallback.  A clean
+# checkout has no Cargo target directory yet, so relying only on target/...
+# silently produces a Windows package that starts without Wintun and fails at
+# the first VPN connection.
+if(NOT EXISTS "${HUSE_WINTUN_DLL}")
+  set(HUSE_WINTUN_DLL "${CMAKE_CURRENT_SOURCE_DIR}/wintun/wintun.dll")
+endif()
 
 # Application build; see runner/CMakeLists.txt.
 add_subdirectory("runner")
