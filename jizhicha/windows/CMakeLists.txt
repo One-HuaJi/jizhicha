@@ -61,9 +61,16 @@ find_program(CARGO_EXECUTABLE NAMES cargo)
 if(NOT CARGO_EXECUTABLE)
   message(FATAL_ERROR "Rust cargo was not found; it is required to build the embedded VPN engine")
 endif()
+find_program(POWERSHELL_EXECUTABLE NAMES pwsh powershell)
+if(NOT POWERSHELL_EXECUTABLE)
+  message(FATAL_ERROR "PowerShell was not found; it is required to build the embedded VPN engine")
+endif()
 add_custom_target(huse_vpn_ffi_build
-  COMMAND "${CARGO_EXECUTABLE}" build --manifest-path
-    "${HUSE_VPN_SOURCE_DIR}/Cargo.toml" --package huse-vpn-ffi --release
+  COMMAND "${POWERSHELL_EXECUTABLE}" -NoProfile -NonInteractive
+    -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/build_rust.ps1"
+    -CargoExecutable "${CARGO_EXECUTABLE}"
+    -ManifestPath "${HUSE_VPN_SOURCE_DIR}/Cargo.toml"
+    -WorkspacePath "${HUSE_VPN_SOURCE_DIR}"
   WORKING_DIRECTORY "${HUSE_VPN_SOURCE_DIR}"
   BYPRODUCTS "${HUSE_VPN_RELEASE_DLL}"
   COMMENT "Building embedded HUSE VPN FFI engine with Cargo"

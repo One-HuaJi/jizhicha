@@ -30,6 +30,10 @@ val ndkHostTag = when {
 }
 val linkerSuffix = if (hostOs.contains("windows")) ".cmd" else ""
 val rustWorkspace = rootProject.projectDir.parentFile.resolve("huse-vpn-next")
+val rustRemapFlags = listOf(
+    "--remap-path-prefix=${rustWorkspace.absolutePath}=huse-vpn-next",
+    "--remap-path-prefix=${System.getProperty("user.home")}=user-home",
+).joinToString("\u001f")
 
 android {
     namespace = "com.one.huaji"
@@ -139,6 +143,7 @@ val rustAndroidBuildTasks = listOf(
         )
         inputs.property("rustTarget", rustTarget)
         inputs.property("ndkVersion", flutter.ndkVersion)
+        inputs.property("rustRemapFlags", rustRemapFlags)
         outputs.file(packagedLibrary)
 
         doFirst {
@@ -157,6 +162,7 @@ val rustAndroidBuildTasks = listOf(
         )
         environment("CC_$normalizedRustTarget", linker.absolutePath)
         environment("AR_$normalizedRustTarget", archiver.absolutePath)
+        environment("CARGO_ENCODED_RUSTFLAGS", rustRemapFlags)
         commandLine(
             if (hostOs.contains("windows")) "cargo.exe" else "cargo",
             "build",

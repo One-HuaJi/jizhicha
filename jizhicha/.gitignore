@@ -45,6 +45,3 @@ app.*.map.json
 
 # Gradle 会从 Rust 源码按 ABI 自动生成；不要提交带本机路径的原生构建产物。
 /android/app/src/main/jniLibs/**/libhuse_vpn_mobile_ffi.so
-
-# 内置第三方二进制（gof5 F5 客户端，从 GitHub release 下载，不入库）
-tools/*.exe
