@@ -17,6 +17,10 @@ class CaptchaOcr {
   static const _modelAsset = 'assets/models/ddddocr_common_old.onnx';
   static final _runtime = OnnxRuntime();
   static Future<OrtSession>? _sessionFuture;
+  // The native Android binding keeps sessions globally and is not safe for
+  // overlapping inference calls. Serialize all callers, including callers
+  // from different login page instances after a quick navigation.
+  static Future<void> _recognitionTail = Future<void>.value();
 
   // ddddocr common_old.onnx 的字符表索引。索引 0 是 CTC blank，未列出。
   // 只保留学校验证码允许的 26 个小写字母和 10 个数字。
@@ -59,7 +63,13 @@ class CaptchaOcr {
     8196: 'h',
   };
 
-  static Future<String?> recognize(Uint8List bytes) async {
+  static Future<String?> recognize(Uint8List bytes) {
+    final task = _recognitionTail.then<String?>((_) => _recognizeNow(bytes));
+    _recognitionTail = task.then<void>((_) {}, onError: (_, _) {});
+    return task;
+  }
+
+  static Future<String?> _recognizeNow(Uint8List bytes) async {
     if (bytes.isEmpty || (!Platform.isAndroid && !Platform.isWindows)) {
       return null;
     }
@@ -97,9 +107,12 @@ class CaptchaOcr {
     return _sessionFuture ??= _runtime.createSessionFromAsset(
       _modelAsset,
       options: OrtSessionOptions(
-        intraOpNumThreads: 2,
+        // Android 手机上验证码只需一次很小的 CPU 推理；限制线程并关闭
+        // arena 可避免部分厂商 ARM 运行时在首次建会话/并发分配时闪退。
+        // Windows 保留两个线程和 arena，桌面端速度不受影响。
+        intraOpNumThreads: Platform.isAndroid ? 1 : 2,
         interOpNumThreads: 1,
-        useArena: true,
+        useArena: !Platform.isAndroid,
       ),
     );
   }
