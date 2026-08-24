@@ -148,7 +148,7 @@ enum SyncResource { schedule, grade }
 /// 返回同一份页面或触发网关限流。冷却从请求开始计时，失败时也保留，
 /// 这样“重试”不会在几秒内形成请求风暴。
 class DataSyncCooldownController extends ChangeNotifier {
-  static const duration = Duration(seconds: 30);
+  static const duration = Duration(seconds: 10);
 
   DateTime? _scheduleUntil;
   DateTime? _gradeUntil;
@@ -197,7 +197,7 @@ class DataSyncCooldownController extends ChangeNotifier {
 
 final dataSyncCooldown = DataSyncCooldownController();
 
-/// 显示课表/成绩本次同步的 30 秒冷却状态。
+/// 显示课表/成绩本次同步的 10 秒冷却状态。
 /// 页面本身监听 [dataSyncCooldown]，因此倒计时会在不重新进入页面的情况下
 /// 每秒刷新；没有冷却时不占用额外的布局空间。
 class _SyncCooldownIndicator extends StatelessWidget {
@@ -4333,6 +4333,9 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
       setState(() => _error = '请输入学号、教务密码和验证码');
       return;
     }
+    // 认证和离线数据同步是两个独立阶段。认证成功后，即使同步被冷却、
+    // 网络或某个学期查询失败，也必须让用户进入本地首页继续使用已有数据。
+    var authenticationSucceeded = alreadyAuthenticated;
     FocusScope.of(context).unfocus();
     setState(() {
       _loggingIn = true;
@@ -4367,6 +4370,7 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
           return;
         }
         if (!loginResult.isSuccess) throw '教务系统未返回登录成功状态';
+        authenticationSucceeded = true;
         _authenticatedStudentId = studentId;
         final resetPending =
             _passwordResetPendingInMemory ||
@@ -4390,19 +4394,39 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
         }
         await _loadSavedAccounts();
       }
-      final syncResult = await syncOfflineUserData(
-        studentId: studentId,
-        gradeSyncScope: widget.gradeSyncScope,
-        syncSchedules: widget.syncSchedules,
-        forceScheduleSync: widget.forceScheduleSync,
-        fetchAllSchedules: widget.fetchAllSchedules,
-        scheduleTerm: widget.scheduleTerm,
-        gradeTerm: widget.gradeTerm,
-        syncGrades: widget.syncGrades,
-        onProgress: (message) {
-          if (mounted) setState(() => _syncProgress = message);
-        },
-      );
+      late final OfflineSyncResult syncResult;
+      try {
+        syncResult = await syncOfflineUserData(
+          studentId: studentId,
+          gradeSyncScope: widget.gradeSyncScope,
+          syncSchedules: widget.syncSchedules,
+          forceScheduleSync: widget.forceScheduleSync,
+          fetchAllSchedules: widget.fetchAllSchedules,
+          scheduleTerm: widget.scheduleTerm,
+          gradeTerm: widget.gradeTerm,
+          syncGrades: widget.syncGrades,
+          onProgress: (message) {
+            if (mounted) setState(() => _syncProgress = message);
+          },
+        );
+      } catch (syncError) {
+        if (!mounted) return;
+        final raw = '$syncError';
+        final syncNotice = raw.contains('更新冷却中')
+            ? '已登录，$raw；稍后重试更新'
+            : '已登录，但数据更新失败：$raw；稍后可在课表或成绩页面重试更新';
+        final completeNotice = credentialNotice == null
+            ? syncNotice
+            : '$syncNotice；$credentialNotice';
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(
+            builder: (_) =>
+                HomePage(studentId: studentId, initialNotice: completeNotice),
+          ),
+          (_) => false,
+        );
+        return;
+      }
       if (!mounted) return;
       final failedSuffix = syncResult.failedTerms.isEmpty
           ? ''
@@ -4446,8 +4470,18 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
       );
     } catch (error) {
       if (mounted) {
-        setState(() => _error = '$error');
-        if (!JwxtClient().isLoggedIn || _authenticatedStudentId != studentId) {
+        if (authenticationSucceeded) {
+          Navigator.of(context).pushAndRemoveUntil(
+            MaterialPageRoute(
+              builder: (_) => HomePage(
+                studentId: studentId,
+                initialNotice: '已登录，但本次离线数据同步未完成：$error；稍后可在课表或成绩页面重试更新',
+              ),
+            ),
+            (_) => false,
+          );
+        } else {
+          setState(() => _error = '$error');
           _captchaCtrl.clear();
           await _refreshCaptcha(clearError: false);
         }
@@ -4947,425 +4981,6 @@ class _ErrorBox extends StatelessWidget {
       child: Text(
         _acceleratorText(message),
         style: TextStyle(color: colorScheme.onErrorContainer, height: 1.4),
-      ),
-    );
-  }
-}
-
-class LoginPage extends StatefulWidget {
-  const LoginPage({super.key});
-  @override
-  State<LoginPage> createState() => _LoginPageState();
-}
-
-class _LoginPageState extends State<LoginPage> {
-  final _idCtrl = TextEditingController();
-  final _pwdCtrl = TextEditingController();
-  final _codeCtrl = TextEditingController();
-  Uint8List? _captchaBytes;
-  bool _loading = false;
-  bool _vpnActionLoading = false;
-  bool _vpnOnline = false; // 悲观默认：探测确认前视为未连通，避免误显示"已联通"
-  bool _vpnChecking = true; // 探测中：UI 显示骨架，避免出现"绿→橙"闪烁
-
-  @override
-  void initState() {
-    super.initState();
-    _checkVpn();
-    _loadCaptcha();
-  }
-
-  /// 探测校园内网（172.20.63.226）是否可达。
-  /// 连不上说明本机没有到内网 IP 的路由——多半是加速器没建好隧道，
-  /// 此时登录页显示橙色“未检测到校园内网”提示，提醒用户先连加速器。
-  Future<void> _checkVpn() async {
-    final ok = await JwxtClient().checkIntranetReachable();
-    if (mounted) {
-      setState(() {
-        _vpnOnline = ok;
-        _vpnChecking = false;
-      });
-    }
-  }
-
-  Future<void> _startVpn({required bool waitForCampusNetwork}) async {
-    if (!Platform.isWindows) {
-      _showMsg('内置校园加速器目前仅支持 Windows');
-      return;
-    }
-    setState(() => _vpnActionLoading = true);
-    try {
-      final launcher = CampusVpnLauncher();
-      await launcher.start();
-      if (!waitForCampusNetwork) {
-        if (mounted) {
-          _showMsg('加速器客户端已启动，请在新窗口完成连接');
-        }
-        return;
-      }
-
-      if (mounted) {
-        _showMsg('加速器客户端已启动，请完成账号认证；应用会自动等待校园网');
-      }
-      final connected = await launcher.waitForCampusNetwork();
-      if (!mounted) return;
-      if (connected) {
-        setState(() {
-          _vpnOnline = true;
-          _vpnChecking = false;
-        });
-        await _loadCaptcha();
-        if (mounted) _showMsg('校园加速器已连接，教务系统已就绪');
-      } else {
-        _showMsg('尚未检测到校园网，请完成加速器连接后重试');
-      }
-    } catch (error) {
-      if (mounted) _showMsg('$error');
-    } finally {
-      if (mounted) setState(() => _vpnActionLoading = false);
-    }
-  }
-
-  Future<void> _loadCaptcha() async {
-    setState(() => _captchaBytes = null);
-    try {
-      final bytes = await JwxtClient().getCaptcha();
-      if (mounted) setState(() => _captchaBytes = bytes);
-    } catch (e) {
-      if (mounted) _showMsg('获取验证码失败：$e');
-    }
-  }
-
-  Future<void> _login() async {
-    final id = _idCtrl.text.trim();
-    final pwd = _pwdCtrl.text;
-    final code = _codeCtrl.text.trim();
-    if (id.isEmpty || pwd.isEmpty || code.isEmpty) {
-      _showMsg('请填写完整');
-      return;
-    }
-    setState(() => _loading = true);
-    try {
-      final loginResult = await JwxtClient().login(id, pwd, code);
-      if (loginResult.status == JwxtLoginStatus.passwordChangeRequired) {
-        throw '教务系统要求设置新的强密码，请返回新版教务登录页完成修改；临时密码未保存';
-      }
-      if (loginResult.isSuccess && mounted) {
-        final resetPending =
-            await CredentialStore.isEducationPasswordResetPending(id);
-        if (!resetPending || isValidFinalEducationPassword(pwd)) {
-          final saved = await CredentialStore.save(
-            StoredAccountKind.education,
-            username: id,
-            password: pwd,
-          );
-          if (saved && resetPending) {
-            await CredentialStore.clearEducationPasswordResetPending(id);
-          }
-        }
-        await syncOfflineUserData(studentId: id);
-        if (!mounted) return;
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (_) => HomePage(studentId: id)),
-        );
-      }
-    } catch (e) {
-      if (mounted) {
-        _showMsg('❌ $e');
-        _loadCaptcha();
-      }
-    } finally {
-      if (mounted) setState(() => _loading = false);
-    }
-  }
-
-  void _showMsg(String msg) => ScaffoldMessenger.of(
-    context,
-  ).showSnackBar(SnackBar(content: Text(_acceleratorText(msg))));
-
-  @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const SizedBox(height: 60),
-              Icon(Icons.school, size: 80, color: colorScheme.primary),
-              const SizedBox(height: 16),
-              Text(
-                '教务查询系统',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
-                  color: colorScheme.onSurface,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                '湖南科技学院',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 14,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const SizedBox(height: 40),
-              // 校园内网检测：探测中显示骨架；未连通显示橙色提示；已连通显示绿色提示。
-              if (Platform.isWindows)
-                Container(
-                  margin: const EdgeInsets.only(bottom: 20),
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: colorScheme.primaryContainer.withAlpha(120),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: colorScheme.outlineVariant),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Row(
-                        children: [
-                          Icon(Icons.vpn_key, color: colorScheme.primary),
-                          const SizedBox(width: 8),
-                          Text(
-                            '校园加速器',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                              color: colorScheme.onSurface,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        '可单独启动加速器，也可以连接成功后自动回到本页查询教务。',
-                        style: TextStyle(
-                          color: colorScheme.onSurfaceVariant,
-                          fontSize: 12,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: _vpnActionLoading
-                                  ? null
-                                  : () =>
-                                        _startVpn(waitForCampusNetwork: false),
-                              icon: const Icon(Icons.open_in_new, size: 18),
-                              label: const Text('仅启动加速器'),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: FilledButton.icon(
-                              onPressed: _vpnActionLoading
-                                  ? null
-                                  : () => _startVpn(waitForCampusNetwork: true),
-                              icon: _vpnActionLoading
-                                  ? const SizedBox(
-                                      width: 16,
-                                      height: 16,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    )
-                                  : const Icon(Icons.login, size: 18),
-                              label: const Text('连接并进入教务'),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-              if (_vpnChecking)
-                Container(
-                  margin: const EdgeInsets.only(bottom: 12),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 8,
-                  ),
-                  decoration: BoxDecoration(
-                    color: colorScheme.surfaceContainerHighest,
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        '正在检测校园内网连接…',
-                        style: TextStyle(
-                          color: colorScheme.onSurfaceVariant,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                )
-              else if (!_vpnOnline)
-                Container(
-                  margin: const EdgeInsets.only(bottom: 16),
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: colorScheme.errorContainer.withAlpha(120),
-                    border: Border.all(color: colorScheme.error.withAlpha(120)),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Row(
-                    children: [
-                      Icon(
-                        Icons.vpn_key_off,
-                        color: colorScheme.error,
-                        size: 20,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          '未检测到校园内网（172.20.63.226），请先连接加速器后再登录教务系统',
-                          style: TextStyle(
-                            color: colorScheme.onErrorContainer,
-                            fontSize: 13,
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                )
-              else if (_vpnOnline)
-                Container(
-                  margin: const EdgeInsets.only(bottom: 12),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color: colorScheme.tertiaryContainer.withAlpha(120),
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        Icons.vpn_key,
-                        color: colorScheme.tertiary,
-                        size: 16,
-                      ),
-                      const SizedBox(width: 6),
-                      Text(
-                        '校园内网已连通',
-                        style: TextStyle(
-                          color: colorScheme.onTertiaryContainer,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              TextField(
-                controller: _idCtrl,
-                decoration: const InputDecoration(
-                  labelText: '学号',
-                  prefixIcon: Icon(Icons.person),
-                ),
-                keyboardType: TextInputType.number,
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: _pwdCtrl,
-                decoration: const InputDecoration(
-                  labelText: '密码',
-                  prefixIcon: Icon(Icons.lock),
-                ),
-                obscureText: true,
-              ),
-              const SizedBox(height: 16),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(
-                    flex: 2,
-                    child: TextField(
-                      controller: _codeCtrl,
-                      decoration: const InputDecoration(
-                        labelText: '验证码',
-                        hintText: '按图片原样输入',
-                        prefixIcon: Icon(Icons.security),
-                      ),
-                      onChanged: (value) {
-                        final lower = value.toLowerCase();
-                        if (lower != value) {
-                          _codeCtrl.value = _codeCtrl.value.copyWith(
-                            text: lower,
-                            selection: TextSelection.collapsed(
-                              offset: lower.length,
-                            ),
-                            composing: TextRange.empty,
-                          );
-                        }
-                      },
-                      maxLength: 4,
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    flex: 2,
-                    child: GestureDetector(
-                      onTap: _captchaBytes == null ? null : _loadCaptcha,
-                      child: Container(
-                        height: 56,
-                        decoration: BoxDecoration(
-                          border: Border.all(color: colorScheme.outline),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: _captchaBytes != null
-                            ? Image.memory(_captchaBytes!, fit: BoxFit.contain)
-                            : const Center(child: CircularProgressIndicator()),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Text(
-                '点击图片刷新验证码',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: colorScheme.onSurfaceVariant,
-                ),
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                height: 48,
-                child: FilledButton(
-                  onPressed: _loading ? null : _login,
-                  child: _loading
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Text('登 录', style: TextStyle(fontSize: 16)),
-                ),
-              ),
-            ],
-          ),
-        ),
       ),
     );
   }
@@ -6033,6 +5648,7 @@ class _SchedulePageState extends State<SchedulePage> {
   bool _loadedFromCache = false;
   DateTime? _cachedAt;
   String? _selectedScheduleUpdateTerm;
+  bool _scheduleToolsExpanded = false;
 
   // 设置（本地持久化）：本周视图高亮 + 按周筛选，均基于手动选定的"当前周次"。
   AppSettings? _settings;
@@ -6328,12 +5944,381 @@ class _SchedulePageState extends State<SchedulePage> {
     }
   }
 
+  String _scheduleAccountSummary() {
+    if (_loadedFromCache) {
+      return '账号 ${widget.studentId} · 本地课表'
+          '${_cachedAt == null ? '' : ' · ${_formatCachedAt(_cachedAt!)}'}';
+    }
+    return '账号 ${widget.studentId} 暂无本地课表';
+  }
+
+  String _campusModeSummary() {
+    if (_campusEnvironment.checking) return '正在检测校内环境';
+    return _campusEnvironment.online == true ? '校园内网可用' : '离线模式';
+  }
+
+  Widget _buildScheduleAccountStatus(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              _scheduleAccountSummary(),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Tooltip(
+            message: '点击重新检测是否为校内环境',
+            child: OutlinedButton.icon(
+              onPressed: _campusEnvironment.checking
+                  ? null
+                  : _detectCampusEnvironment,
+              icon: _campusEnvironment.checking
+                  ? const SizedBox.square(
+                      dimension: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Icon(
+                      _campusEnvironment.online == true
+                          ? Icons.wifi
+                          : Icons.cloud_off,
+                      size: 17,
+                    ),
+              label: Text(
+                _campusEnvironment.checking
+                    ? '正在检测校内环境'
+                    : _campusEnvironment.online == true
+                    ? '在线模式 · 校园内网可用'
+                    : '离线模式 · 使用本地数据',
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCompactScheduleStatus(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final online = _campusEnvironment.online == true;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 8, 8, 0),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _scheduleAccountSummary(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '${_selectedTerm.isEmpty ? '未选择学期' : _selectedTerm} · ${_campusModeSummary()}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: online
+                        ? colorScheme.primary
+                        : colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          IconButton(
+            tooltip: '重新检测校园内网',
+            onPressed: _campusEnvironment.checking
+                ? null
+                : _detectCampusEnvironment,
+            icon: _campusEnvironment.checking
+                ? const SizedBox.square(
+                    dimension: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Icon(online ? Icons.wifi : Icons.cloud_off, size: 20),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildScheduleTermSelector() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 8, 14, 8),
+      child: DropdownButtonFormField<String>(
+        key: ValueKey(_selectedTerm),
+        decoration: const InputDecoration(
+          labelText: '本地学年学期',
+          border: OutlineInputBorder(),
+          prefixIcon: Icon(Icons.calendar_month),
+          isDense: true,
+        ),
+        initialValue: _terms.contains(_selectedTerm) ? _selectedTerm : null,
+        items: _terms
+            .map((term) => DropdownMenuItem(value: term, child: Text(term)))
+            .toList(),
+        onChanged: _loading
+            ? null
+            : (value) {
+                if (value == null || value == _selectedTerm) return;
+                _loadLocalTerm(value);
+              },
+      ),
+    );
+  }
+
+  Widget _buildScheduleViewControls(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final weekFilter = (_s.highlightCurrentWeek || _s.filterByWeek)
+        ? Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _s.filterByWeek && _s.highlightCurrentWeek
+                    ? '高亮+筛选'
+                    : _s.filterByWeek
+                    ? '按周筛选'
+                    : '本周视图',
+                style: TextStyle(fontSize: 13, color: colorScheme.onSurface),
+              ),
+              const SizedBox(width: 4),
+              DropdownButton<int>(
+                value: _s.currentWeek,
+                isDense: true,
+                items: List.generate(
+                  AcademicCalendar.weeksPerAcademicYear,
+                  (index) => DropdownMenuItem(
+                    value: index + 1,
+                    child: Text('第${index + 1}周'),
+                  ),
+                ),
+                onChanged: _settings == null
+                    ? null
+                    : (value) {
+                        if (value == null) return;
+                        setState(() => _settings!.currentWeek = value);
+                        _saveSettingsAndRefresh();
+                      },
+              ),
+            ],
+          )
+        : Text(
+            '未启用周视图',
+            style: TextStyle(fontSize: 12, color: colorScheme.onSurfaceVariant),
+          );
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
+      child: Wrap(
+        alignment: WrapAlignment.spaceBetween,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        spacing: 12,
+        runSpacing: 4,
+        children: [
+          OutlinedButton.icon(
+            onPressed: _lastRawHtml.isEmpty ? null : _chooseScheduleExport,
+            icon: const Icon(Icons.save_alt, size: 16),
+            label: const Text('导出课表'),
+          ),
+          weekFilter,
+        ],
+      ),
+    );
+  }
+
+  Widget _buildScheduleUpdateControls(
+    BuildContext context, {
+    required List<String> updateTerms,
+    required String selectedUpdateValue,
+    required bool compact,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: DropdownButtonFormField<String>(
+                  key: ValueKey(
+                    'schedule-update-$selectedUpdateValue-${updateTerms.join('|')}',
+                  ),
+                  initialValue:
+                      updateTerms.contains(selectedUpdateValue) ||
+                          selectedUpdateValue == _latestScheduleTermsValue ||
+                          selectedUpdateValue == _allScheduleTermsValue
+                      ? selectedUpdateValue
+                      : _latestScheduleTermsValue,
+                  decoration: const InputDecoration(
+                    labelText: '更新学期',
+                    prefixIcon: Icon(Icons.cloud_download),
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  items: [
+                    const DropdownMenuItem(
+                      value: _latestScheduleTermsValue,
+                      child: Text('最新一期（自动回退）'),
+                    ),
+                    const DropdownMenuItem(
+                      value: _allScheduleTermsValue,
+                      child: Text('所有已知学期'),
+                    ),
+                    ...updateTerms.map(
+                      (term) =>
+                          DropdownMenuItem(value: term, child: Text(term)),
+                    ),
+                  ],
+                  onChanged: _loading
+                      ? null
+                      : (value) {
+                          if (value == null) return;
+                          setState(() {
+                            _selectedScheduleUpdateTerm =
+                                value == _latestScheduleTermsValue
+                                ? null
+                                : value;
+                          });
+                        },
+                ),
+              ),
+              const SizedBox(width: 8),
+              OutlinedButton.icon(
+                onPressed:
+                    _loading ||
+                        dataSyncCooldown.isCooling(SyncResource.schedule)
+                    ? null
+                    : _openManualScheduleSave,
+                icon: const Icon(Icons.sync, size: 18),
+                label: Text(compact ? '更新' : '更新课表'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: _SyncCooldownIndicator(resource: SyncResource.schedule),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildScheduleTools(
+    BuildContext context, {
+    required List<String> updateTerms,
+    required String selectedUpdateValue,
+    required bool compact,
+  }) {
+    return Column(
+      children: [
+        _buildScheduleTermSelector(),
+        _buildScheduleViewControls(context),
+        _buildScheduleUpdateControls(
+          context,
+          updateTerms: updateTerms,
+          selectedUpdateValue: selectedUpdateValue,
+          compact: compact,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCompactScheduleTools(
+    BuildContext context, {
+    required List<String> updateTerms,
+    required String selectedUpdateValue,
+  }) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 8),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: colorScheme.outlineVariant),
+        ),
+        child: Column(
+          children: [
+            InkWell(
+              borderRadius: BorderRadius.circular(18),
+              onTap: () => setState(
+                () => _scheduleToolsExpanded = !_scheduleToolsExpanded,
+              ),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(14, 9, 10, 9),
+                child: Row(
+                  children: [
+                    Icon(Icons.tune, size: 19, color: colorScheme.primary),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _scheduleToolsExpanded ? '收起课表操作' : '课表操作',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: colorScheme.onSurface,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      _scheduleToolsExpanded ? '点击收起' : '学期 / 导出 / 更新',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    Icon(
+                      _scheduleToolsExpanded
+                          ? Icons.expand_less
+                          : Icons.expand_more,
+                      color: colorScheme.onSurfaceVariant,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            AnimatedSize(
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              child: _scheduleToolsExpanded
+                  ? _buildScheduleTools(
+                      context,
+                      updateTerms: updateTerms,
+                      selectedUpdateValue: selectedUpdateValue,
+                      compact: true,
+                    )
+                  : const SizedBox.shrink(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final updateTerms = _scheduleUpdateTerms();
     final selectedUpdateValue = _selectedScheduleUpdateTerm == null
         ? _latestScheduleTermsValue
         : _selectedScheduleUpdateTerm!;
+    final compact = MediaQuery.sizeOf(context).width < 600;
     return Scaffold(
       appBar: AppBar(
         title: const Text('学期课表'),
@@ -6374,210 +6359,22 @@ class _SchedulePageState extends State<SchedulePage> {
       ),
       body: Column(
         children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    _loadedFromCache
-                        ? '正在显示账号 ${widget.studentId} 的本地课表'
-                              '${_cachedAt == null ? '' : ' · ${_formatCachedAt(_cachedAt!)}'}'
-                        : '账号 ${widget.studentId} 暂无本地课表',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Tooltip(
-                  message: '点击重新检测是否为校内环境',
-                  child: OutlinedButton.icon(
-                    onPressed: _campusEnvironment.checking
-                        ? null
-                        : _detectCampusEnvironment,
-                    icon: _campusEnvironment.checking
-                        ? const SizedBox.square(
-                            dimension: 14,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : Icon(
-                            _campusEnvironment.online == true
-                                ? Icons.wifi
-                                : Icons.cloud_off,
-                            size: 17,
-                          ),
-                    label: Text(
-                      _campusEnvironment.checking
-                          ? '正在检测校内环境'
-                          : _campusEnvironment.online == true
-                          ? '在线模式 · 校园内网可用'
-                          : '离线模式 · 使用本地数据',
-                    ),
-                  ),
-                ),
-              ],
+          if (compact) ...[
+            _buildCompactScheduleStatus(context),
+            _buildCompactScheduleTools(
+              context,
+              updateTerms: updateTerms,
+              selectedUpdateValue: selectedUpdateValue,
             ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: DropdownButtonFormField<String>(
-              key: ValueKey(_selectedTerm),
-              decoration: const InputDecoration(
-                labelText: '本地学年学期',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.calendar_month),
-              ),
-              initialValue: _terms.contains(_selectedTerm)
-                  ? _selectedTerm
-                  : null,
-              items: _terms
-                  .map((t) => DropdownMenuItem(value: t, child: Text(t)))
-                  .toList(),
-              onChanged: _loading
-                  ? null
-                  : (v) {
-                      if (v == null || v == _selectedTerm) return;
-                      _loadLocalTerm(v);
-                    },
+          ] else ...[
+            _buildScheduleAccountStatus(context),
+            _buildScheduleTools(
+              context,
+              updateTerms: updateTerms,
+              selectedUpdateValue: selectedUpdateValue,
+              compact: false,
             ),
-          ),
-          // 第二行：导出课表 + 周次选择（按设置页的"本周视图/按周筛选"决定是否显示与高亮）
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: Row(
-              children: [
-                OutlinedButton.icon(
-                  onPressed: _lastRawHtml.isEmpty
-                      ? null
-                      : _chooseScheduleExport,
-                  icon: const Icon(Icons.save_alt, size: 16),
-                  label: const Text('导出课表'),
-                ),
-                const Spacer(),
-                // 仅当开启"本周视图"或"按周筛选"时才需要选择周次
-                if (_s.highlightCurrentWeek || _s.filterByWeek) ...[
-                  Text(
-                    _s.filterByWeek && _s.highlightCurrentWeek
-                        ? '高亮+筛选'
-                        : _s.filterByWeek
-                        ? '按周筛选'
-                        : '本周视图',
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: Theme.of(context).colorScheme.onSurface,
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  DropdownButton<int>(
-                    value: _s.currentWeek,
-                    items:
-                        List.generate(
-                              AcademicCalendar.weeksPerAcademicYear,
-                              (i) => i + 1,
-                            )
-                            .map(
-                              (w) => DropdownMenuItem(
-                                value: w,
-                                child: Text('第$w周'),
-                              ),
-                            )
-                            .toList(),
-                    onChanged: _settings == null
-                        ? null
-                        : (v) {
-                            setState(() => _settings!.currentWeek = v!);
-                            _saveSettingsAndRefresh();
-                          },
-                  ),
-                ] else
-                  Text(
-                    '未启用周视图（设置中开启）',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: DropdownButtonFormField<String>(
-                        key: ValueKey(
-                          'schedule-update-$selectedUpdateValue-${updateTerms.join('|')}',
-                        ),
-                        initialValue:
-                            updateTerms.contains(selectedUpdateValue) ||
-                                selectedUpdateValue ==
-                                    _latestScheduleTermsValue ||
-                                selectedUpdateValue == _allScheduleTermsValue
-                            ? selectedUpdateValue
-                            : _latestScheduleTermsValue,
-                        decoration: const InputDecoration(
-                          labelText: '更新学期',
-                          prefixIcon: Icon(Icons.cloud_download),
-                          border: OutlineInputBorder(),
-                          isDense: true,
-                        ),
-                        items: [
-                          const DropdownMenuItem(
-                            value: _latestScheduleTermsValue,
-                            child: Text('最新一期（自动回退）'),
-                          ),
-                          const DropdownMenuItem(
-                            value: _allScheduleTermsValue,
-                            child: Text('所有已知学期'),
-                          ),
-                          ...updateTerms.map(
-                            (term) => DropdownMenuItem(
-                              value: term,
-                              child: Text(term),
-                            ),
-                          ),
-                        ],
-                        onChanged: _loading
-                            ? null
-                            : (value) {
-                                if (value == null) return;
-                                setState(() {
-                                  _selectedScheduleUpdateTerm =
-                                      value == _latestScheduleTermsValue
-                                      ? null
-                                      : value;
-                                });
-                              },
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    OutlinedButton.icon(
-                      onPressed:
-                          _loading ||
-                              dataSyncCooldown.isCooling(SyncResource.schedule)
-                          ? null
-                          : _openManualScheduleSave,
-                      icon: const Icon(Icons.sync, size: 18),
-                      label: const Text('更新课表'),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 6),
-                Align(
-                  alignment: Alignment.centerLeft,
-                  child: _SyncCooldownIndicator(
-                    resource: SyncResource.schedule,
-                  ),
-                ),
-              ],
-            ),
-          ),
+          ],
           const Divider(),
           Expanded(
             child: RepaintBoundary(
@@ -8075,64 +7872,233 @@ class _GradesPageState extends State<GradesPage> {
     );
   }
 
-  /// 单门课程卡片：第一行显示「课程名称 + 得分」，第二行小字显示
-  /// 「学分 · 课程性质 · 课程编码 · 开课学期」。
+  List<MapEntry<String, String>> _gradeDetailEntries(_GradeArchive a) => [
+    MapEntry('课程名称', a.course.isEmpty ? '未知课程' : a.course),
+    MapEntry('成绩', a.grade.isEmpty ? '-' : a.grade),
+    MapEntry('学分', a.credit.isEmpty ? '-' : a.credit),
+    MapEntry('课程性质', a.courseType.isEmpty ? '-' : a.courseType),
+    MapEntry('课程编码', a.code.isEmpty ? '-' : a.code),
+    MapEntry('开课学期', a.term.isEmpty ? '-' : a.term),
+  ];
+
+  String _gradeSummary(_GradeArchive a) {
+    return [
+      if (a.credit.isNotEmpty) '学分 ${a.credit}',
+      if (a.courseType.isNotEmpty) a.courseType,
+      if (a.code.isNotEmpty) '编码 ${a.code}',
+      if (a.term.isNotEmpty) '学期 ${a.term}',
+    ].join('  ·  ');
+  }
+
+  String _gradeCopyText(_GradeArchive a) => _gradeDetailEntries(
+    a,
+  ).map((entry) => '${entry.key}：${entry.value}').join('\n');
+
+  Future<void> _copyGradeText(
+    String label,
+    String value, {
+    BuildContext? feedbackContext,
+  }) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    ScaffoldMessenger.of(feedbackContext ?? context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text('已复制$label')));
+  }
+
+  Future<void> _showGradeDetails(_GradeArchive a, Color accent) async {
+    final colorScheme = Theme.of(context).colorScheme;
+    final entries = _gradeDetailEntries(a);
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: colorScheme.surface,
+      builder: (sheetContext) => SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(sheetContext).height * 0.82,
+          ),
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        a.course.isEmpty ? '未知课程' : a.course,
+                        style: TextStyle(
+                          fontSize: 22,
+                          height: 1.25,
+                          fontWeight: FontWeight.w700,
+                          color: colorScheme.onSurface,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Text(
+                      a.grade.isEmpty ? '-' : a.grade,
+                      style: TextStyle(
+                        fontSize: 28,
+                        height: 1.1,
+                        fontWeight: FontWeight.w700,
+                        color: a.isFail ? colorScheme.error : accent,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  a.isFail ? '历史补考 / 重修' : '已完成',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: a.isFail ? colorScheme.error : accent,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: colorScheme.surfaceContainerLow,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: colorScheme.outlineVariant),
+                  ),
+                  child: Column(
+                    children: [
+                      for (var index = 0; index < entries.length; index++) ...[
+                        ListTile(
+                          dense: true,
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 2,
+                          ),
+                          title: Text(
+                            entries[index].key,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                          subtitle: Padding(
+                            padding: const EdgeInsets.only(top: 3),
+                            child: SelectableText(
+                              entries[index].value,
+                              style: TextStyle(
+                                fontSize: 16,
+                                height: 1.35,
+                                color: colorScheme.onSurface,
+                              ),
+                            ),
+                          ),
+                          trailing: IconButton(
+                            tooltip: '复制${entries[index].key}',
+                            icon: const Icon(Icons.copy, size: 19),
+                            onPressed: () => _copyGradeText(
+                              entries[index].key,
+                              entries[index].value,
+                              feedbackContext: sheetContext,
+                            ),
+                          ),
+                        ),
+                        if (index < entries.length - 1)
+                          Divider(
+                            height: 1,
+                            indent: 14,
+                            endIndent: 14,
+                            color: colorScheme.outlineVariant,
+                          ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 14),
+                FilledButton.icon(
+                  onPressed: () => _copyGradeText(
+                    '全部成绩信息',
+                    _gradeCopyText(a),
+                    feedbackContext: sheetContext,
+                  ),
+                  icon: const Icon(Icons.copy_all),
+                  label: const Text('复制全部信息'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 单门课程卡片：第一行显示「课程名称 + 得分」，第二行显示完整摘要。
+  /// 手机端摘要会自动换行；点击卡片可以打开更大的可复制详情。
   Widget _buildGradeCard(_GradeArchive a, Color color) {
-    final score = double.tryParse(a.grade);
-    final failed = score != null && score < 60;
+    final failed = a.isFail;
     final colorScheme = Theme.of(context).colorScheme;
     return Card(
+      clipBehavior: Clip.antiAlias,
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  // 第一行：课程名称
-                  Text(
-                    a.course.isEmpty ? '未知课程' : a.course,
-                    style: TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.bold,
-                      color: colorScheme.onSurface,
+      child: InkWell(
+        onTap: () => _showGradeDetails(a, color),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      a.course.isEmpty ? '未知课程' : a.course,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 15,
+                        height: 1.25,
+                        fontWeight: FontWeight.bold,
+                        color: colorScheme.onSurface,
+                      ),
                     ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 4),
-                  // 第二行小字：五字段中的学分/课程性质/课程编码/开课学期
-                  Text(
-                    [
-                          '学分 ${a.credit.isEmpty ? '-' : a.credit}',
-                          a.courseType,
-                          '编码 ${a.code.isEmpty ? '-' : a.code}',
-                          '学期 ${a.term.isEmpty ? '-' : a.term}',
-                        ]
-                        .where((e) => e.isNotEmpty && !e.endsWith('-'))
-                        .join('  ·  '),
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: colorScheme.onSurfaceVariant,
+                    const SizedBox(height: 4),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 18,
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          _gradeSummary(a).isEmpty
+                              ? '暂无课程附加信息'
+                              : _gradeSummary(a),
+                          maxLines: 1,
+                          style: TextStyle(
+                            fontSize: MediaQuery.sizeOf(context).width < 600
+                                ? 10
+                                : 11,
+                            height: 1.2,
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
                     ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ],
+                  ],
+                ),
               ),
-            ),
-            const SizedBox(width: 12),
-            // 得分：第一行的右端，不及格显红
-            Text(
-              a.grade.isEmpty ? '-' : a.grade,
-              style: TextStyle(
-                fontSize: 22,
-                fontWeight: FontWeight.bold,
-                color: failed ? colorScheme.error : color,
+              const SizedBox(width: 12),
+              Text(
+                a.grade.isEmpty ? '-' : a.grade,
+                style: TextStyle(
+                  fontSize: 22,
+                  height: 1.1,
+                  fontWeight: FontWeight.bold,
+                  color: failed ? colorScheme.error : color,
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
