@@ -2,7 +2,7 @@
 
 > 湖南科技学院校园助手 —— 面向 Windows 与 Android 的 Flutter 应用，内置 Rust 校园内网加速器。
 
-当前只支持 Windows 与 Android；iOS 和 macOS 当前及以后均无支持计划，相关工程已从源码删除。
+当前只支持 Windows 与 Android；iOS 和 macOS 当前及以后均无支持计划，若确实有需求请自己cop
 
 ## 功能
 
