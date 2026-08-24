@@ -20,6 +20,12 @@ add_executable(${BINARY_NAME} WIN32
 # that need different build settings.
 apply_standard_settings(${BINARY_NAME})
 
+# The runner contains Chinese fallback messages returned to Flutter. Tell MSVC
+# to interpret source files as UTF-8 instead of the machine code page (936).
+if(MSVC)
+  target_compile_options(${BINARY_NAME} PRIVATE /utf-8)
+endif()
+
 # 让 MSBuild 自动生成带 UAC 的 manifest（requireAdministrator），
 # 而不是在 runner.exe.manifest 里写 trustInfo（会和 Flutter 自动生成的 manifest 合并时 mt.exe 报错 LNK1327）。
 # 启动 jizhicha.exe 时自动 UAC 提权，整个进程树都是管理员，

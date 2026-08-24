@@ -438,7 +438,10 @@ impl TargetRoute {
                 break;
             }
             if attempt < 9 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // netsh can report success before Get-NetRoute observes the
+                // new entry. Keep a short retry window without adding a full
+                // second for every profile route during connection setup.
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
         if !installed {
@@ -480,32 +483,25 @@ impl Drop for TargetRoute {
 /// the adapter up without any target routes.
 fn tunnel_interface_index() -> Result<u32> {
     let script = format!(
-        "Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceIndex",
+        "$index = $null; for ($attempt = 0; $attempt -lt 20 -and $null -eq $index; $attempt++) {{ $index = Get-NetAdapter -Name '{}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty InterfaceIndex; if ($null -eq $index -and $attempt -lt 19) {{ Start-Sleep -Milliseconds 100 }} }}; if ($null -ne $index) {{ [Console]::Out.Write([string]$index) }}",
         TUN_NAME.replace('\'', "''")
     );
-    let mut last_error = None;
-    for attempt in 0..20 {
-        let output = hidden_command("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
-            .map_err(|e| {
-                HuseVpnError::Tunnel(format!("failed to inspect CampusVPN interface: {e}"))
-            })?;
-        if output.status.success() {
-            let value = String::from_utf8_lossy(&output.stdout);
-            if let Ok(index) = value.trim().parse::<u32>() {
-                return Ok(index);
-            }
-        }
-        last_error = Some(String::from_utf8_lossy(&output.stderr).trim().to_string());
-        if attempt < 19 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+    let output = hidden_command("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| HuseVpnError::Tunnel(format!("failed to inspect CampusVPN interface: {e}")))?;
+    if output.status.success() {
+        let value = String::from_utf8_lossy(&output.stdout);
+        if let Ok(index) = value.trim().parse::<u32>() {
+            return Ok(index);
         }
     }
-    let detail = last_error.filter(|value| !value.is_empty());
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
     Err(HuseVpnError::Tunnel(match detail {
-        Some(detail) => format!("CampusVPN interface index is unavailable: {detail}"),
-        None => "CampusVPN interface index is unavailable".into(),
+        detail if !detail.is_empty() => {
+            format!("CampusVPN interface index is unavailable: {detail}")
+        }
+        _ => "CampusVPN interface index is unavailable".into(),
     }))
 }
 

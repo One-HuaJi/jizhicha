@@ -14,13 +14,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart' show SchedulerBinding;
 
 /// 全局主题模式通知器，任何页面修改它都会触发整应用重建。
-final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier<ThemeMode>(
-  ThemeMode.system,
-);
-
 /// 主题持久化服务。
 class ThemeService {
   static File? _file;
+
+  /// 没有保存过主题偏好时，默认跟随系统外观。
+  static const defaultMode = ThemeMode.system;
 
   static Future<File> _settingsFile() async {
     if (_file != null) return _file!;
@@ -54,7 +53,7 @@ class ThemeService {
       final modeName = map['themeMode'] as String?;
       themeNotifier.value = _parseMode(modeName);
     } catch (_) {
-      themeNotifier.value = ThemeMode.system;
+      themeNotifier.value = defaultMode;
     }
   }
 
@@ -74,7 +73,7 @@ class ThemeService {
       case 'light':
         return ThemeMode.light;
       default:
-        return ThemeMode.system;
+        return defaultMode;
     }
   }
 
@@ -87,23 +86,27 @@ class ThemeService {
   }
 }
 
+final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier<ThemeMode>(
+  ThemeService.defaultMode,
+);
+
 /// 应用配色常量，便于在 widget 中直接引用统一语义化的颜色。
 class AppColors {
   AppColors._();
 
   // 浅色模式主色板（米黄/暖咖）
-  static const cream = Color(0xFFFDF8F0);
-  static const creamDark = Color(0xFFF5EFE4);
-  static const beige = Color(0xFFE8DCC4);
-  static const beigeMedium = Color(0xFFD8C8A8);
-  static const warmBrown = Color(0xFF5D4E37);
-  static const softBrown = Color(0xFF8B7355);
-  static const mutedBrown = Color(0xFFA08E72);
-  static const espresso = Color(0xFF3D3226);
+  static const cream = Color(0xFFFAF9F6);
+  static const creamDark = Color(0xFFF1F0EC);
+  static const beige = Color(0xFFE6E1D8);
+  static const beigeMedium = Color(0xFFCEC7BA);
+  static const warmBrown = Color(0xFF5A5348);
+  static const softBrown = Color(0xFF756D62);
+  static const mutedBrown = Color(0xFF968C7E);
+  static const espresso = Color(0xFF28241F);
 
   // 强调色（柔和琥珀/赭石）
-  static const amberSoft = Color(0xFFD69E2E);
-  static const amberLight = Color(0xFFF6E05E);
+  static const amberSoft = Color(0xFFC4861C);
+  static const amberLight = Color(0xFFF0C75E);
   static const terracotta = Color(0xFFC65D3B);
   static const sage = Color(0xFF6B8E6B);
   static const softBlue = Color(0xFF6B8EAF);

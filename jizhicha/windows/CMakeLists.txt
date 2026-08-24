@@ -97,6 +97,19 @@ add_subdirectory("runner")
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+# Some third-party Windows plugins contain UTF-8 comments. The runner uses
+# /WX, so MSVC's default system code page (936 on Chinese Windows) would turn
+# warning C4819 into a hard build failure and silently leave the plugin out of
+# the packaged application. Apply the same source encoding to every plugin
+# target after generated_plugins.cmake has created them.
+if(MSVC)
+  foreach(plugin ${FLUTTER_PLUGIN_LIST})
+    if(TARGET ${plugin}_plugin)
+      target_compile_options(${plugin}_plugin PRIVATE /utf-8)
+    endif()
+  endforeach()
+endif()
+
 
 # === Installation ===
 # Support files are copied into place next to the executable, so that it can
