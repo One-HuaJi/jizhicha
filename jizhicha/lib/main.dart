@@ -3467,6 +3467,12 @@ class _EducationPasswordRecoveryPageState
   bool _submitting = false;
   bool _showIdentity = false;
   bool _localCredentialsInvalidated = false;
+  bool _captchaOcrEnabled = true;
+  bool _captchaOcrBusy = false;
+  String? _captchaOcrHint;
+  String _lastOcrCaptcha = '';
+  int _captchaGeneration = 0;
+  Future<void> _captchaOcrTail = Future<void>.value();
   String? _error;
   String? _successMessage;
 
@@ -3474,7 +3480,7 @@ class _EducationPasswordRecoveryPageState
   void initState() {
     super.initState();
     _studentIdCtrl = TextEditingController(text: widget.initialStudentId);
-    _loadRecoveryCaptcha();
+    unawaited(_initializeRecoveryCaptcha());
   }
 
   @override
@@ -3487,21 +3493,95 @@ class _EducationPasswordRecoveryPageState
 
   Future<void> _loadRecoveryCaptcha({bool clearError = true}) async {
     if (_loadingCaptcha || _submitting) return;
+    final generation = ++_captchaGeneration;
     setState(() {
       _loadingCaptcha = true;
       _captchaBytes = null;
       _captchaCtrl.clear();
+      _captchaOcrBusy = false;
+      _captchaOcrHint = null;
+      _lastOcrCaptcha = '';
       if (clearError) _error = null;
     });
     try {
       final bytes = await JwxtClient().beginPasswordRecovery().timeout(
         const Duration(seconds: 15),
       );
-      if (mounted) setState(() => _captchaBytes = bytes);
+      if (mounted) {
+        setState(() => _captchaBytes = bytes);
+        if (_captchaOcrEnabled) {
+          unawaited(_recognizeRecoveryCaptcha(bytes, generation: generation));
+        }
+      }
     } catch (error) {
       if (mounted) setState(() => _error = '$error');
     } finally {
       if (mounted) setState(() => _loadingCaptcha = false);
+    }
+  }
+
+  Future<void> _initializeRecoveryCaptcha() async {
+    try {
+      final settings = await AppSettings.load();
+      if (mounted) {
+        setState(() => _captchaOcrEnabled = settings.captchaOcrEnabled);
+      }
+    } catch (_) {
+      // 损坏的设置不能阻止官方找回密码页面显示，默认继续开启 OCR。
+    }
+    if (mounted) await _loadRecoveryCaptcha();
+  }
+
+  Future<void> _recognizeRecoveryCaptcha(
+    Uint8List bytes, {
+    required int generation,
+  }) async {
+    final task = _captchaOcrTail.catchError((_) {}).then<void>((_) async {
+      if (!mounted || generation != _captchaGeneration || !_captchaOcrEnabled) {
+        return;
+      }
+      await _recognizeRecoveryCaptchaNow(bytes, generation: generation);
+    });
+    _captchaOcrTail = task.catchError((_) {});
+    await task;
+  }
+
+  Future<void> _recognizeRecoveryCaptchaNow(
+    Uint8List bytes, {
+    required int generation,
+  }) async {
+    if (!_captchaOcrEnabled || bytes.isEmpty) return;
+    if (mounted) {
+      setState(() {
+        _captchaOcrBusy = true;
+        _captchaOcrHint = null;
+      });
+    }
+    String? recognized;
+    try {
+      recognized = await CaptchaOcr.recognize(bytes);
+    } catch (_) {
+      recognized = null;
+    }
+    if (!mounted || generation != _captchaGeneration || !_captchaOcrEnabled) {
+      return;
+    }
+    final current = _captchaCtrl.text.trim();
+    if (recognized != null && (current.isEmpty || current == _lastOcrCaptcha)) {
+      _captchaCtrl.value = TextEditingValue(
+        text: recognized,
+        selection: TextSelection.collapsed(offset: recognized.length),
+      );
+      _lastOcrCaptcha = recognized;
+      setState(() {
+        _captchaOcrBusy = false;
+        _captchaOcrHint = '已自动识别，可按需修改';
+      });
+    } else {
+      setState(() {
+        _captchaOcrBusy = false;
+        _captchaOcrHint = recognized == null ? '未识别成功，请手动输入' : '验证码已手动修改';
+      });
     }
   }
 
@@ -3531,8 +3611,11 @@ class _EducationPasswordRecoveryPageState
         _verifiedAccount = result;
         _studentIdCtrl.text = result.studentId;
         _step = _PasswordRecoveryStep.identity;
+        ++_captchaGeneration;
         _captchaCtrl.clear();
         _captchaBytes = null;
+        _captchaOcrBusy = false;
+        _captchaOcrHint = null;
       });
     } catch (error) {
       if (!mounted) return;
@@ -3792,6 +3875,33 @@ class _EducationPasswordRecoveryPageState
             ),
           ],
         ),
+        if (_captchaOcrEnabled) ...[
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Icon(
+                _captchaOcrBusy ? Icons.sync : Icons.document_scanner_outlined,
+                size: 15,
+                color: colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 5),
+              Expanded(
+                child: Text(
+                  _captchaOcrBusy
+                      ? '正在本机识别验证码…'
+                      : (_captchaOcrHint ??
+                            (Platform.isAndroid || Platform.isWindows
+                                ? '验证码自动识别已开启'
+                                : '当前平台不支持 OCR，请手动输入')),
+                  style: TextStyle(
+                    color: colorScheme.onSurfaceVariant,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
         if (_error != null) ...[
           const SizedBox(height: 16),
           _ErrorBox(message: _error!),
@@ -4184,6 +4294,10 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
   String? _captchaOcrHint;
   String _lastOcrCaptcha = '';
   int _captchaGeneration = 0;
+  // flutter_onnxruntime 的 Android 会话不允许多个推理同时访问。初始化时
+  // “读取 OCR 设置”和“获取首张验证码”可能几乎同时完成；统一排队后，
+  // 旧验证码过期时也只会被安全地跳过，不会让原生运行时收到并发请求。
+  Future<void> _captchaOcrTail = Future<void>.value();
   String? _syncProgress;
   String? _authenticatedStudentId;
   String? _error;
@@ -4194,8 +4308,7 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
     super.initState();
     _studentIdCtrl = TextEditingController(text: widget.studentId);
     _loadSavedAccounts();
-    _loadCaptchaOcrSetting();
-    _refreshCaptcha();
+    unawaited(_initializeCaptcha());
   }
 
   @override
@@ -4249,13 +4362,33 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
         _captchaOcrHint = null;
       }
     });
-    final bytes = _captchaBytes;
-    if (_captchaOcrEnabled && bytes != null) {
-      unawaited(_recognizeCaptcha(bytes, generation: _captchaGeneration));
+  }
+
+  Future<void> _initializeCaptcha() async {
+    // 先确定开关，再请求验证码，避免首屏同时启动两次 OCR。
+    try {
+      await _loadCaptchaOcrSetting();
+    } catch (_) {
+      // 设置文件损坏时保留默认开启状态，验证码仍应正常显示并允许手填。
     }
+    if (mounted) await _refreshCaptcha();
   }
 
   Future<void> _recognizeCaptcha(
+    Uint8List bytes, {
+    required int generation,
+  }) async {
+    final task = _captchaOcrTail.catchError((_) {}).then<void>((_) async {
+      if (!mounted || generation != _captchaGeneration || !_captchaOcrEnabled) {
+        return;
+      }
+      await _recognizeCaptchaNow(bytes, generation: generation);
+    });
+    _captchaOcrTail = task.catchError((_) {});
+    await task;
+  }
+
+  Future<void> _recognizeCaptchaNow(
     Uint8List bytes, {
     required int generation,
   }) async {
@@ -4266,7 +4399,14 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
         _captchaOcrHint = null;
       });
     }
-    final recognized = await CaptchaOcr.recognize(bytes);
+    String? recognized;
+    try {
+      recognized = await CaptchaOcr.recognize(bytes);
+    } catch (_) {
+      // OCR 是可选增强功能；任何平台/模型异常都必须回退到手动输入，
+      // 不能因为自动识别失败阻断教务登录。
+      recognized = null;
+    }
     if (!mounted || generation != _captchaGeneration || !_captchaOcrEnabled) {
       return;
     }
@@ -6895,70 +7035,76 @@ class _SchedulePageState extends State<SchedulePage> {
         : _selectedScheduleUpdateTerm!;
     final compact = MediaQuery.sizeOf(context).width < 600;
     return Scaffold(
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          final contentWidth = constraints.maxWidth > 1400
-              ? 1400.0
-              : constraints.maxWidth;
-          final header = compact
-              ? Column(
-                  children: [
-                    _buildCompactScheduleStatus(context),
-                    _buildCompactScheduleTools(
-                      context,
-                      updateTerms: updateTerms,
-                      selectedUpdateValue: selectedUpdateValue,
-                    ),
-                  ],
-                )
-              : Column(
-                  children: [
-                    _buildScheduleAccountStatus(context),
-                    _buildDesktopScheduleTools(
-                      context,
-                      updateTerms: updateTerms,
-                      selectedUpdateValue: selectedUpdateValue,
-                    ),
-                  ],
-                );
-          return Column(
-            children: [
-              Center(
-                child: SizedBox(width: contentWidth, child: header),
-              ),
-              const Divider(),
-              Expanded(
-                child: Center(
-                  child: SizedBox(
-                    width: contentWidth,
-                    child: RepaintBoundary(
-                      key: _scheduleRepaintKey,
-                      child: ColoredBox(
-                        color: Theme.of(context).scaffoldBackgroundColor,
-                        child: _error != null
-                            ? _buildErrorView(context)
-                            : _courses.isEmpty
-                            ? Center(
-                                child: Text(
-                                  _loading
-                                      ? '正在读取本地课表…'
-                                      : (_emptyMessage ?? '暂无本地课表数据'),
-                                  style: TextStyle(
-                                    color: Theme.of(
-                                      context,
-                                    ).colorScheme.onSurfaceVariant,
+      // 课表页没有 AppBar，必须自己避开 Android 状态栏；否则账号摘要
+      // 会从屏幕顶部开始绘制，被时间、电量和网络图标覆盖。
+      body: SafeArea(
+        top: true,
+        bottom: false,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final contentWidth = constraints.maxWidth > 1400
+                ? 1400.0
+                : constraints.maxWidth;
+            final header = compact
+                ? Column(
+                    children: [
+                      _buildCompactScheduleStatus(context),
+                      _buildCompactScheduleTools(
+                        context,
+                        updateTerms: updateTerms,
+                        selectedUpdateValue: selectedUpdateValue,
+                      ),
+                    ],
+                  )
+                : Column(
+                    children: [
+                      _buildScheduleAccountStatus(context),
+                      _buildDesktopScheduleTools(
+                        context,
+                        updateTerms: updateTerms,
+                        selectedUpdateValue: selectedUpdateValue,
+                      ),
+                    ],
+                  );
+            return Column(
+              children: [
+                Center(
+                  child: SizedBox(width: contentWidth, child: header),
+                ),
+                const Divider(),
+                Expanded(
+                  child: Center(
+                    child: SizedBox(
+                      width: contentWidth,
+                      child: RepaintBoundary(
+                        key: _scheduleRepaintKey,
+                        child: ColoredBox(
+                          color: Theme.of(context).scaffoldBackgroundColor,
+                          child: _error != null
+                              ? _buildErrorView(context)
+                              : _courses.isEmpty
+                              ? Center(
+                                  child: Text(
+                                    _loading
+                                        ? '正在读取本地课表…'
+                                        : (_emptyMessage ?? '暂无本地课表数据'),
+                                    style: TextStyle(
+                                      color: Theme.of(
+                                        context,
+                                      ).colorScheme.onSurfaceVariant,
+                                    ),
                                   ),
-                                ),
-                              )
-                            : _buildScheduleTable(),
+                                )
+                              : _buildScheduleTable(),
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-            ],
-          );
-        },
+              ],
+            );
+          },
+        ),
       ),
     );
   }
