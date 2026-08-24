@@ -22,6 +22,7 @@ import 'dart:io'
 import 'captcha_ocr.dart';
 import 'credential_store.dart';
 import 'schedule_cache_store.dart';
+import 'schedule_time.dart';
 import 'theme.dart';
 
 void main() {
@@ -2103,6 +2104,7 @@ Future<bool> _hasLocalGrades(String studentId) async {
 /// - [filterByWeek]：按周筛选——只显示所选周次有课的课程，其它周隐藏。默认开启。
 /// - [currentWeek]：手动选定的周次（1~20）。学校开课日期由作者维护，但仍允许手动调整，
 ///   本周视图高亮与按周筛选都以它为准。
+/// - [scheduleTimeMode]：课表节次时间模式，默认按设备本地日期自动切换春秋冬季/夏季。
 ///
 /// —— 成绩设置 ——
 /// - [gradeCategoryEnabled]：是否启用"已完成 / 历史补考·重修"分类（关闭则所有课混在一组）。
@@ -2115,6 +2117,7 @@ class AppSettings {
   bool highlightCurrentWeek;
   bool filterByWeek;
   int currentWeek;
+  ScheduleTimeMode scheduleTimeMode;
   bool gradeCategoryEnabled;
   bool gradeSortByYear;
   bool gradeTermFilterEnabled;
@@ -2124,6 +2127,7 @@ class AppSettings {
     this.highlightCurrentWeek = false,
     this.filterByWeek = true,
     this.currentWeek = 1,
+    this.scheduleTimeMode = ScheduleTimeMode.automatic,
     this.gradeCategoryEnabled = true,
     this.gradeSortByYear = true,
     this.gradeTermFilterEnabled = true,
@@ -2132,7 +2136,7 @@ class AppSettings {
 
   static const _fileName = 'jizhicha_settings.json';
   // schemaVersion 仅用于老版本 settings.json 的字段迁移；当前版本无加速器字段。
-  static const _schemaVersion = 6;
+  static const _schemaVersion = 7;
 
   /// 配置文件路径：优先用系统用户目录（Windows %APPDATA%），保证桌面端可写且稳定；
   /// 移动端没有这些环境变量，要回退到平台沙盒目录，否则会落到只读根目录。
@@ -2171,6 +2175,9 @@ class AppSettings {
                 ? (json['filterByWeek'] as bool? ?? true)
                 : true,
             currentWeek: json['currentWeek'] as int? ?? 1,
+            scheduleTimeMode: parseScheduleTimeMode(
+              json['scheduleTimeMode'] as String?,
+            ),
             gradeCategoryEnabled: json['gradeCategoryEnabled'] as bool? ?? true,
             gradeSortByYear: json['gradeSortByYear'] as bool? ?? true,
             gradeTermFilterEnabled:
@@ -2182,6 +2189,9 @@ class AppSettings {
           highlightCurrentWeek: json['highlightCurrentWeek'] as bool? ?? false,
           filterByWeek: json['filterByWeek'] as bool? ?? true,
           currentWeek: json['currentWeek'] as int? ?? 1,
+          scheduleTimeMode: parseScheduleTimeMode(
+            json['scheduleTimeMode'] as String?,
+          ),
           gradeCategoryEnabled: json['gradeCategoryEnabled'] as bool? ?? true,
           gradeSortByYear: json['gradeSortByYear'] as bool? ?? true,
           gradeTermFilterEnabled:
@@ -2202,6 +2212,7 @@ class AppSettings {
           'highlightCurrentWeek': highlightCurrentWeek,
           'filterByWeek': filterByWeek,
           'currentWeek': currentWeek,
+          'scheduleTimeMode': scheduleTimeMode.storageValue,
           'gradeCategoryEnabled': gradeCategoryEnabled,
           'gradeSortByYear': gradeSortByYear,
           'gradeTermFilterEnabled': gradeTermFilterEnabled,
@@ -5670,6 +5681,35 @@ class _SettingsPageState extends State<SettingsPage> {
                           },
                   ),
                 ),
+                const Divider(height: 1),
+                ListTile(
+                  leading: Icon(Icons.schedule, color: colorScheme.primary),
+                  title: const Text('课表节次时间'),
+                  subtitle: Text(
+                    s.scheduleTimeMode == ScheduleTimeMode.automatic
+                        ? '自动按本机日期切换：1–4月、10–12月春秋冬季，5–9月夏季'
+                        : '固定使用${s.scheduleTimeMode.label}作息时间',
+                  ),
+                  trailing: DropdownButton<ScheduleTimeMode>(
+                    value: s.scheduleTimeMode,
+                    isDense: true,
+                    items: ScheduleTimeMode.values
+                        .map(
+                          (mode) => DropdownMenuItem(
+                            value: mode,
+                            child: Text(mode.label),
+                          ),
+                        )
+                        .toList(),
+                    onChanged: _settings == null
+                        ? null
+                        : (mode) {
+                            if (mode == null) return;
+                            setState(() => _settings!.scheduleTimeMode = mode);
+                            _persist(notify: true);
+                          },
+                  ),
+                ),
               ],
             ),
           ),
@@ -7288,10 +7328,14 @@ class _SchedulePageState extends State<SchedulePage> {
   Widget _buildTimeCell(String time) {
     // 例 "第一大节 (01,02小节)" / "第一节 (01,02小节)" → 主行 + 小节行
     final match = RegExp(
-      r'^(第[一二三四五六七八九十]+(?:大)?节)(?:\s*\(([^)]+)\))?',
+      r'^(第[一二三四五六七八九十]+(?:大)?节)(?:\s*[（(]([^）)]*)[）)])?',
     ).firstMatch(time);
     final main = match?.group(1) ?? time;
-    final sub = match?.group(2) ?? '';
+    final legacySub = match?.group(2) ?? '';
+    final sub = ScheduleTimeTable.formatSublessonLines(
+      time,
+      _s.scheduleTimeMode,
+    );
     final colorScheme = Theme.of(context).colorScheme;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
@@ -7310,12 +7354,14 @@ class _SchedulePageState extends State<SchedulePage> {
               color: colorScheme.onSurface,
             ),
           ),
-          if (sub.isNotEmpty) ...[
+          if (sub.isNotEmpty || legacySub.isNotEmpty) ...[
             const SizedBox(height: 2),
             Text(
-              sub,
+              sub.isNotEmpty ? sub : legacySub,
+              textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 10,
+                height: 1.25,
                 color: colorScheme.onSurfaceVariant,
               ),
             ),
