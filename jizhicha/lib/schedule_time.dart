@@ -98,13 +98,16 @@ class ScheduleTimeTable {
     String value,
     ScheduleTimeMode mode, {
     DateTime? now,
+    bool includeLabels = true,
   }) {
     final numbers = sublessonNumbers(value);
     if (numbers.isEmpty) return '';
     return numbers
         .map((number) {
           final time = lessonTime(number, mode, now: now);
-          return '${number.toString().padLeft(2, '0')}小节：$time';
+          return includeLabels
+              ? '${number.toString().padLeft(2, '0')}小节：$time'
+              : time!;
         })
         .join('\n');
   }
