@@ -6240,6 +6240,34 @@ class _SchedulePageState extends State<SchedulePage> {
     return _campusEnvironment.online == true ? '校园内网可用' : '离线模式';
   }
 
+  Widget _buildScheduleAcceleratorAction(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final online = _campusEnvironment.online == true;
+    return OutlinedButton.icon(
+      onPressed: _campusEnvironment.actionLoading
+          ? null
+          : _handleCampusAcceleratorAction,
+      icon: _campusEnvironment.actionLoading
+          ? const SizedBox.square(
+              dimension: 15,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : Icon(online ? Icons.logout : Icons.vpn_lock, size: 16),
+      label: Text(
+        _campusEnvironment.actionLoading
+            ? '处理中…'
+            : online
+            ? '登出加速器'
+            : '连接校园加速器',
+      ),
+      style: OutlinedButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        textStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+        foregroundColor: online ? colorScheme.tertiary : colorScheme.primary,
+      ),
+    );
+  }
+
   Widget _buildScheduleAccountStatus(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final online = _campusEnvironment.online == true;
@@ -6255,49 +6283,70 @@ class _SchedulePageState extends State<SchedulePage> {
           padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
           child: Row(
             children: [
-              DecoratedBox(
-                decoration: BoxDecoration(
-                  color: colorScheme.primaryContainer,
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(8),
-                  child: Icon(
-                    Icons.person_outline,
-                    size: 19,
-                    color: colorScheme.onPrimaryContainer,
+              Expanded(
+                child: Tooltip(
+                  message: '点击切换账号',
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: () => _switchToSavedAccount(
+                      context,
+                      currentStudentId: widget.studentId,
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2),
+                      child: Row(
+                        children: [
+                          DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: colorScheme.primaryContainer,
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.all(8),
+                              child: Icon(
+                                Icons.person_outline,
+                                size: 19,
+                                color: colorScheme.onPrimaryContainer,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  _scheduleAccountSummary(),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: colorScheme.onSurface,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  '当前查看：${_selectedTerm.isEmpty ? '未选择学期' : _selectedTerm}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      _scheduleAccountSummary(),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: colorScheme.onSurface,
-                      ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      '当前查看：${_selectedTerm.isEmpty ? '未选择学期' : _selectedTerm}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
               const SizedBox(width: 12),
+              _buildScheduleAcceleratorAction(context),
+              const SizedBox(width: 8),
               Tooltip(
                 message: '点击重新检测是否为校内环境',
                 child: InkWell(
@@ -6369,32 +6418,62 @@ class _SchedulePageState extends State<SchedulePage> {
       child: Row(
         children: [
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  _scheduleAccountSummary(),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: colorScheme.onSurfaceVariant,
+            child: Tooltip(
+              message: '点击切换账号',
+              child: InkWell(
+                borderRadius: BorderRadius.circular(10),
+                onTap: () => _switchToSavedAccount(
+                  context,
+                  currentStudentId: widget.studentId,
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _scheduleAccountSummary(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        '${_selectedTerm.isEmpty ? '未选择学期' : _selectedTerm} · ${_campusModeSummary()}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: online
+                              ? colorScheme.primary
+                              : colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  '${_selectedTerm.isEmpty ? '未选择学期' : _selectedTerm} · ${_campusModeSummary()}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: online
-                        ? colorScheme.primary
-                        : colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
+              ),
             ),
+          ),
+          IconButton(
+            tooltip: _campusEnvironment.online == true ? '登出校园加速器' : '连接校园加速器',
+            onPressed: _campusEnvironment.actionLoading
+                ? null
+                : _handleCampusAcceleratorAction,
+            icon: _campusEnvironment.actionLoading
+                ? const SizedBox.square(
+                    dimension: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Icon(
+                    _campusEnvironment.online == true
+                        ? Icons.logout
+                        : Icons.vpn_lock,
+                    size: 20,
+                  ),
           ),
           IconButton(
             tooltip: '重新检测校园内网',
@@ -6816,43 +6895,6 @@ class _SchedulePageState extends State<SchedulePage> {
         : _selectedScheduleUpdateTerm!;
     final compact = MediaQuery.sizeOf(context).width < 600;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('学期课表'),
-        actions: [
-          TextButton.icon(
-            onPressed: () => _switchToSavedAccount(
-              context,
-              currentStudentId: widget.studentId,
-            ),
-            icon: const Icon(Icons.switch_account, size: 18),
-            label: const Text('切换用户'),
-          ),
-          if (!_campusEnvironment.checking)
-            TextButton.icon(
-              onPressed: _campusEnvironment.actionLoading
-                  ? null
-                  : _handleCampusAcceleratorAction,
-              icon: _campusEnvironment.actionLoading
-                  ? const SizedBox.square(
-                      dimension: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : Icon(
-                      _campusEnvironment.online == true
-                          ? Icons.logout
-                          : Icons.vpn_lock,
-                      size: 18,
-                    ),
-              label: Text(
-                _campusEnvironment.actionLoading
-                    ? '正在登出…'
-                    : _campusEnvironment.online == true
-                    ? '登出加速器'
-                    : '连接校园加速器',
-              ),
-            ),
-        ],
-      ),
       body: LayoutBuilder(
         builder: (context, constraints) {
           final contentWidth = constraints.maxWidth > 1400
@@ -7335,6 +7377,7 @@ class _SchedulePageState extends State<SchedulePage> {
     final sub = ScheduleTimeTable.formatSublessonLines(
       time,
       _s.scheduleTimeMode,
+      includeLabels: false,
     );
     final colorScheme = Theme.of(context).colorScheme;
     return Container(

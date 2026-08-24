@@ -63,6 +63,14 @@ void main() {
       );
       expect(
         ScheduleTimeTable.formatSublessonLines(
+          '第一大节 (01,02小节)',
+          ScheduleTimeMode.springAutumnWinter,
+          includeLabels: false,
+        ),
+        '08:20–09:05\n09:15–10:00',
+      );
+      expect(
+        ScheduleTimeTable.formatSublessonLines(
           '第二大节 (03,04小节)',
           ScheduleTimeMode.summer,
         ),
