@@ -15,10 +15,11 @@ import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
-import 'dart:async' show Timer, runZonedGuarded;
+import 'dart:async' show Timer, runZonedGuarded, unawaited;
 import 'dart:io'
     show Directory, File, HttpClient, InternetAddress, Platform, Socket;
 
+import 'captcha_ocr.dart';
 import 'credential_store.dart';
 import 'schedule_cache_store.dart';
 import 'theme.dart';
@@ -203,7 +204,7 @@ final dataSyncCooldown = DataSyncCooldownController();
 class _SyncCooldownIndicator extends StatelessWidget {
   final SyncResource resource;
 
-  const _SyncCooldownIndicator({required this.resource});
+  const _SyncCooldownIndicator({required this.resource, super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -2107,6 +2108,9 @@ Future<bool> _hasLocalGrades(String studentId) async {
 /// - [gradeCategoryEnabled]：是否启用"已完成 / 历史补考·重修"分类（关闭则所有课混在一组）。
 /// - [gradeSortByYear]：按开课时间（学年）排序，以更大学年为顶，倒序展示。
 /// - [gradeTermFilterEnabled]：是否显示成绩学期筛选器，默认开启。
+///
+/// —— 登录设置 ——
+/// - [captchaOcrEnabled]：Android / Windows 端自动识别教务验证码，默认开启；识别失败时仍可手动输入。
 class AppSettings {
   bool highlightCurrentWeek;
   bool filterByWeek;
@@ -2114,6 +2118,7 @@ class AppSettings {
   bool gradeCategoryEnabled;
   bool gradeSortByYear;
   bool gradeTermFilterEnabled;
+  bool captchaOcrEnabled;
 
   AppSettings({
     this.highlightCurrentWeek = false,
@@ -2122,11 +2127,12 @@ class AppSettings {
     this.gradeCategoryEnabled = true,
     this.gradeSortByYear = true,
     this.gradeTermFilterEnabled = true,
+    this.captchaOcrEnabled = true,
   });
 
   static const _fileName = 'jizhicha_settings.json';
   // schemaVersion 仅用于老版本 settings.json 的字段迁移；当前版本无加速器字段。
-  static const _schemaVersion = 5;
+  static const _schemaVersion = 6;
 
   /// 配置文件路径：优先用系统用户目录（Windows %APPDATA%），保证桌面端可写且稳定；
   /// 移动端没有这些环境变量，要回退到平台沙盒目录，否则会落到只读根目录。
@@ -2169,6 +2175,7 @@ class AppSettings {
             gradeSortByYear: json['gradeSortByYear'] as bool? ?? true,
             gradeTermFilterEnabled:
                 json['gradeTermFilterEnabled'] as bool? ?? true,
+            captchaOcrEnabled: json['captchaOcrEnabled'] as bool? ?? true,
           );
         }
         return AppSettings(
@@ -2179,6 +2186,7 @@ class AppSettings {
           gradeSortByYear: json['gradeSortByYear'] as bool? ?? true,
           gradeTermFilterEnabled:
               json['gradeTermFilterEnabled'] as bool? ?? true,
+          captchaOcrEnabled: json['captchaOcrEnabled'] as bool? ?? true,
         );
       }
     } catch (_) {}
@@ -2197,6 +2205,7 @@ class AppSettings {
           'gradeCategoryEnabled': gradeCategoryEnabled,
           'gradeSortByYear': gradeSortByYear,
           'gradeTermFilterEnabled': gradeTermFilterEnabled,
+          'captchaOcrEnabled': captchaOcrEnabled,
         }),
       );
     } catch (_) {}
@@ -2847,6 +2856,33 @@ class _ModeCard extends StatelessWidget {
   }
 }
 
+Future<void> _showStudentIdHelp(BuildContext context) async {
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.help_outline),
+          SizedBox(width: 8),
+          Text('账号填写说明'),
+        ],
+      ),
+      content: const SingleChildScrollView(
+        child: SelectableText(
+          '学号为湘科院官方下发的纯数字学号，格式为[年份][专业][系别][学号]的十二位纯数字学号，密码为身份证后六位,若显示无法登陆则可能校方并未录入数据，我们无能为力，请静待校方添加。',
+          style: TextStyle(height: 1.6),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(dialogContext).pop(),
+          child: const Text('知道了'),
+        ),
+      ],
+    ),
+  );
+}
+
 class VpnSetupPage extends StatefulWidget {
   final AppMode mode;
   final String? initialNotice;
@@ -2880,6 +2916,7 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
   final _passwordCtrl = TextEditingController();
   List<StoredAccount> _savedAccounts = const [];
   bool _submitting = false;
+  bool _showPassword = false;
   AppMode? _connectingMode;
   String? _error;
   String? _progress;
@@ -3090,7 +3127,16 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: Text(title)),
+      appBar: AppBar(
+        title: Text(title),
+        actions: [
+          IconButton(
+            tooltip: '账号填写说明',
+            icon: const Icon(Icons.help_outline),
+            onPressed: _submitting ? null : () => _showStudentIdHelp(context),
+          ),
+        ],
+      ),
       body: SafeArea(
         child: Center(
           child: ConstrainedBox(
@@ -3139,7 +3185,12 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
                   controller: _passwordCtrl,
                   label: '学校加速器密码',
                   icon: Icons.lock_outline,
-                  obscureText: true,
+                  obscureText: !_showPassword,
+                  suffixIcon: _PasswordVisibilityButton(
+                    visible: _showPassword,
+                    onPressed: () =>
+                        setState(() => _showPassword = !_showPassword),
+                  ),
                 ),
                 const SizedBox(height: 24),
                 if (_error != null) _ErrorBox(message: _error!),
@@ -3315,6 +3366,31 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
             )
             .toList();
       },
+    );
+  }
+}
+
+class _PasswordVisibilityButton extends StatelessWidget {
+  final bool visible;
+  final VoidCallback onPressed;
+
+  const _PasswordVisibilityButton({
+    required this.visible,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: visible ? '隐藏密码' : '显示密码',
+      onPressed: onPressed,
+      icon: Icon(
+        visible ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+        size: 18,
+      ),
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+      visualDensity: VisualDensity.compact,
     );
   }
 }
@@ -4086,11 +4162,17 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
   final _passwordCtrl = TextEditingController();
   final _captchaCtrl = TextEditingController();
   List<StoredAccount> _savedAccounts = const [];
+  bool _showPassword = false;
   Uint8List? _captchaBytes;
   bool _loadingCaptcha = false;
   bool _loggingIn = false;
   bool _openingPasswordRecovery = false;
   bool _passwordResetPendingInMemory = false;
+  bool _captchaOcrEnabled = true;
+  bool _captchaOcrBusy = false;
+  String? _captchaOcrHint;
+  String _lastOcrCaptcha = '';
+  int _captchaGeneration = 0;
   String? _syncProgress;
   String? _authenticatedStudentId;
   String? _error;
@@ -4101,6 +4183,7 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
     super.initState();
     _studentIdCtrl = TextEditingController(text: widget.studentId);
     _loadSavedAccounts();
+    _loadCaptchaOcrSetting();
     _refreshCaptcha();
   }
 
@@ -4145,12 +4228,67 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
     });
   }
 
+  Future<void> _loadCaptchaOcrSetting() async {
+    final settings = await AppSettings.load();
+    if (!mounted) return;
+    setState(() {
+      _captchaOcrEnabled = settings.captchaOcrEnabled;
+      if (!_captchaOcrEnabled) {
+        _captchaOcrBusy = false;
+        _captchaOcrHint = null;
+      }
+    });
+    final bytes = _captchaBytes;
+    if (_captchaOcrEnabled && bytes != null) {
+      unawaited(_recognizeCaptcha(bytes, generation: _captchaGeneration));
+    }
+  }
+
+  Future<void> _recognizeCaptcha(
+    Uint8List bytes, {
+    required int generation,
+  }) async {
+    if (!_captchaOcrEnabled || bytes.isEmpty) return;
+    if (mounted) {
+      setState(() {
+        _captchaOcrBusy = true;
+        _captchaOcrHint = null;
+      });
+    }
+    final recognized = await CaptchaOcr.recognize(bytes);
+    if (!mounted || generation != _captchaGeneration || !_captchaOcrEnabled) {
+      return;
+    }
+    final current = _captchaCtrl.text.trim();
+    if (recognized != null && (current.isEmpty || current == _lastOcrCaptcha)) {
+      _captchaCtrl.value = TextEditingValue(
+        text: recognized,
+        selection: TextSelection.collapsed(offset: recognized.length),
+      );
+      _lastOcrCaptcha = recognized;
+      setState(() {
+        _captchaOcrBusy = false;
+        _captchaOcrHint = '已自动识别，可按需修改';
+      });
+    } else {
+      setState(() {
+        _captchaOcrBusy = false;
+        _captchaOcrHint = recognized == null ? '未识别成功，请手动输入' : '验证码已手动修改';
+      });
+    }
+  }
+
   Future<void> _refreshCaptcha({bool clearError = true}) async {
     if (_loadingCaptcha) return;
     final previousError = clearError ? null : _error;
+    final generation = ++_captchaGeneration;
     setState(() {
       _loadingCaptcha = true;
       _error = previousError;
+      _captchaOcrBusy = false;
+      _captchaOcrHint = null;
+      _lastOcrCaptcha = '';
+      _captchaCtrl.clear();
     });
     try {
       // 直接请求实际验证码接口，不再先做一轮容易受页面模板/502 影响的
@@ -4175,7 +4313,12 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
         }
       }
       if (bytes == null) throw lastError ?? '验证码请求失败';
-      if (mounted) setState(() => _captchaBytes = bytes);
+      if (mounted) {
+        setState(() => _captchaBytes = bytes);
+        if (_captchaOcrEnabled) {
+          unawaited(_recognizeCaptcha(bytes, generation: generation));
+        }
+      }
     } catch (error) {
       if (mounted) {
         setState(() {
@@ -4542,10 +4685,15 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
                 const SizedBox(height: 16),
                 TextField(
                   controller: _passwordCtrl,
-                  obscureText: true,
-                  decoration: const InputDecoration(
+                  obscureText: !_showPassword,
+                  decoration: InputDecoration(
                     labelText: '教务系统密码',
                     prefixIcon: Icon(Icons.lock_outline),
+                    suffixIcon: _PasswordVisibilityButton(
+                      visible: _showPassword,
+                      onPressed: () =>
+                          setState(() => _showPassword = !_showPassword),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -4614,6 +4762,35 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
                     ),
                   ],
                 ),
+                if (_captchaOcrEnabled) ...[
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Icon(
+                        _captchaOcrBusy
+                            ? Icons.sync
+                            : Icons.document_scanner_outlined,
+                        size: 15,
+                        color: colorScheme.onSurfaceVariant,
+                      ),
+                      const SizedBox(width: 5),
+                      Expanded(
+                        child: Text(
+                          _captchaOcrBusy
+                              ? '正在本机识别验证码…'
+                              : (_captchaOcrHint ??
+                                    (Platform.isAndroid || Platform.isWindows
+                                        ? '验证码自动识别已开启'
+                                        : '当前平台不支持 OCR，请手动输入')),
+                          style: TextStyle(
+                            color: colorScheme.onSurfaceVariant,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
                 const SizedBox(height: 20),
                 if (_error != null) _ErrorBox(message: _error!),
                 if (_error != null) const SizedBox(height: 16),
@@ -5143,29 +5320,69 @@ class _HomePageState extends State<HomePage> {
       const FitnessPage(),
       SettingsPage(studentId: widget.studentId),
     ];
-    return Scaffold(
-      // 保留每个页面 State，并用轻微淡入/平移动画切换，避免底部导航
-      // 点击后页面像被硬切开一样割裂。
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          for (var i = 0; i < pages.length; i++)
-            IgnorePointer(
-              ignoring: i != _index,
-              child: AnimatedOpacity(
-                opacity: i == _index ? 1 : 0,
-                duration: const Duration(milliseconds: 220),
+    // 保留每个页面 State，并用轻微淡入/平移动画切换，避免页面像被硬切开。
+    final pageStack = Stack(
+      fit: StackFit.expand,
+      children: [
+        for (var i = 0; i < pages.length; i++)
+          IgnorePointer(
+            ignoring: i != _index,
+            child: AnimatedOpacity(
+              opacity: i == _index ? 1 : 0,
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              child: AnimatedSlide(
+                offset: i == _index ? Offset.zero : const Offset(0.025, 0),
+                duration: const Duration(milliseconds: 260),
                 curve: Curves.easeOutCubic,
-                child: AnimatedSlide(
-                  offset: i == _index ? Offset.zero : const Offset(0.025, 0),
-                  duration: const Duration(milliseconds: 260),
-                  curve: Curves.easeOutCubic,
-                  child: pages[i],
+                child: pages[i],
+              ),
+            ),
+          ),
+      ],
+    );
+
+    // 桌面端使用侧边导航，避免把宽屏也套成手机底部导航；手机仍保留
+    // 底部导航，保证单手操作和已有用户习惯不变。
+    final desktop = MediaQuery.sizeOf(context).width >= 900;
+    if (desktop) {
+      return Scaffold(
+        body: Row(
+          children: [
+            SafeArea(
+              child: Material(
+                color: colorScheme.surfaceContainerLow,
+                child: NavigationRail(
+                  minWidth: 82,
+                  groupAlignment: -0.55,
+                  labelType: NavigationRailLabelType.all,
+                  selectedIndex: _index,
+                  onDestinationSelected: (i) => setState(() => _index = i),
+                  indicatorColor: colorScheme.primaryContainer,
+                  destinations: [
+                    for (final t in _tabs)
+                      NavigationRailDestination(
+                        icon: Icon(t.icon),
+                        selectedIcon: Icon(t.icon),
+                        label: Text(t.label),
+                      ),
+                  ],
                 ),
               ),
             ),
-        ],
-      ),
+            VerticalDivider(
+              width: 1,
+              thickness: 1,
+              color: colorScheme.outlineVariant.withAlpha(110),
+            ),
+            Expanded(child: pageStack),
+          ],
+        ),
+      );
+    }
+
+    return Scaffold(
+      body: pageStack,
       bottomNavigationBar: NavigationBar(
         selectedIndex: _index,
         onDestinationSelected: (i) => setState(() => _index = i),
@@ -5344,9 +5561,9 @@ class _SettingsPageState extends State<SettingsPage> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text('深色模式'),
+                            Text('外观颜色'),
                             SizedBox(height: 3),
-                            Text('浅色 / 深色 / 跟随系统'),
+                            Text('跟随系统（默认），也可以手动选择浅色或深色'),
                           ],
                         ),
                       ),
@@ -5516,6 +5733,32 @@ class _SettingsPageState extends State<SettingsPage> {
                         },
                 ),
               ],
+            ),
+          ),
+          const SizedBox(height: 18),
+
+          // ==================== 教务登录设置 ====================
+          _buildSectionHeader(Icons.verified_user, '教务登录'),
+          Card(
+            child: SwitchListTile(
+              title: const Text(
+                '自动识别验证码',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              subtitle: const Text(
+                '默认开启：Android / Windows 会在本机识别验证码并自动填入。识别失败时可直接手动修改。',
+              ),
+              secondary: Icon(
+                Icons.document_scanner,
+                color: colorScheme.primary,
+              ),
+              value: s.captchaOcrEnabled,
+              onChanged: _settings == null
+                  ? null
+                  : (v) {
+                      setState(() => _settings!.captchaOcrEnabled = v);
+                      _persist(notify: true);
+                    },
             ),
           ),
           const SizedBox(height: 18),
@@ -5958,49 +6201,122 @@ class _SchedulePageState extends State<SchedulePage> {
   }
 
   Widget _buildScheduleAccountStatus(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final online = _campusEnvironment.online == true;
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(
-              _scheduleAccountSummary(),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 12,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: colorScheme.outlineVariant.withAlpha(150)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+          child: Row(
+            children: [
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: colorScheme.primaryContainer,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: Icon(
+                    Icons.person_outline,
+                    size: 19,
+                    color: colorScheme.onPrimaryContainer,
+                  ),
+                ),
               ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Tooltip(
-            message: '点击重新检测是否为校内环境',
-            child: OutlinedButton.icon(
-              onPressed: _campusEnvironment.checking
-                  ? null
-                  : _detectCampusEnvironment,
-              icon: _campusEnvironment.checking
-                  ? const SizedBox.square(
-                      dimension: 14,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : Icon(
-                      _campusEnvironment.online == true
-                          ? Icons.wifi
-                          : Icons.cloud_off,
-                      size: 17,
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _scheduleAccountSummary(),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: colorScheme.onSurface,
+                      ),
                     ),
-              label: Text(
-                _campusEnvironment.checking
-                    ? '正在检测校内环境'
-                    : _campusEnvironment.online == true
-                    ? '在线模式 · 校园内网可用'
-                    : '离线模式 · 使用本地数据',
+                    const SizedBox(height: 2),
+                    Text(
+                      '当前查看：${_selectedTerm.isEmpty ? '未选择学期' : _selectedTerm}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            ),
+              const SizedBox(width: 12),
+              Tooltip(
+                message: '点击重新检测是否为校内环境',
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(12),
+                  onTap: _campusEnvironment.checking
+                      ? null
+                      : _detectCampusEnvironment,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 9,
+                      vertical: 7,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _campusEnvironment.checking
+                            ? SizedBox.square(
+                                dimension: 15,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: colorScheme.primary,
+                                ),
+                              )
+                            : Icon(
+                                online ? Icons.wifi : Icons.cloud_off,
+                                size: 17,
+                                color: online
+                                    ? colorScheme.tertiary
+                                    : colorScheme.onSurfaceVariant,
+                              ),
+                        const SizedBox(width: 6),
+                        Text(
+                          _campusEnvironment.checking
+                              ? '检测中'
+                              : online
+                              ? '校园网在线'
+                              : '离线模式',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: online
+                                ? colorScheme.tertiary
+                                : colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        const SizedBox(width: 2),
+                        Icon(
+                          Icons.refresh,
+                          size: 14,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -6057,28 +6373,36 @@ class _SchedulePageState extends State<SchedulePage> {
     );
   }
 
-  Widget _buildScheduleTermSelector() {
+  Widget _buildScheduleTermSelector({bool embedded = false}) {
+    final selector = DropdownButtonFormField<String>(
+      key: ValueKey(_selectedTerm),
+      decoration: const InputDecoration(
+        labelText: '查看学期',
+        border: OutlineInputBorder(),
+        prefixIcon: Icon(Icons.calendar_month),
+        isDense: true,
+      ),
+      initialValue: _terms.contains(_selectedTerm) ? _selectedTerm : null,
+      isExpanded: true,
+      items: _terms
+          .map(
+            (term) => DropdownMenuItem(
+              value: term,
+              child: Text(term, overflow: TextOverflow.ellipsis),
+            ),
+          )
+          .toList(),
+      onChanged: _loading
+          ? null
+          : (value) {
+              if (value == null || value == _selectedTerm) return;
+              _loadLocalTerm(value);
+            },
+    );
+    if (embedded) return selector;
     return Padding(
       padding: const EdgeInsets.fromLTRB(14, 8, 14, 8),
-      child: DropdownButtonFormField<String>(
-        key: ValueKey(_selectedTerm),
-        decoration: const InputDecoration(
-          labelText: '本地学年学期',
-          border: OutlineInputBorder(),
-          prefixIcon: Icon(Icons.calendar_month),
-          isDense: true,
-        ),
-        initialValue: _terms.contains(_selectedTerm) ? _selectedTerm : null,
-        items: _terms
-            .map((term) => DropdownMenuItem(value: term, child: Text(term)))
-            .toList(),
-        onChanged: _loading
-            ? null
-            : (value) {
-                if (value == null || value == _selectedTerm) return;
-                _loadLocalTerm(value);
-              },
-      ),
+      child: selector,
     );
   }
 
@@ -6123,20 +6447,7 @@ class _SchedulePageState extends State<SchedulePage> {
           );
     return Padding(
       padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
-      child: Wrap(
-        alignment: WrapAlignment.spaceBetween,
-        crossAxisAlignment: WrapCrossAlignment.center,
-        spacing: 12,
-        runSpacing: 4,
-        children: [
-          OutlinedButton.icon(
-            onPressed: _lastRawHtml.isEmpty ? null : _chooseScheduleExport,
-            icon: const Icon(Icons.save_alt, size: 16),
-            label: const Text('导出课表'),
-          ),
-          weekFilter,
-        ],
-      ),
+      child: Row(children: [weekFilter, const Spacer()]),
     );
   }
 
@@ -6148,73 +6459,218 @@ class _SchedulePageState extends State<SchedulePage> {
   }) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Row(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final selector = _buildScheduleUpdateSelector(
+            updateTerms: updateTerms,
+            selectedUpdateValue: selectedUpdateValue,
+          );
+          final selectorBox = compact
+              ? Expanded(child: selector)
+              : SizedBox(width: 300, child: selector);
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: DropdownButtonFormField<String>(
-                  key: ValueKey(
-                    'schedule-update-$selectedUpdateValue-${updateTerms.join('|')}',
+              Row(
+                children: [
+                  selectorBox,
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed:
+                        _loading ||
+                            dataSyncCooldown.isCooling(SyncResource.schedule)
+                        ? null
+                        : _openManualScheduleSave,
+                    icon: const Icon(Icons.sync, size: 18),
+                    label: Text(compact ? '更新' : '更新课表'),
                   ),
-                  initialValue:
-                      updateTerms.contains(selectedUpdateValue) ||
-                          selectedUpdateValue == _latestScheduleTermsValue ||
-                          selectedUpdateValue == _allScheduleTermsValue
-                      ? selectedUpdateValue
-                      : _latestScheduleTermsValue,
-                  decoration: const InputDecoration(
-                    labelText: '更新学期',
-                    prefixIcon: Icon(Icons.cloud_download),
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
-                  items: [
-                    const DropdownMenuItem(
-                      value: _latestScheduleTermsValue,
-                      child: Text('最新一期（自动回退）'),
-                    ),
-                    const DropdownMenuItem(
-                      value: _allScheduleTermsValue,
-                      child: Text('所有已知学期'),
-                    ),
-                    ...updateTerms.map(
-                      (term) =>
-                          DropdownMenuItem(value: term, child: Text(term)),
-                    ),
-                  ],
-                  onChanged: _loading
-                      ? null
-                      : (value) {
-                          if (value == null) return;
-                          setState(() {
-                            _selectedScheduleUpdateTerm =
-                                value == _latestScheduleTermsValue
-                                ? null
-                                : value;
-                          });
-                        },
-                ),
+                  if (!compact) const Spacer(),
+                ],
               ),
-              const SizedBox(width: 8),
+              const SizedBox(height: 6),
+              _SyncCooldownIndicator(resource: SyncResource.schedule),
+              const SizedBox(height: 2),
               OutlinedButton.icon(
-                onPressed:
-                    _loading ||
-                        dataSyncCooldown.isCooling(SyncResource.schedule)
-                    ? null
-                    : _openManualScheduleSave,
-                icon: const Icon(Icons.sync, size: 18),
-                label: Text(compact ? '更新' : '更新课表'),
+                onPressed: _lastRawHtml.isEmpty ? null : _chooseScheduleExport,
+                icon: const Icon(Icons.save_alt, size: 16),
+                label: const Text('导出课表'),
               ),
             ],
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildScheduleUpdateSelector({
+    required List<String> updateTerms,
+    required String selectedUpdateValue,
+  }) {
+    return DropdownButtonFormField<String>(
+      key: ValueKey(
+        'schedule-update-$selectedUpdateValue-${updateTerms.join('|')}',
+      ),
+      initialValue:
+          updateTerms.contains(selectedUpdateValue) ||
+              selectedUpdateValue == _latestScheduleTermsValue ||
+              selectedUpdateValue == _allScheduleTermsValue
+          ? selectedUpdateValue
+          : _latestScheduleTermsValue,
+      decoration: const InputDecoration(
+        labelText: '更新范围',
+        prefixIcon: Icon(Icons.sync),
+        border: OutlineInputBorder(),
+        isDense: true,
+      ),
+      isExpanded: true,
+      items: [
+        const DropdownMenuItem(
+          value: _latestScheduleTermsValue,
+          child: Text('最新一期（自动回退）', overflow: TextOverflow.ellipsis),
+        ),
+        const DropdownMenuItem(
+          value: _allScheduleTermsValue,
+          child: Text('所有已知学期', overflow: TextOverflow.ellipsis),
+        ),
+        ...updateTerms.map(
+          (term) => DropdownMenuItem(
+            value: term,
+            child: Text(term, overflow: TextOverflow.ellipsis),
           ),
-          const SizedBox(height: 6),
-          Align(
-            alignment: Alignment.centerLeft,
-            child: _SyncCooldownIndicator(resource: SyncResource.schedule),
+        ),
+      ],
+      onChanged: _loading
+          ? null
+          : (value) {
+              if (value == null) return;
+              setState(() {
+                _selectedScheduleUpdateTerm = value == _latestScheduleTermsValue
+                    ? null
+                    : value;
+              });
+            },
+    );
+  }
+
+  Widget _buildDesktopWeekSelector(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return DropdownButtonFormField<int>(
+      key: ValueKey('schedule-week-${_s.currentWeek}'),
+      initialValue: _s.currentWeek,
+      decoration: InputDecoration(
+        labelText: _s.filterByWeek ? '按周筛选' : '当前周视图',
+        prefixIcon: const Icon(Icons.view_week_outlined),
+        border: const OutlineInputBorder(),
+        isDense: true,
+        helperStyle: TextStyle(color: colorScheme.onSurfaceVariant),
+      ),
+      isExpanded: true,
+      items: List.generate(
+        AcademicCalendar.weeksPerAcademicYear,
+        (index) =>
+            DropdownMenuItem(value: index + 1, child: Text('第${index + 1}周')),
+      ),
+      onChanged: _settings == null
+          ? null
+          : (value) {
+              if (value == null) return;
+              setState(() => _settings!.currentWeek = value);
+              _saveSettingsAndRefresh();
+            },
+    );
+  }
+
+  Widget _buildDesktopScheduleTools(
+    BuildContext context, {
+    required List<String> updateTerms,
+    required String selectedUpdateValue,
+  }) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colorScheme.surfaceContainerLow,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: colorScheme.outlineVariant.withAlpha(150)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final narrow = constraints.maxWidth < 1160;
+              final fields = [
+                SizedBox(
+                  width: narrow ? 190 : 240,
+                  child: _buildScheduleTermSelector(embedded: true),
+                ),
+                SizedBox(
+                  width: narrow ? 150 : 175,
+                  child: _buildDesktopWeekSelector(context),
+                ),
+                SizedBox(
+                  width: narrow ? 270 : 320,
+                  child: _buildScheduleUpdateSelector(
+                    updateTerms: updateTerms,
+                    selectedUpdateValue: selectedUpdateValue,
+                  ),
+                ),
+                FilledButton.icon(
+                  onPressed:
+                      _loading ||
+                          dataSyncCooldown.isCooling(SyncResource.schedule)
+                      ? null
+                      : _openManualScheduleSave,
+                  icon: _loading
+                      ? const SizedBox.square(
+                          dimension: 17,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.sync, size: 18),
+                  label: const Text('更新课表'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _lastRawHtml.isEmpty
+                      ? null
+                      : _chooseScheduleExport,
+                  icon: const Icon(Icons.more_horiz, size: 18),
+                  label: const Text('更多'),
+                ),
+              ];
+              final content = narrow
+                  ? Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: fields,
+                    )
+                  : Row(
+                      children: [
+                        for (var i = 0; i < fields.length; i++) ...[
+                          if (i > 0) const SizedBox(width: 10),
+                          fields[i],
+                        ],
+                      ],
+                    );
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  content,
+                  const SizedBox(height: 8),
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 180),
+                    child: _SyncCooldownIndicator(
+                      key: ValueKey(
+                        dataSyncCooldown.remainingText(SyncResource.schedule),
+                      ),
+                      resource: SyncResource.schedule,
+                    ),
+                  ),
+                ],
+              );
+            },
           ),
-        ],
+        ),
       ),
     );
   }
@@ -6357,50 +6813,70 @@ class _SchedulePageState extends State<SchedulePage> {
             ),
         ],
       ),
-      body: Column(
-        children: [
-          if (compact) ...[
-            _buildCompactScheduleStatus(context),
-            _buildCompactScheduleTools(
-              context,
-              updateTerms: updateTerms,
-              selectedUpdateValue: selectedUpdateValue,
-            ),
-          ] else ...[
-            _buildScheduleAccountStatus(context),
-            _buildScheduleTools(
-              context,
-              updateTerms: updateTerms,
-              selectedUpdateValue: selectedUpdateValue,
-              compact: false,
-            ),
-          ],
-          const Divider(),
-          Expanded(
-            child: RepaintBoundary(
-              key: _scheduleRepaintKey,
-              child: ColoredBox(
-                color: Theme.of(context).scaffoldBackgroundColor,
-                child: _error != null
-                    ? _buildErrorView(context)
-                    : _courses.isEmpty
-                    ? Center(
-                        child: Text(
-                          _loading
-                              ? '正在读取本地课表…'
-                              : (_emptyMessage ?? '暂无本地课表数据'),
-                          style: TextStyle(
-                            color: Theme.of(
-                              context,
-                            ).colorScheme.onSurfaceVariant,
-                          ),
-                        ),
-                      )
-                    : _buildScheduleTable(),
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final contentWidth = constraints.maxWidth > 1400
+              ? 1400.0
+              : constraints.maxWidth;
+          final header = compact
+              ? Column(
+                  children: [
+                    _buildCompactScheduleStatus(context),
+                    _buildCompactScheduleTools(
+                      context,
+                      updateTerms: updateTerms,
+                      selectedUpdateValue: selectedUpdateValue,
+                    ),
+                  ],
+                )
+              : Column(
+                  children: [
+                    _buildScheduleAccountStatus(context),
+                    _buildDesktopScheduleTools(
+                      context,
+                      updateTerms: updateTerms,
+                      selectedUpdateValue: selectedUpdateValue,
+                    ),
+                  ],
+                );
+          return Column(
+            children: [
+              Center(
+                child: SizedBox(width: contentWidth, child: header),
               ),
-            ),
-          ),
-        ],
+              const Divider(),
+              Expanded(
+                child: Center(
+                  child: SizedBox(
+                    width: contentWidth,
+                    child: RepaintBoundary(
+                      key: _scheduleRepaintKey,
+                      child: ColoredBox(
+                        color: Theme.of(context).scaffoldBackgroundColor,
+                        child: _error != null
+                            ? _buildErrorView(context)
+                            : _courses.isEmpty
+                            ? Center(
+                                child: Text(
+                                  _loading
+                                      ? '正在读取本地课表…'
+                                      : (_emptyMessage ?? '暂无本地课表数据'),
+                                  style: TextStyle(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                              )
+                            : _buildScheduleTable(),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -6696,9 +7172,17 @@ class _SchedulePageState extends State<SchedulePage> {
         final fSize = isNarrow ? 12.0 : 13.0;
 
         final tableRows = <TableRow>[];
-        for (final time in orderedTimes) {
+        for (var rowIndex = 0; rowIndex < orderedTimes.length; rowIndex++) {
+          final time = orderedTimes[rowIndex];
           tableRows.add(
             TableRow(
+              decoration: BoxDecoration(
+                color: rowIndex.isEven
+                    ? Theme.of(widthCtx).colorScheme.surface
+                    : Theme.of(
+                        widthCtx,
+                      ).colorScheme.surfaceContainerLowest.withAlpha(100),
+              ),
               children: [
                 _buildTimeCell(time),
                 for (final d in dayOrder)
@@ -6717,52 +7201,67 @@ class _SchedulePageState extends State<SchedulePage> {
           child: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Padding(
-              padding: EdgeInsets.all(tPad),
-              child: Table(
-                defaultColumnWidth: FixedColumnWidth(dayWidth),
-                columnWidths: isNarrow
-                    ? const {0: FixedColumnWidth(timeWidth)}
-                    : const {0: FixedColumnWidth(96)},
-                border: TableBorder(
-                  horizontalInside: BorderSide(
-                    color: Theme.of(widthCtx).colorScheme.outlineVariant,
-                    width: 0.5,
+              padding: EdgeInsets.fromLTRB(tPad, 8, tPad, 16),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Theme.of(widthCtx).colorScheme.surface,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: Theme.of(
+                      widthCtx,
+                    ).colorScheme.outlineVariant.withAlpha(180),
                   ),
-                  verticalInside: BorderSide(
-                    color: Theme.of(widthCtx).colorScheme.outlineVariant,
-                    width: 0.5,
-                  ),
-                  top: BorderSide(
-                    color: Theme.of(widthCtx).colorScheme.outline,
-                  ),
-                  bottom: BorderSide(
-                    color: Theme.of(widthCtx).colorScheme.outline,
-                  ),
-                  left: BorderSide(
-                    color: Theme.of(widthCtx).colorScheme.outline,
-                  ),
-                  right: BorderSide(
-                    color: Theme.of(widthCtx).colorScheme.outline,
-                  ),
-                ),
-                children: [
-                  TableRow(
-                    decoration: BoxDecoration(
+                  boxShadow: [
+                    BoxShadow(
                       color: Theme.of(
                         widthCtx,
-                      ).colorScheme.primaryContainer.withAlpha(102),
+                      ).colorScheme.shadow.withAlpha(18),
+                      blurRadius: 16,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: Table(
+                    defaultColumnWidth: FixedColumnWidth(dayWidth),
+                    columnWidths: isNarrow
+                        ? const {0: FixedColumnWidth(timeWidth)}
+                        : const {0: FixedColumnWidth(96)},
+                    border: TableBorder(
+                      horizontalInside: BorderSide(
+                        color: Theme.of(
+                          widthCtx,
+                        ).colorScheme.outlineVariant.withAlpha(120),
+                        width: 0.6,
+                      ),
+                      verticalInside: BorderSide(
+                        color: Theme.of(
+                          widthCtx,
+                        ).colorScheme.outlineVariant.withAlpha(100),
+                        width: 0.6,
+                      ),
                     ),
                     children: [
-                      _buildHeaderCell('节', fontSize: fSize),
-                      for (var i = 0; i < dayOrder.length; i++)
-                        _buildHeaderCell(
-                          isNarrow ? dayOrder[i][1] : dayOrder[i],
-                          fontSize: fSize,
+                      TableRow(
+                        decoration: BoxDecoration(
+                          color: Theme.of(
+                            widthCtx,
+                          ).colorScheme.surfaceContainerHighest.withAlpha(180),
                         ),
+                        children: [
+                          _buildHeaderCell('节', fontSize: fSize),
+                          for (var i = 0; i < dayOrder.length; i++)
+                            _buildHeaderCell(
+                              isNarrow ? dayOrder[i][1] : dayOrder[i],
+                              fontSize: fSize,
+                            ),
+                        ],
+                      ),
+                      ...tableRows,
                     ],
                   ),
-                  ...tableRows,
-                ],
+                ),
               ),
             ),
           ),
@@ -6773,11 +7272,15 @@ class _SchedulePageState extends State<SchedulePage> {
 
   Widget _buildHeaderCell(String text, {double fontSize = 13}) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
+      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
       alignment: Alignment.center,
       child: Text(
         text,
-        style: TextStyle(fontWeight: FontWeight.bold, fontSize: fontSize),
+        style: TextStyle(
+          fontWeight: FontWeight.w700,
+          fontSize: fontSize,
+          letterSpacing: 0.2,
+        ),
       ),
     );
   }
@@ -6789,20 +7292,23 @@ class _SchedulePageState extends State<SchedulePage> {
     ).firstMatch(time);
     final main = match?.group(1) ?? time;
     final sub = match?.group(2) ?? '';
+    final colorScheme = Theme.of(context).colorScheme;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
       alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: Theme.of(
-          context,
-        ).colorScheme.surfaceContainerHighest.withAlpha(128),
+        color: colorScheme.surfaceContainerHighest.withAlpha(150),
       ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           Text(
             main,
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+            style: TextStyle(
+              fontWeight: FontWeight.w700,
+              fontSize: 12,
+              color: colorScheme.onSurface,
+            ),
           ),
           if (sub.isNotEmpty) ...[
             const SizedBox(height: 2),
@@ -6810,7 +7316,7 @@ class _SchedulePageState extends State<SchedulePage> {
               sub,
               style: TextStyle(
                 fontSize: 10,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                color: colorScheme.onSurfaceVariant,
               ),
             ),
           ],
@@ -6826,20 +7332,13 @@ class _SchedulePageState extends State<SchedulePage> {
   ]) {
     if (courses.isEmpty) {
       return Container(
-        height: 64,
+        height: 72,
         alignment: Alignment.center,
-        decoration: highlightWeek != null
-            ? BoxDecoration(
-                border: Border.all(
-                  color: Theme.of(context).colorScheme.outlineVariant,
-                ),
-              )
-            : null,
         child: Text(
           '-',
           style: TextStyle(
             color: Theme.of(context).colorScheme.outline,
-            fontSize: 18,
+            fontSize: 15,
           ),
         ),
       );
@@ -6925,8 +7424,9 @@ class _SchedulePageState extends State<SchedulePage> {
       decoration: inCurrentWeek
           ? BoxDecoration(
               color: colorScheme.primaryContainer.withAlpha(120),
-              border: Border.all(color: colorScheme.primary, width: 1),
-              borderRadius: BorderRadius.circular(2),
+              border: Border(
+                left: BorderSide(color: colorScheme.primary, width: 3),
+              ),
             )
           : null,
       child: Column(
@@ -6949,58 +7449,66 @@ class _SchedulePageState extends State<SchedulePage> {
       return n.isNotEmpty ? n : '(未知课程)';
     }).toList();
     final colorScheme = Theme.of(context).colorScheme;
-    return GestureDetector(
-      onTap: () => _showConflictDialog(courses),
-      child: Container(
-        padding: const EdgeInsets.all(6),
-        decoration: BoxDecoration(
-          color: colorScheme.errorContainer.withAlpha(140),
-          borderRadius: BorderRadius.circular(4),
-          border: Border.all(color: colorScheme.error.withAlpha(140)),
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.start,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  Icons.warning_amber_rounded,
-                  color: colorScheme.error,
-                  size: 14,
-                ),
-                const SizedBox(width: 4),
-                Expanded(
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(9),
+        onTap: () => _showConflictDialog(courses),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(7, 7, 6, 7),
+          decoration: BoxDecoration(
+            color: colorScheme.errorContainer.withAlpha(72),
+            borderRadius: BorderRadius.circular(9),
+            border: Border(
+              left: BorderSide(color: colorScheme.error, width: 3),
+            ),
+          ),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    Icons.warning_amber_rounded,
+                    color: colorScheme.error,
+                    size: 14,
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      '$weekLabel 冲突',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: colorScheme.error,
+                      ),
+                      softWrap: true,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              // 主动列出冲突课程名（按 · 排列），不用点也能看清是哪几门
+              for (final n in names)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
                   child: Text(
-                    '$weekLabel 冲突',
+                    '· $n',
                     style: TextStyle(
                       fontSize: 11,
-                      fontWeight: FontWeight.bold,
-                      color: colorScheme.error,
+                      color: colorScheme.onSurface,
                     ),
-                    overflow: TextOverflow.ellipsis,
+                    softWrap: true,
                   ),
                 ),
-              ],
-            ),
-            const SizedBox(height: 4),
-            // 主动列出冲突课程名（按 · 排列），不用点也能看清是哪几门
-            for (final n in names)
-              Padding(
-                padding: const EdgeInsets.only(top: 2),
-                child: Text(
-                  '· $n',
-                  style: TextStyle(fontSize: 11, color: colorScheme.onSurface),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
+              const SizedBox(height: 4),
+              Text(
+                '点击查看 ${names.length} 门详情',
+                style: TextStyle(fontSize: 9, color: colorScheme.error),
               ),
-            const SizedBox(height: 4),
-            Text(
-              '点击查看 ${names.length} 门详情',
-              style: TextStyle(fontSize: 9, color: colorScheme.error),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -7205,51 +7713,63 @@ class _SchedulePageState extends State<SchedulePage> {
     final name = (c['name'] ?? '').trim();
     final teacher = (c['teacher'] ?? '').trim();
     final room = (c['room'] ?? '').trim();
+    final colorScheme = Theme.of(context).colorScheme;
     final nameSize = isNarrow ? 11.0 : 12.0;
     final subSize = isNarrow ? 9.0 : 10.0;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text(
-          name.isNotEmpty ? name : '(未知课程)',
-          maxLines: isNarrow ? null : 2,
-          overflow: isNarrow ? null : TextOverflow.ellipsis,
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-            fontSize: nameSize,
-            color: name.isNotEmpty
-                ? Theme.of(context).colorScheme.onSurface
-                : Theme.of(context).colorScheme.onSurfaceVariant,
-          ),
+    return Container(
+      margin: const EdgeInsets.only(bottom: 2),
+      padding: const EdgeInsets.fromLTRB(7, 6, 6, 6),
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withAlpha(112),
+        borderRadius: BorderRadius.circular(8),
+        border: Border(
+          left: BorderSide(color: colorScheme.primary.withAlpha(170), width: 2),
         ),
-        if (teacher.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(top: 1),
-            child: Text(
-              '@$teacher',
-              maxLines: isNarrow ? null : 1,
-              overflow: isNarrow ? null : TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: subSize,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            name.isNotEmpty ? name : '(未知课程)',
+            softWrap: true,
+            style: TextStyle(
+              fontWeight: FontWeight.w700,
+              fontSize: nameSize,
+              height: 1.25,
+              color: name.isNotEmpty
+                  ? colorScheme.onSurface
+                  : colorScheme.onSurfaceVariant,
             ),
           ),
-        if (room.isNotEmpty)
-          Padding(
-            padding: const EdgeInsets.only(top: 1),
-            child: Text(
-              '📍$room',
-              maxLines: isNarrow ? null : 1,
-              overflow: isNarrow ? null : TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: subSize,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
+          if (teacher.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                '@$teacher',
+                softWrap: true,
+                style: TextStyle(
+                  fontSize: subSize,
+                  height: 1.2,
+                  color: colorScheme.onSurfaceVariant,
+                ),
               ),
             ),
-          ),
-      ],
+          if (room.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                '📍$room',
+                softWrap: true,
+                style: TextStyle(
+                  fontSize: subSize,
+                  height: 1.2,
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 }
