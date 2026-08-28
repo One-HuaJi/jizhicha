@@ -2,20 +2,21 @@
 
 > 湖南科技学院校园助手 —— 面向 Windows 与 Android 的 Flutter 应用，内置 Rust 校园内网加速器。
 
-当前只支持 Windows 与 Android；iOS 和 macOS 当前及以后均无支持计划，若确实有需求请自己cop
+当前只支持 Windows 与 Android；iOS 和 macOS 当前及以后均无支持计划，若确实有需求请自己维护
+本项目维护至2028年下半年
+学校校园内网免费 100mbps校园宽带付费 请知悉 登教务系统无需多付费 *警惕诈骗*
 
 ## 功能
 
 - **校园加速器**：内嵌 Rust VPN 核心，通过 Dart FFI 直连学校网关，无需安装第三方 VPN 客户端。离开校园内网环境也能访问教务、图书馆、知网等服务
 - **一键教务查询**：通过已验证的加速器隧道请求教务系统，自动更新最新学期成绩并复用历史缓存；发现数据异常时可手动刷新全部成绩
-- **智慧课表**：周视图高亮 + 按周筛选，支持深色模式
+- **智慧课表**：周视图高亮 + 按周筛选，支持深色模式,暂时还没那么智慧
 - **体测计算器**：输入各项实测数据，自动换算等级与总分
-- **隐私安全**：账号密码使用系统安全存储加密（Windows DPAPI / Android Keystore），网关 TLS 使用 SPKI Pinning，账号数据不上传第三方云端
+- **隐私安全**：账号密码使用系统安全存储加密（Windows DPAPI / Android Keystore），网关 TLS 使用 SPKI Pinning，账号数据不上传第三方云端（项目已开源，可自行查看安全度）
 
 ## 后续计划
-
-- 继续优化课表样式和个性化布局
-- 根据校园实际使用反馈完善兼容性
+- 增加教务系统选课（调整接口会导致功能失效且无自检，请勿当做主办法使用，自行准备备选工具）
+- 天下苦综评久矣 增加方便快捷的学期末一键综评（2027年见）
 
 ## 技术栈
 
@@ -45,8 +46,6 @@ rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-and
 flutter build apk --release --split-per-abi
 # 产物：build\app\outputs\flutter-apk\app-<arch>-release.apk
 ```
-
-Gradle 会使用 Flutter 配置的 Android NDK，自动为 ARMv7、ARM64、x86_64 增量重编 Rust 原生库，避免复用旧 `.so`；生成的 `jniLibs` 不进入 Git。正式构建还必须在本机配置不进入 Git 的 `android/key.properties` 与独立 release keystore。
 
 > 最低支持 Android 8.0（API 26）
 
