@@ -1,0 +1,25 @@
+name: guard-internal-files
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for internal/local/build artifacts
+        run: |
+          set -o pipefail
+          forbidden='^(release/|.*/HANDOFF\.md$|.*/PROGRESS\.md$|.*\.(apk|zip|sha1|sha256|log)$|.*/key\.properties$|.*\.(keystore|jks|key|pem)$)'
+          hits="$(git ls-files | grep -E "$forbidden" || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::The following files must not be committed to the public repo:"
+            echo "$hits"
+            echo ""
+            echo "Remove them from the commit (do not use 'git add -f')."
+            exit 1
+          fi
+          echo "OK: no internal/local/build artifacts found."
