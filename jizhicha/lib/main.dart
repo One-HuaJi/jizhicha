@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart'
-    show Clipboard, ClipboardData, MethodChannel;
+    show Clipboard, ClipboardData, MethodChannel, FilteringTextInputFormatter;
 import 'package:dio/dio.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
@@ -10,6 +11,7 @@ import 'package:html/parser.dart' show parse;
 import 'package:image/image.dart' as img;
 import 'package:ffi/ffi.dart' as ffi_utils;
 import 'package:path_provider/path_provider.dart';
+import 'package:gal/gal.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
@@ -24,6 +26,126 @@ import 'credential_store.dart';
 import 'schedule_cache_store.dart';
 import 'schedule_time.dart';
 import 'theme.dart';
+
+// ==================== 更新检测 ====================
+
+/// 当前应用版本（与 pubspec.yaml 保持一致）。
+const String _currentAppVersion = '1.0.8';
+
+/// 比较版本号 a 与 b：a>b 返回正数，a<b 返回负数，相等返回 0。
+int _compareVersions(String a, String b) {
+  final pa = a.split('.').map((e) => int.tryParse(e) ?? 0).toList();
+  final pb = b.split('.').map((e) => int.tryParse(e) ?? 0).toList();
+  final len = pa.length > pb.length ? pa.length : pb.length;
+  for (var i = 0; i < len; i++) {
+    final x = i < pa.length ? pa[i] : 0;
+    final y = i < pb.length ? pb[i] : 0;
+    if (x != y) return x.compareTo(y);
+  }
+  return 0;
+}
+
+/// 拉取 GitHub 最新 release；返回 {version, downloadUrl}，失败返回 null（静默）。
+Future<Map<String, String>?> _fetchLatestRelease() async {
+  try {
+    final dio = Dio(
+      BaseOptions(
+        connectTimeout: const Duration(seconds: 8),
+        receiveTimeout: const Duration(seconds: 8),
+      ),
+    );
+    final resp = await dio.get<dynamic>(
+      'https://api.github.com/repos/One-HuaJi/jizhicha/releases/latest',
+      options: Options(
+        headers: const {
+          'Accept': 'application/vnd.github+json',
+          'User-Agent': 'jizhicha-updater',
+        },
+      ),
+    );
+    final data = resp.data;
+    if (data is! Map) return null;
+    final tag = (data['tag_name'] as String?) ?? '';
+    final version = tag.startsWith('v') ? tag.substring(1) : tag;
+    if (version.isEmpty) return null;
+
+    // 按平台找对应下载资产：Windows 取 zip，Android 取 arm64 APK。
+    String? downloadUrl;
+    final assets = (data['assets'] as List?) ?? const [];
+    for (final a in assets) {
+      if (a is! Map) continue;
+      final name = (a['name'] as String?) ?? '';
+      final url = (a['browser_download_url'] as String?) ?? '';
+      final match = Platform.isWindows
+          ? name.contains('Windows')
+          : name.contains('arm64');
+      if (match && url.isNotEmpty) {
+        downloadUrl = url;
+        break;
+      }
+    }
+    return {
+      'version': version,
+      'downloadUrl': downloadUrl ?? (data['html_url'] as String?) ?? '',
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/// 弹出"检测到新版本"对话框；勾选"永不弹出"则写入设置，点"更新"打开下载链接。
+Future<void> _showUpdateDialog(
+  BuildContext context,
+  String version,
+  String downloadUrl,
+) async {
+  var neverAgain = false;
+  final doUpdate = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setInner) => AlertDialog(
+        title: const Text('检测到新版本'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('发现新版本 v$version，是否更新？'),
+            const SizedBox(height: 4),
+            CheckboxListTile(
+              value: neverAgain,
+              onChanged: (v) => setInner(() => neverAgain = v ?? false),
+              title: const Text('永不弹出'),
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('更新'),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  if (neverAgain) {
+    final settings = await AppSettings.load();
+    settings.updateCheckDisabled = true;
+    await settings.save();
+  }
+  if (doUpdate == true && downloadUrl.isNotEmpty) {
+    final uri = Uri.tryParse(downloadUrl);
+    if (uri != null) {
+      launchUrl(uri, mode: LaunchMode.externalApplication);
+    }
+  }
+}
 
 void main() {
   // 用 runZonedGuarded 包一层：所有未捕获的异步异常都会进 zoneError，
@@ -84,6 +206,16 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       theme: AppTheme.light,
       darkTheme: AppTheme.dark,
       themeMode: themeNotifier.value,
+      locale: const Locale('zh', 'CN'),
+      supportedLocales: const [
+        Locale('zh', 'CN'),
+        Locale('en', 'US'),
+      ],
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
       home: const AppBootstrapPage(),
     );
   }
@@ -107,6 +239,9 @@ class _AppBootstrapPageState extends State<AppBootstrapPage> {
   void initState() {
     super.initState();
     _resolveStartupDestination();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkForUpdates();
+    });
   }
 
   Future<void> _resolveStartupDestination() async {
@@ -132,6 +267,22 @@ class _AppBootstrapPageState extends State<AppBootstrapPage> {
               initialNotice: '您之前未进行过认证，本地暂无存储，请认证后保存课表',
             );
     });
+  }
+
+  Future<void> _checkForUpdates() async {
+    try {
+      final settings = await AppSettings.load();
+      if (settings.updateCheckDisabled) return;
+      final info = await _fetchLatestRelease();
+      if (info == null || !mounted) return;
+      if (_compareVersions(info['version'] ?? '', _currentAppVersion) <= 0) {
+        return;
+      }
+      if (!mounted) return;
+      await _showUpdateDialog(context, info['version'] ?? '', info['downloadUrl'] ?? '');
+    } catch (_) {
+      // 静默失败：网络异常等不打扰用户。
+    }
   }
 
   @override
@@ -1883,7 +2034,7 @@ class AcademicCalendar {
 
   // 这些日期仅作为作者维护记录，暂不强制覆盖设置页的手动周次选择。
   static final Map<String, DateTime> termStartDates = {
-    '2026-2027-1': DateTime(2026, 9, 1),
+    '2026-2027-1': DateTime(2026, 9, 7),
     '2025-2026-2': DateTime(2026, 3, 1),
     '2025-2026-1': DateTime(2025, 9, 1),
     '2024-2025-2': DateTime(2025, 3, 1),
@@ -1894,6 +2045,12 @@ class AcademicCalendar {
 
   static bool isBeforeLatestTermQueryDate(DateTime now) =>
       now.isBefore(latestTermQueryDate);
+
+  /// 计算 [now] 落在第几周；第一周从 [start] 当天（周一）算起。
+  static int weekNumberFor(DateTime start, DateTime now) {
+    final days = now.difference(start).inDays;
+    return (days ~/ 7) + 1;
+  }
 
   /// 返回已经开始的、按学期列表顺序排列的第一个学期。
   ///
@@ -2116,22 +2273,30 @@ Future<bool> _hasLocalGrades(String studentId) async {
 class AppSettings {
   bool highlightCurrentWeek;
   bool filterByWeek;
+  bool showWeekend;
+  int scheduleTextSize;
+  String semesterStartDate;
   int currentWeek;
   ScheduleTimeMode scheduleTimeMode;
   bool gradeCategoryEnabled;
   bool gradeSortByYear;
   bool gradeTermFilterEnabled;
   bool captchaOcrEnabled;
+  bool updateCheckDisabled;
 
   AppSettings({
     this.highlightCurrentWeek = false,
     this.filterByWeek = true,
+    this.showWeekend = true,
+    this.scheduleTextSize = 1,
+    this.semesterStartDate = '2026-09-07',
     this.currentWeek = 1,
     this.scheduleTimeMode = ScheduleTimeMode.automatic,
     this.gradeCategoryEnabled = true,
     this.gradeSortByYear = true,
     this.gradeTermFilterEnabled = true,
     this.captchaOcrEnabled = true,
+    this.updateCheckDisabled = false,
   });
 
   static const _fileName = 'jizhicha_settings.json';
@@ -2174,6 +2339,10 @@ class AppSettings {
             filterByWeek: version >= 2
                 ? (json['filterByWeek'] as bool? ?? true)
                 : true,
+            showWeekend: json['showWeekend'] as bool? ?? true,
+            scheduleTextSize: json['scheduleTextSize'] as int? ?? 1,
+            semesterStartDate:
+                json['semesterStartDate'] as String? ?? '2026-09-07',
             currentWeek: json['currentWeek'] as int? ?? 1,
             scheduleTimeMode: parseScheduleTimeMode(
               json['scheduleTimeMode'] as String?,
@@ -2183,11 +2352,17 @@ class AppSettings {
             gradeTermFilterEnabled:
                 json['gradeTermFilterEnabled'] as bool? ?? true,
             captchaOcrEnabled: json['captchaOcrEnabled'] as bool? ?? true,
+            updateCheckDisabled:
+                json['updateCheckDisabled'] as bool? ?? false,
           );
         }
         return AppSettings(
           highlightCurrentWeek: json['highlightCurrentWeek'] as bool? ?? false,
           filterByWeek: json['filterByWeek'] as bool? ?? true,
+          showWeekend: json['showWeekend'] as bool? ?? true,
+          scheduleTextSize: json['scheduleTextSize'] as int? ?? 1,
+          semesterStartDate:
+              json['semesterStartDate'] as String? ?? '2026-09-07',
           currentWeek: json['currentWeek'] as int? ?? 1,
           scheduleTimeMode: parseScheduleTimeMode(
             json['scheduleTimeMode'] as String?,
@@ -2197,6 +2372,7 @@ class AppSettings {
           gradeTermFilterEnabled:
               json['gradeTermFilterEnabled'] as bool? ?? true,
           captchaOcrEnabled: json['captchaOcrEnabled'] as bool? ?? true,
+          updateCheckDisabled: json['updateCheckDisabled'] as bool? ?? false,
         );
       }
     } catch (_) {}
@@ -2211,12 +2387,16 @@ class AppSettings {
           '_v': _schemaVersion,
           'highlightCurrentWeek': highlightCurrentWeek,
           'filterByWeek': filterByWeek,
+          'showWeekend': showWeekend,
+          'scheduleTextSize': scheduleTextSize,
+          'semesterStartDate': semesterStartDate,
           'currentWeek': currentWeek,
           'scheduleTimeMode': scheduleTimeMode.storageValue,
           'gradeCategoryEnabled': gradeCategoryEnabled,
           'gradeSortByYear': gradeSortByYear,
           'gradeTermFilterEnabled': gradeTermFilterEnabled,
           'captchaOcrEnabled': captchaOcrEnabled,
+          'updateCheckDisabled': updateCheckDisabled,
         }),
       );
     } catch (_) {}
@@ -5569,12 +5749,15 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   AppSettings? _settings;
   bool _accountActionLoading = false;
+  bool _versionChecking = false;
+  String _versionStatus = '';
 
   @override
   void initState() {
     super.initState();
     _appSettingsRevision.addListener(_reloadSettings);
     _load();
+    _refreshVersionStatus();
   }
 
   @override
@@ -5595,6 +5778,67 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _persist({bool notify = false}) async {
     await _settings?.save();
     if (notify) _notifyAppSettingsChanged();
+  }
+
+  Future<void> _refreshVersionStatus() async {
+    try {
+      final info = await _fetchLatestRelease();
+      if (!mounted) return;
+      final version = info?['version'] ?? '';
+      String status;
+      if (info == null || version.isEmpty) {
+        status = '检测失败';
+      } else if (_compareVersions(version, _currentAppVersion) > 0) {
+        status = '有新版本 v$version';
+      } else {
+        status = '已是最新版本';
+      }
+      if (mounted) setState(() => _versionStatus = status);
+    } catch (_) {
+      if (mounted) setState(() => _versionStatus = '检测失败');
+    }
+  }
+
+  Future<void> _checkVersion() async {
+    if (_versionChecking) return;
+    setState(() => _versionChecking = true);
+    try {
+      final info = await _fetchLatestRelease();
+      if (!mounted) return;
+      final version = info?['version'] ?? '';
+      if (info == null || version.isEmpty) {
+        setState(() {
+          _versionChecking = false;
+          _versionStatus = '检测失败';
+        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('检测失败，请检查网络')));
+        return;
+      }
+      if (_compareVersions(version, _currentAppVersion) > 0) {
+        setState(() {
+          _versionChecking = false;
+          _versionStatus = '有新版本 v$version';
+        });
+        await _showUpdateDialog(context, version, info['downloadUrl'] ?? '');
+      } else {
+        setState(() {
+          _versionChecking = false;
+          _versionStatus = '已是最新版本';
+        });
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('已是最新版本')));
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _versionChecking = false;
+          _versionStatus = '检测失败';
+        });
+      }
+    }
   }
 
   /// 退出时彻底关闭加速器；本地加密账号保留，便于下次在登录页快速填充。
@@ -5772,7 +6016,10 @@ class _SettingsPageState extends State<SettingsPage> {
                   onChanged: _settings == null
                       ? null
                       : (v) {
-                          setState(() => _settings!.highlightCurrentWeek = v);
+                          setState(() {
+                            _settings!.highlightCurrentWeek = v;
+                            if (v) _settings!.filterByWeek = false;
+                          });
                           _persist(notify: true);
                         },
                 ),
@@ -5790,9 +6037,37 @@ class _SettingsPageState extends State<SettingsPage> {
                   onChanged: _settings == null
                       ? null
                       : (v) {
-                          setState(() => _settings!.filterByWeek = v);
+                          setState(() {
+                            _settings!.filterByWeek = v;
+                            if (v) _settings!.highlightCurrentWeek = false;
+                          });
                           _persist(notify: true);
                         },
+                ),
+                const Divider(height: 1),
+                ListTile(
+                  leading: Icon(Icons.event, color: colorScheme.primary),
+                  title: const Text('开学日期'),
+                  subtitle: const Text('第一周周一，用于自动计算当前周次'),
+                  trailing: TextButton(
+                    onPressed: _settings == null
+                        ? null
+                        : () async {
+                            final current = DateTime.tryParse(
+                                  s.semesterStartDate,
+                                ) ??
+                                DateTime(2026, 9, 7);
+                            final picked = await _pickSemesterStartDate(current);
+                            if (picked == null) return;
+                            setState(() {
+                              _settings!.semesterStartDate = picked
+                                  .toIso8601String()
+                                  .substring(0, 10);
+                            });
+                            _persist(notify: true);
+                          },
+                    child: Text(s.semesterStartDate),
+                  ),
                 ),
                 const Divider(height: 1),
                 ListTile(
@@ -5817,6 +6092,57 @@ class _SettingsPageState extends State<SettingsPage> {
                         ? null
                         : (v) {
                             setState(() => _settings!.currentWeek = v!);
+                            _persist(notify: true);
+                          },
+                  ),
+                ),
+                const Divider(height: 1),
+                ListTile(
+                  leading: Icon(
+                    Icons.view_week_outlined,
+                    color: colorScheme.primary,
+                  ),
+                  title: const Text('显示筛选'),
+                  subtitle: const Text('课表显示天数'),
+                  trailing: SegmentedButton<bool>(
+                    showSelectedIcon: false,
+                    style: _scheduleSegmentedStyle(colorScheme),
+                    segments: const [
+                      ButtonSegment(value: false, label: Text('五天')),
+                      ButtonSegment(value: true, label: Text('七天')),
+                    ],
+                    selected: {s.showWeekend},
+                    onSelectionChanged: _settings == null
+                        ? null
+                        : (selection) {
+                            setState(
+                              () => _settings!.showWeekend = selection.first,
+                            );
+                            _persist(notify: true);
+                          },
+                  ),
+                ),
+                const Divider(height: 1),
+                ListTile(
+                  leading: Icon(Icons.text_fields, color: colorScheme.primary),
+                  title: const Text('课表文字大小'),
+                  subtitle: const Text('课程字号'),
+                  trailing: SegmentedButton<int>(
+                    showSelectedIcon: false,
+                    style: _scheduleSegmentedStyle(colorScheme),
+                    segments: const [
+                      ButtonSegment(value: 0, label: Text('小')),
+                      ButtonSegment(value: 1, label: Text('中')),
+                      ButtonSegment(value: 2, label: Text('大')),
+                    ],
+                    selected: {s.scheduleTextSize},
+                    onSelectionChanged: _settings == null
+                        ? null
+                        : (selection) {
+                            setState(
+                              () => _settings!.scheduleTextSize =
+                                  selection.first,
+                            );
                             _persist(notify: true);
                           },
                   ),
@@ -6003,6 +6329,42 @@ class _SettingsPageState extends State<SettingsPage> {
               ],
             ),
           ),
+          const SizedBox(height: 18),
+          _buildSectionHeader(Icons.info_outline, '关于'),
+          Card(
+            child: Column(
+              children: [
+                ListTile(
+                  leading: Icon(
+                    Icons.system_update_alt,
+                    color: colorScheme.primary,
+                  ),
+                  title: const Text('版本检测'),
+                  subtitle: Text(
+                    _versionChecking
+                        ? '检测中…'
+                        : (_versionStatus.isEmpty
+                            ? '当前版本 $_currentAppVersion，点击检测更新'
+                            : _versionStatus),
+                  ),
+                  trailing: _versionChecking
+                      ? const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : Icon(
+                          _versionStatus.startsWith('有新版本')
+                              ? Icons.arrow_circle_up
+                              : Icons.check_circle_outline,
+                          color: _versionStatus.startsWith('有新版本')
+                              ? colorScheme.primary
+                              : colorScheme.onSurfaceVariant,
+                        ),
+                  onTap: _checkVersion,
+                ),
+              ],
+            ),
+          ),
           const SizedBox(height: 10),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -6017,6 +6379,89 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ],
       ),
+    );
+  }
+
+  ButtonStyle _scheduleSegmentedStyle(ColorScheme colorScheme) {
+    return ButtonStyle(
+      visualDensity: VisualDensity.compact,
+      backgroundColor: WidgetStateProperty.resolveWith((states) {
+        return states.contains(WidgetState.selected)
+            ? colorScheme.primary
+            : colorScheme.surfaceContainerHighest;
+      }),
+      foregroundColor: WidgetStateProperty.resolveWith((states) {
+        return states.contains(WidgetState.selected)
+            ? colorScheme.onPrimary
+            : colorScheme.onSurfaceVariant;
+      }),
+    );
+  }
+
+  /// 三框独立输入年月日，避免系统日历卡顿与单框格式错误。
+  Future<DateTime?> _pickSemesterStartDate(DateTime current) {
+    final yearCtrl = TextEditingController(text: current.year.toString());
+    final monthCtrl = TextEditingController(text: current.month.toString());
+    final dayCtrl = TextEditingController(text: current.day.toString());
+    return showDialog<DateTime>(
+      context: context,
+      builder: (ctx) {
+        String? error;
+        return StatefulBuilder(
+          builder: (ctx, setInner) {
+            return AlertDialog(
+              title: const Text('设置开学日期'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('第一周的周一', style: TextStyle(fontSize: 13)),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(child: TextField(controller: yearCtrl, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly], decoration: const InputDecoration(labelText: '年', isDense: true, border: OutlineInputBorder()))),
+                      const Padding(padding: EdgeInsets.symmetric(horizontal: 6), child: Text('年')),
+                      Expanded(child: TextField(controller: monthCtrl, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly], decoration: const InputDecoration(labelText: '月', isDense: true, border: OutlineInputBorder()))),
+                      const Padding(padding: EdgeInsets.symmetric(horizontal: 6), child: Text('月')),
+                      Expanded(child: TextField(controller: dayCtrl, keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly], decoration: const InputDecoration(labelText: '日', isDense: true, border: OutlineInputBorder()))),
+                      const Padding(padding: EdgeInsets.symmetric(horizontal: 6), child: Text('日')),
+                    ],
+                  ),
+                  if (error != null) ...[
+                    const SizedBox(height: 8),
+                    Text(error!, style: TextStyle(color: Theme.of(ctx).colorScheme.error, fontSize: 12)),
+                  ],
+                ],
+              ),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+                FilledButton(
+                  onPressed: () {
+                    final y = int.tryParse(yearCtrl.text);
+                    final m = int.tryParse(monthCtrl.text);
+                    final d = int.tryParse(dayCtrl.text);
+                    if (y == null || m == null || d == null) {
+                      setInner(() => error = '请输入年、月、日数字');
+                      return;
+                    }
+                    if (y < 2000 || y > 2100) {
+                      setInner(() => error = '年份需在 2000–2100 之间');
+                      return;
+                    }
+                    final date = DateTime(y, m, d);
+                    if (date.year != y || date.month != m || date.day != d) {
+                      setInner(() => error = '日期不合法，请检查月和日');
+                      return;
+                    }
+                    Navigator.pop(ctx, date);
+                  },
+                  child: const Text('确定'),
+                ),
+              ],
+            );
+          },
+        );
+      },
     );
   }
 
@@ -6058,6 +6503,7 @@ class _SchedulePageState extends State<SchedulePage> {
   static const _latestScheduleTermsValue = '__latest_schedule_term__';
   static const _allScheduleTermsValue = '__all_schedule_terms__';
   final _scheduleRepaintKey = GlobalKey();
+  final _scheduleTableRepaintKey = GlobalKey();
   List<String> _terms = const [];
   String _selectedTerm = AcademicCalendar.latestTerm;
   List<Map<String, String>> _courses = [];
@@ -6247,6 +6693,14 @@ class _SchedulePageState extends State<SchedulePage> {
 
   Future<void> _initialize() async {
     final settings = await AppSettings.load();
+    // 根据开学日期自动计算当前周次；尚未开始或已超过20周则保留用户上次选择。
+    final startDate = DateTime.tryParse(settings.semesterStartDate);
+    if (startDate != null) {
+      final w = AcademicCalendar.weekNumberFor(startDate, DateTime.now());
+      if (w >= 1 && w <= AcademicCalendar.weeksPerAcademicYear) {
+        settings.currentWeek = w;
+      }
+    }
     final profile = await UserDataCacheStore.loadProfile(widget.studentId);
     if (!mounted) return;
 
@@ -6271,6 +6725,7 @@ class _SchedulePageState extends State<SchedulePage> {
         _cachedAt = profile.savedAt;
       });
       await _loadLocalTerm(selectedTerm);
+      _applySundayAdjustment();
       return;
     }
 
@@ -6293,6 +6748,7 @@ class _SchedulePageState extends State<SchedulePage> {
         _loadedFromCache = true;
         _cachedAt = legacy.savedAt;
       });
+      _applySundayAdjustment();
       return;
     }
 
@@ -6305,6 +6761,46 @@ class _SchedulePageState extends State<SchedulePage> {
 
   // 设置未加载完成时的兜底：两功能都关、周次 1。
   AppSettings get _s => _settings ?? AppSettings();
+
+  /// 当前日期是否已经超过本学期的 20 周范围。
+  bool get _semesterEnded {
+    final start = DateTime.tryParse(_s.semesterStartDate);
+    if (start == null) return false;
+    return AcademicCalendar.weekNumberFor(start, DateTime.now()) >
+        AcademicCalendar.weeksPerAcademicYear;
+  }
+
+  /// 学期已结束的提示条。
+  Widget _buildSemesterEndedBanner(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(14, 6, 14, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: colorScheme.tertiaryContainer,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            Icons.event_busy,
+            size: 18,
+            color: colorScheme.onTertiaryContainer,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '预设学期已结束，请手动更改开学日期',
+              style: TextStyle(
+                fontSize: 13,
+                color: colorScheme.onTertiaryContainer,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   /// 应用"按周筛选"：开启时只保留当前周次有课的课程。
   List<Map<String, String>> get _visibleCourses {
@@ -6365,6 +6861,40 @@ class _SchedulePageState extends State<SchedulePage> {
         _loading = false;
       });
     }
+  }
+
+  /// 周日特殊处理：今天若是周日，且本周周日没有课，则自动跳到下一周并提示一次。
+  void _applySundayAdjustment() {
+    if (_settings == null) return;
+    final now = DateTime.now();
+    if (now.weekday != DateTime.sunday) return;
+    final current = _settings!.currentWeek;
+    if (current < 1 || current >= AcademicCalendar.weeksPerAcademicYear) {
+      return;
+    }
+    final sundayHasCourse = _courses.any(
+      (c) =>
+          (c['day'] ?? '') == '周日' &&
+          weekInWeeks(c['weeks'] ?? '', current),
+    );
+    if (sundayHasCourse) return;
+    setState(() => _settings!.currentWeek = current + 1);
+    _saveSettingsAndRefresh();
+    _showSundayPrompt();
+  }
+
+  void _showSundayPrompt() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          "今日为周日，为您显示下周课表，不要看错了- ̗̀ ෆ( ˶'ᵕ'˶)ෆ ̖́-",
+          style: TextStyle(fontSize: 13),
+        ),
+        duration: Duration(seconds: 5),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   String _scheduleAccountSummary() {
@@ -6598,6 +7128,8 @@ class _SchedulePageState extends State<SchedulePage> {
               ),
             ),
           ),
+          const SizedBox(width: 4),
+          _buildCompactWeekChip(context),
           IconButton(
             tooltip: _campusEnvironment.online == true ? '登出校园加速器' : '连接校园加速器',
             onPressed: _campusEnvironment.actionLoading
@@ -6710,6 +7242,101 @@ class _SchedulePageState extends State<SchedulePage> {
     );
   }
 
+  /// 紧凑的周次选择按钮：内嵌进顶部状态栏，不额外占一整行。
+  /// 点击"第N周"弹出完整周次选择，避免顶部越堆越高。
+  Widget _buildCompactWeekChip(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final week = _s.currentWeek;
+    return Tooltip(
+      message: '切换查看周次',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: _openWeekPicker,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(
+            color: colorScheme.primaryContainer,
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.view_week_outlined,
+                size: 15,
+                color: colorScheme.onPrimaryContainer,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                '第$week周',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                  color: colorScheme.onPrimaryContainer,
+                ),
+              ),
+              Icon(
+                Icons.arrow_drop_down,
+                size: 16,
+                color: colorScheme.onPrimaryContainer,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _openWeekPicker() {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetContext) {
+        final colorScheme = Theme.of(sheetContext).colorScheme;
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 14, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '选择查看周次',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: colorScheme.onSurface,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: List.generate(
+                    AcademicCalendar.weeksPerAcademicYear,
+                    (index) {
+                      final week = index + 1;
+                      final selected = week == _s.currentWeek;
+                      return ChoiceChip(
+                        label: Text('第$week周'),
+                        selected: selected,
+                        onSelected: (_) {
+                          Navigator.of(sheetContext).pop();
+                          if (!mounted || _settings == null) return;
+                          setState(() => _settings!.currentWeek = week);
+                          _saveSettingsAndRefresh();
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildScheduleUpdateControls(
     BuildContext context, {
     required List<String> updateTerms,
@@ -6785,7 +7412,7 @@ class _SchedulePageState extends State<SchedulePage> {
       items: [
         const DropdownMenuItem(
           value: _latestScheduleTermsValue,
-          child: Text('最新一期（自动回退）', overflow: TextOverflow.ellipsis),
+          child: Text('最新一期', overflow: TextOverflow.ellipsis),
         ),
         const DropdownMenuItem(
           value: _allScheduleTermsValue,
@@ -7033,7 +7660,7 @@ class _SchedulePageState extends State<SchedulePage> {
     final selectedUpdateValue = _selectedScheduleUpdateTerm == null
         ? _latestScheduleTermsValue
         : _selectedScheduleUpdateTerm!;
-    final compact = MediaQuery.sizeOf(context).width < 600;
+    final compact = MediaQuery.sizeOf(context).shortestSide < 600;
     return Scaffold(
       // 课表页没有 AppBar，必须自己避开 Android 状态栏；否则账号摘要
       // 会从屏幕顶部开始绘制，被时间、电量和网络图标覆盖。
@@ -7042,9 +7669,7 @@ class _SchedulePageState extends State<SchedulePage> {
         bottom: false,
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final contentWidth = constraints.maxWidth > 1400
-                ? 1400.0
-                : constraints.maxWidth;
+            final contentWidth = constraints.maxWidth;
             final header = compact
                 ? Column(
                     children: [
@@ -7071,6 +7696,13 @@ class _SchedulePageState extends State<SchedulePage> {
                 Center(
                   child: SizedBox(width: contentWidth, child: header),
                 ),
+                if (_semesterEnded)
+                  Center(
+                    child: SizedBox(
+                      width: contentWidth,
+                      child: _buildSemesterEndedBanner(context),
+                    ),
+                  ),
                 const Divider(),
                 Expanded(
                   child: Center(
@@ -7389,15 +8021,23 @@ class _SchedulePageState extends State<SchedulePage> {
     return LayoutBuilder(
       builder: (context, constraints) {
         final screenWidth = constraints.maxWidth;
-        final isNarrow = screenWidth < 600;
+        final isNarrow = MediaQuery.sizeOf(context).shortestSide < 600;
 
-        // 手机端列宽：6 列可见 (节次 + 周一~周五)，超出部分滑动
+        // 手机端列宽：五天模式可见 6 列 (节次 + 周一~周五)，超出部分滑动；
+        // 七天模式让周一~周日全部可见（列更窄）。
         const timeWidth = 34.0;
+        final showWeekend = _s.showWeekend;
+        // 桌面端：7 天列自适应撑满可用宽度，避免左侧贴边、右侧留空或横向滚动。
         final dayWidth = isNarrow
-            ? ((screenWidth - timeWidth - 8) / 5).clamp(48.0, 72.0)
-            : 112.0;
+            ? ((screenWidth - timeWidth - 8) / (showWeekend ? 7 : 5)).clamp(
+                showWeekend ? 40.0 : 48.0,
+                72.0,
+              )
+            : ((screenWidth - 114) / 7).clamp(70.0, 500.0);
         final tPad = isNarrow ? 4.0 : 8.0;
         final fSize = isNarrow ? 12.0 : 13.0;
+        final startDate = DateTime.tryParse(_s.semesterStartDate);
+        final weekOffsetDays = (_s.currentWeek - 1) * 7;
 
         final tableRows = <TableRow>[];
         for (var rowIndex = 0; rowIndex < orderedTimes.length; rowIndex++) {
@@ -7430,8 +8070,10 @@ class _SchedulePageState extends State<SchedulePage> {
             scrollDirection: Axis.horizontal,
             child: Padding(
               padding: EdgeInsets.fromLTRB(tPad, 8, tPad, 16),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
+              child: RepaintBoundary(
+                key: _scheduleTableRepaintKey,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
                   color: Theme.of(widthCtx).colorScheme.surface,
                   borderRadius: BorderRadius.circular(16),
                   border: Border.all(
@@ -7483,6 +8125,10 @@ class _SchedulePageState extends State<SchedulePage> {
                             _buildHeaderCell(
                               isNarrow ? dayOrder[i][1] : dayOrder[i],
                               fontSize: fSize,
+                              sub: _dayDateLabel(
+                                startDate,
+                                weekOffsetDays + i,
+                              ),
                             ),
                         ],
                       ),
@@ -7491,6 +8137,7 @@ class _SchedulePageState extends State<SchedulePage> {
                   ),
                 ),
               ),
+              ),
             ),
           ),
         );
@@ -7498,19 +8145,38 @@ class _SchedulePageState extends State<SchedulePage> {
     );
   }
 
-  Widget _buildHeaderCell(String text, {double fontSize = 13}) {
+  Widget _buildHeaderCell(String text, {double fontSize = 13, String? sub}) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
       alignment: Alignment.center,
-      child: Text(
-        text,
-        style: TextStyle(
-          fontWeight: FontWeight.w700,
-          fontSize: fontSize,
-          letterSpacing: 0.2,
-        ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Text(
+            text,
+            style: TextStyle(
+              fontWeight: FontWeight.w700,
+              fontSize: fontSize,
+              letterSpacing: 0.2,
+            ),
+          ),
+          if (sub != null)
+            Text(
+              sub,
+              style: TextStyle(
+                fontSize: fontSize - 2,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+        ],
       ),
     );
+  }
+
+  String? _dayDateLabel(DateTime? startDate, int offsetDays) {
+    if (startDate == null) return null;
+    final d = startDate.add(Duration(days: offsetDays));
+    return d.month.toString() + '/' + d.day.toString();
   }
 
   Widget _buildTimeCell(String time) {
@@ -7632,22 +8298,8 @@ class _SchedulePageState extends State<SchedulePage> {
       if (idxs.length == 1) {
         children.add(_buildCourseEntry(courses[idxs.first], isNarrow));
       } else {
-        // 合并冲突簇的各段区间，求真实的覆盖区间作为标签（支持多段）。
-        // 例如 A=1-4,9-12 与 C=9-10 冲突，标签应显示二者真实重叠的 "9-12周"，
-        // 而非只看首段得出的误导性的 "1-4周"。
-        int? s;
-        int? e;
-        for (final i in idxs) {
-          for (final sp in spans[i]) {
-            final st = sp['start']!;
-            final en = sp['end']!;
-            s = s == null ? st : (st < s ? st : s);
-            e = e == null ? en : (en > e ? en : e);
-          }
-        }
-        final label = (s != null && e != null) ? '$s-$e周' : '课程';
         children.add(
-          _buildConflictCell(idxs.map((i) => courses[i]).toList(), label),
+          _buildConflictCell(idxs.map((i) => courses[i]).toList()),
         );
       }
     }
@@ -7655,7 +8307,7 @@ class _SchedulePageState extends State<SchedulePage> {
     final colorScheme = Theme.of(context).colorScheme;
     return Container(
       padding: const EdgeInsets.all(6),
-      constraints: const BoxConstraints(minHeight: 64),
+      constraints: const BoxConstraints(minHeight: 72),
       decoration: inCurrentWeek
           ? BoxDecoration(
               color: colorScheme.primaryContainer.withAlpha(120),
@@ -7672,13 +8324,8 @@ class _SchedulePageState extends State<SchedulePage> {
     );
   }
 
-  /// 同一节次、周次重叠的多门课——标记为冲突，点击查看详情。
-  /// [weekLabel] 如 "1-10周"，让用户一眼看到冲突发生在哪些周。
-  /// 主动展示冲突的课程名（不只显示数量），避免必须点击才能看到具体是哪几门冲突。
-  Widget _buildConflictCell(
-    List<Map<String, String>> courses,
-    String weekLabel,
-  ) {
+  /// 同一节次、周次重叠的多门课——冲突块，点击可查看详情。
+  Widget _buildConflictCell(List<Map<String, String>> courses) {
     final names = courses.map((c) {
       final n = (c['name'] ?? '').trim();
       return n.isNotEmpty ? n : '(未知课程)';
@@ -7702,29 +8349,6 @@ class _SchedulePageState extends State<SchedulePage> {
             mainAxisAlignment: MainAxisAlignment.start,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                children: [
-                  Icon(
-                    Icons.warning_amber_rounded,
-                    color: colorScheme.error,
-                    size: 14,
-                  ),
-                  const SizedBox(width: 4),
-                  Expanded(
-                    child: Text(
-                      '$weekLabel 冲突',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w700,
-                        color: colorScheme.error,
-                      ),
-                      softWrap: true,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 4),
-              // 主动列出冲突课程名（按 · 排列），不用点也能看清是哪几门
               for (final n in names)
                 Padding(
                   padding: const EdgeInsets.only(top: 2),
@@ -7734,14 +8358,10 @@ class _SchedulePageState extends State<SchedulePage> {
                       fontSize: 11,
                       color: colorScheme.onSurface,
                     ),
-                    softWrap: true,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                   ),
                 ),
-              const SizedBox(height: 4),
-              Text(
-                '点击查看 ${names.length} 门详情',
-                style: TextStyle(fontSize: 9, color: colorScheme.error),
-              ),
             ],
           ),
         ),
@@ -7788,60 +8408,90 @@ class _SchedulePageState extends State<SchedulePage> {
   }
 
   Future<Directory> _scheduleExportDirectory() async {
-    if (Platform.isWindows) return Directory.current;
+    if (Platform.isWindows) {
+      final current = Directory.current.path;
+      final sep = Platform.pathSeparator;
+      final dir = Directory('$current$sep' + 'screen');
+      if (!await dir.exists()) await dir.create(recursive: true);
+      return dir;
+    }
     return getApplicationDocumentsDirectory();
   }
 
-  /// 导出当前屏幕可见的课表区域。手机端的 RepaintBoundary 覆盖实际窗口
-  /// 分辨率，并使用设备像素比生成清晰图片；桌面端则按窗口大小导出。
+  String _scheduleFileStamp() {
+    final now = DateTime.now();
+    String two(int v) => v.toString().padLeft(2, '0');
+    final y = now.year;
+    final mo = two(now.month);
+    final d = two(now.day);
+    final h = two(now.hour);
+    final mi = two(now.minute);
+    final s = two(now.second);
+    return '$y$mo$d' + '_' + '$h$mi$s';
+  }
+
+  /// 导出课表：Windows 存到 exe 同级 screen/ 目录；Android 存到系统相册；
+  /// 文件名按截图时间精确到秒。
   Future<void> _exportSchedule(_ScheduleExportFormat format) async {
     if (_lastRawHtml.isEmpty) return;
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final dir = await _scheduleExportDirectory();
-      final stamp = DateTime.now()
-          .toIso8601String()
-          .replaceAll(':', '-')
-          .split('.')
-          .first;
+      final stamp = _scheduleFileStamp();
+      final term = _selectedTerm;
+      final baseName = 'jizhicha_schedule_' + term + '_' + stamp;
       final extension = switch (format) {
         _ScheduleExportFormat.jpg => 'jpg',
         _ScheduleExportFormat.png => 'png',
         _ScheduleExportFormat.html => 'html',
       };
-      final file = File(
-        '${dir.path}${Platform.pathSeparator}jizhicha_schedule_${_selectedTerm}_$stamp.$extension',
-      );
+      final fileName = baseName + '.' + extension;
 
       if (format == _ScheduleExportFormat.html) {
+        final dir = await _scheduleExportDirectory();
+        final file = File(dir.path + Platform.pathSeparator + fileName);
         await file.writeAsString(_lastRawHtml, flush: true);
-      } else {
-        if (_courses.isEmpty) throw '当前学期没有可导出的课程';
-        await WidgetsBinding.instance.endOfFrame;
-        if (!mounted) return;
-        final renderObject = _scheduleRepaintKey.currentContext
-            ?.findRenderObject();
-        if (renderObject is! RenderRepaintBoundary) {
-          throw '课表尚未完成渲染，请稍后再试';
-        }
-        final media = MediaQuery.of(context);
-        final ratio = media.devicePixelRatio.clamp(1.0, 3.0).toDouble();
-        final image = await renderObject.toImage(pixelRatio: ratio);
-        try {
-          final byteData = await image.toByteData(
-            format: ui.ImageByteFormat.png,
-          );
-          if (byteData == null) throw '无法生成课表图片';
-          final pngBytes = byteData.buffer.asUint8List();
-          final bytes = format == _ScheduleExportFormat.png
-              ? pngBytes
-              : img.encodeJpg(img.decodePng(pngBytes)!, quality: 92);
-          await file.writeAsBytes(bytes, flush: true);
-        } finally {
-          image.dispose();
-        }
+        messenger.showSnackBar(SnackBar(content: Text('已导出：' + file.path)));
+        return;
       }
-      messenger.showSnackBar(SnackBar(content: Text('已导出：${file.path}')));
+
+      if (_courses.isEmpty) throw '当前学期没有可导出的课程';
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
+      final renderObject = _scheduleTableRepaintKey.currentContext
+          ?.findRenderObject();
+      if (renderObject is! RenderRepaintBoundary) {
+        throw '课表尚未完成渲染，请稍后再试';
+      }
+      final media = MediaQuery.of(context);
+      final ratio = media.devicePixelRatio.clamp(1.0, 3.0).toDouble();
+      final image = await renderObject.toImage(pixelRatio: ratio);
+      try {
+        final byteData = await image.toByteData(
+          format: ui.ImageByteFormat.png,
+        );
+        if (byteData == null) throw '无法生成课表图片';
+        final pngBytes = byteData.buffer.asUint8List();
+        final bytes = format == _ScheduleExportFormat.png
+            ? pngBytes
+            : img.encodeJpg(img.decodePng(pngBytes)!, quality: 92);
+
+        if (Platform.isAndroid) {
+          final tmpDir = await getTemporaryDirectory();
+          final tmp = File(tmpDir.path + Platform.pathSeparator + fileName);
+          await tmp.writeAsBytes(bytes, flush: true);
+          await Gal.putImage(tmp.path, album: '稽之查');
+          messenger.showSnackBar(
+            const SnackBar(content: Text('已保存到手机相册')),
+          );
+        } else {
+          final dir = await _scheduleExportDirectory();
+          final file = File(dir.path + Platform.pathSeparator + fileName);
+          await file.writeAsBytes(bytes, flush: true);
+          messenger.showSnackBar(SnackBar(content: Text('已导出：' + file.path)));
+        }
+      } finally {
+        image.dispose();
+      }
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('导出失败：$e')));
     }
@@ -7949,8 +8599,9 @@ class _SchedulePageState extends State<SchedulePage> {
     final teacher = (c['teacher'] ?? '').trim();
     final room = (c['room'] ?? '').trim();
     final colorScheme = Theme.of(context).colorScheme;
-    final nameSize = isNarrow ? 11.0 : 12.0;
-    final subSize = isNarrow ? 9.0 : 10.0;
+    final textDelta = (_s.scheduleTextSize - 1).toDouble();
+    final nameSize = (isNarrow ? 10.0 : 11.0) + textDelta;
+    final subSize = (isNarrow ? 8.0 : 9.0) + textDelta;
     return Container(
       margin: const EdgeInsets.only(bottom: 2),
       padding: const EdgeInsets.fromLTRB(7, 6, 6, 6),
@@ -7994,7 +8645,7 @@ class _SchedulePageState extends State<SchedulePage> {
             Padding(
               padding: const EdgeInsets.only(top: 2),
               child: Text(
-                '📍$room',
+                '$room',
                 softWrap: true,
                 style: TextStyle(
                   fontSize: subSize,
