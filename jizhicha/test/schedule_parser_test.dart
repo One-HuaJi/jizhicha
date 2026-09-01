@@ -2,6 +2,9 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jizhicha/credential_store.dart';
+import 'package:jizhicha/fitness.dart';
+import 'package:jizhicha/grades_page.dart';
+import 'package:jizhicha/jwxt_client.dart';
 import 'package:jizhicha/main.dart';
 import 'package:jizhicha/schedule_cache_store.dart';
 
