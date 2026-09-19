@@ -11,7 +11,9 @@ import 'package:path_provider/path_provider.dart';
 import 'academic_calendar.dart';
 import 'app_mode.dart';
 import 'app_settings.dart';
+import 'auth_pages.dart';
 import 'campus_environment.dart';
+import 'campus_sync_helpers.dart';
 import 'common.dart';
 import 'jwxt_client.dart';
 import 'offline_sync.dart';
@@ -19,6 +21,7 @@ import 'schedule_cache_store.dart';
 import 'schedule_time.dart';
 import 'sync_cooldown.dart';
 import 'ui_constants.dart';
+import 'widget_schedule_store.dart';
 
 // ==================== 课表页（带学期选择） ====================
 enum _ScheduleExportFormat { jpg, png, html }
@@ -32,7 +35,12 @@ class SchedulePage extends StatefulWidget {
   State<SchedulePage> createState() => _SchedulePageState();
 }
 
-class _SchedulePageState extends State<SchedulePage> {
+class _SchedulePageState extends State<SchedulePage>
+    with CampusSyncHelpers<SchedulePage> {
+  /// [CampusSyncHelpers] 需要知道当前页面对应的学号。
+  @override
+  String get campusStudentId => widget.studentId;
+
   static const _latestScheduleTermsValue = '__latest_schedule_term__';
   static const _allScheduleTermsValue = '__all_schedule_terms__';
   final _scheduleRepaintKey = GlobalKey();
@@ -102,7 +110,7 @@ class _SchedulePageState extends State<SchedulePage> {
   Future<void> _openVpnSetup() async {
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => buildVpnSetupPage!(mode: AppMode.education),
+        builder: (_) => VpnSetupPage(mode: AppMode.education),
       ),
     );
     if (mounted) await _detectCampusEnvironment();
@@ -121,27 +129,17 @@ class _SchedulePageState extends State<SchedulePage> {
     return terms;
   }
 
-  Future<bool> _canReuseEducationSession() async {
-    if (campusEnvironment.checking) await _detectCampusEnvironment();
-    if (campusEnvironment.online != true) {
-      await _detectCampusEnvironment();
-    }
-    final client = JwxtClient();
-    return campusEnvironment.online == true &&
-        client.isLoggedIn &&
-        client.authenticatedStudentId == widget.studentId;
-  }
 
   Future<void> _openManualScheduleSave() async {
     final remaining = dataSyncCooldown.remaining(SyncResource.schedule);
     if (remaining > Duration.zero) {
-      _showSyncCooldownMessage(SyncResource.schedule);
+      showSyncCooldownMessage(SyncResource.schedule);
       return;
     }
     final selected = _selectedScheduleUpdateTerm;
     final fetchAll = selected == _allScheduleTermsValue;
     final term = fetchAll ? null : selected;
-    if (await _canReuseEducationSession()) {
+    if (await canReuseEducationSession()) {
       setState(() {
         _loading = true;
         _error = null;
@@ -183,7 +181,7 @@ class _SchedulePageState extends State<SchedulePage> {
     if (!mounted) return;
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => buildVpnSetupPage!(
+        builder: (_) => VpnSetupPage(
           mode: AppMode.education,
           forceScheduleSync: true,
           fetchAllSchedules: fetchAll,
@@ -203,14 +201,6 @@ class _SchedulePageState extends State<SchedulePage> {
     }
   }
 
-  void _showSyncCooldownMessage(SyncResource resource) {
-    final remaining = dataSyncCooldown.remainingText(resource);
-    if (remaining.isEmpty || !mounted) return;
-    final label = resource == SyncResource.schedule ? '课表' : '成绩';
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text('$label更新冷却中，还需 $remaining 后重试')));
-  }
 
   Future<void> _handleCampusAcceleratorAction() =>
       handleCampusAcceleratorAction(context, openVpnSetup: _openVpnSetup);
@@ -250,6 +240,8 @@ class _SchedulePageState extends State<SchedulePage> {
       });
       await _loadLocalTerm(selectedTerm);
       _applySundayAdjustment();
+      // 顺手刷新桌面小组件要读的 JSON（失败静默）。
+      WidgetScheduleStore.writeCurrentSchedule(widget.studentId);
       return;
     }
 
@@ -340,11 +332,6 @@ class _SchedulePageState extends State<SchedulePage> {
         : '暂无课程安排';
   }
 
-  String _formatCachedAt(DateTime value) {
-    String two(int number) => number.toString().padLeft(2, '0');
-    return '${value.year}-${two(value.month)}-${two(value.day)} '
-        '${two(value.hour)}:${two(value.minute)}';
-  }
 
   Future<void> _loadLocalTerm(String term) async {
     setState(() {
@@ -424,7 +411,7 @@ class _SchedulePageState extends State<SchedulePage> {
   String _scheduleAccountSummary() {
     if (_loadedFromCache) {
       return '账号 ${widget.studentId} · 本地课表'
-          '${_cachedAt == null ? '' : ' · ${_formatCachedAt(_cachedAt!)}'}';
+          '${_cachedAt == null ? '' : ' · ${formatCachedAt(_cachedAt!)}'}';
     }
     return '账号 ${widget.studentId} 暂无本地课表';
   }
@@ -1290,7 +1277,13 @@ class _SchedulePageState extends State<SchedulePage> {
                           ),
                         ),
                       )
-                    : _buildScheduleTable(),
+                    : MediaQuery.withClampedTextScaling(
+                        // 课表是密集网格：系统"最大字体"会把课表内 10px 的基础
+                        // 字号放大到挤成竖排单字。这里只限制课表区域的放大上限，
+                        // 其它页面仍完全跟随系统字号。
+                        maxScaleFactor: 1.3,
+                        child: _buildScheduleTable(),
+                      ),
               ),
             );
             if (pure) {
@@ -1729,6 +1722,13 @@ class _SchedulePageState extends State<SchedulePage> {
                   child: Table(
                     defaultColumnWidth: FixedColumnWidth(dayWidth),
                     columnWidths: {0: FixedColumnWidth(timeCol)},
+                    // 同一行（同一个大节）的所有单元格统一拉伸到"该行最高内容"
+                    // 的高度，这样同一大节内的课程块上下边缘对齐，不再是高矮
+                    // 参差的块。
+                    // 用 intrinsicHeight 而不是 fill：fill 不参与行高计算
+                    // （rendering/table.dart 里直接 break），整行会塌成 0 高。
+                    defaultVerticalAlignment:
+                        TableCellVerticalAlignment.intrinsicHeight,
                     border: TableBorder(
                       horizontalInside: BorderSide(
                         color: Theme.of(
@@ -1969,11 +1969,19 @@ class _SchedulePageState extends State<SchedulePage> {
               ),
             )
           : null,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: children,
-      ),
+      // 只有一个课程块时，直接把它作为单元格的子节点返回：在 Table 的
+      // intrinsicHeight 下单元格拿到的是"紧高度"，块自身的圆角背景与左侧色条
+      // 因此能撑满整格，与同一大节的其它块等高。
+      // 若仍套一层 Column，子节点只按内容自然高度布局，装饰又会被缩回去。
+      // 注意：这里不能用 Expanded/Flexible 撑开——intrinsicHeight 的第一遍
+      // 布局高度无界，带 flex 的子节点会直接抛错。
+      child: children.length == 1
+          ? children.single
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: children,
+            ),
     );
   }
 

@@ -57,13 +57,32 @@ class ThemeService {
     }
   }
 
-  static Future<void> save(ThemeMode mode) async {
+  /// 读取当前主题偏好，避免写回时丢字段。
+  static Future<Map<String, dynamic>> _readAll() async {
     try {
       final file = await _settingsFile();
-      await file.writeAsString(json.encode({'themeMode': mode.name}));
+      if (!file.existsSync()) return <String, dynamic>{};
+      final raw = await file.readAsString();
+      if (raw.trim().isEmpty) return <String, dynamic>{};
+      return json.decode(raw) as Map<String, dynamic>;
     } catch (_) {
-      // 主题偏好写入失败不应阻塞主流程。
+      return <String, dynamic>{};
     }
+  }
+
+  /// 合并写入：只覆盖给定键，保留其余设置。
+  static Future<void> _writeMerged(Map<String, dynamic> patch) async {
+    try {
+      final file = await _settingsFile();
+      final merged = await _readAll()..addAll(patch);
+      await file.writeAsString(json.encode(merged));
+    } catch (_) {
+      // 偏好写入失败不应阻塞主流程。
+    }
+  }
+
+  static Future<void> save(ThemeMode mode) async {
+    await _writeMerged({'themeMode': mode.name});
   }
 
   static ThemeMode _parseMode(String? value) {
@@ -256,6 +275,15 @@ abstract class AppTheme {
       ),
       dialogTheme: DialogThemeData(
         backgroundColor: scheme.surface,
+        titleTextStyle: TextStyle(
+          color: scheme.onSurface,
+          fontSize: 18,
+          fontWeight: FontWeight.w600,
+        ),
+        contentTextStyle: TextStyle(
+          color: scheme.onSurfaceVariant,
+          fontSize: 14,
+        ),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
       ),
       popupMenuTheme: PopupMenuThemeData(
@@ -298,7 +326,7 @@ abstract class AppTheme {
       onError: Colors.white,
       errorContainer: Color(0xFFFFE4DC),
       onErrorContainer: Color(0xFF7A2E1D),
-      inverseSurface: AppColors.warmBrown,
+      inverseSurface: AppColors.espresso,
       onInverseSurface: AppColors.cream,
       shadow: Color(0x3F5D4E37),
     );
@@ -351,6 +379,21 @@ abstract class AppTheme {
 
   static TextTheme _textTheme(ColorScheme scheme) {
     return TextTheme(
+      headlineSmall: TextStyle(
+        fontSize: 24,
+        fontWeight: FontWeight.w600,
+        color: scheme.onSurface,
+      ),
+      headlineMedium: TextStyle(
+        fontSize: 28,
+        fontWeight: FontWeight.w600,
+        color: scheme.onSurface,
+      ),
+      headlineLarge: TextStyle(
+        fontSize: 32,
+        fontWeight: FontWeight.w700,
+        color: scheme.onSurface,
+      ),
       titleLarge: TextStyle(
         fontSize: 22,
         fontWeight: FontWeight.w700,
@@ -373,6 +416,16 @@ abstract class AppTheme {
         fontSize: 14,
         fontWeight: FontWeight.w600,
         color: scheme.primary,
+      ),
+      labelMedium: TextStyle(
+        fontSize: 12,
+        fontWeight: FontWeight.w500,
+        color: scheme.onSurface,
+      ),
+      labelSmall: TextStyle(
+        fontSize: 11,
+        fontWeight: FontWeight.w500,
+        color: scheme.onSurface,
       ),
     );
   }

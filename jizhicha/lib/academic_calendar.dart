@@ -1,4 +1,4 @@
-﻿// ==================== 学年日期（作者手动维护） ====================
+// ==================== 学年日期（作者手动维护） ====================
 /// 教务系统的学年选项和开课日期由作者手动维护，不从校园网额外探测。
 ///
 /// 每个学期按 20 周显示周次；如果学校调整开课日期，只需要修改这里，
@@ -37,8 +37,10 @@ class AcademicCalendar {
       now.isBefore(latestTermQueryDate);
 
   /// 计算 [now] 落在第几周；第一周从 [start] 当天（周一）算起。
+  /// [now] 早于开学日期时返回 0，表示「还没开学」。
   static int weekNumberFor(DateTime start, DateTime now) {
     final days = now.difference(start).inDays;
+    if (days < 0) return 0;
     return (days ~/ 7) + 1;
   }
 

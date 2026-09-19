@@ -1449,6 +1449,7 @@ dependencies = [
  "tokio",
  "tun2",
  "x509-cert",
+ "zeroize",
 ]
 
 [[package]]

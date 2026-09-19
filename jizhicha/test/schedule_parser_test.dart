@@ -5,7 +5,6 @@ import 'package:jizhicha/credential_store.dart';
 import 'package:jizhicha/fitness.dart';
 import 'package:jizhicha/grades_page.dart';
 import 'package:jizhicha/jwxt_client.dart';
-import 'package:jizhicha/main.dart';
 import 'package:jizhicha/schedule_cache_store.dart';
 
 // 验证课表解析，重点覆盖“课程名被 <span> 包裹”这一导致旧版返回空结果的 bug。

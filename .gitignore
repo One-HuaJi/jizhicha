@@ -37,5 +37,13 @@ jizhicha-output/
 **/PROGRESS.md
 /release/
 
-# Local Flutter pub cache override
-pubspec.lock
+# 内部工作文档（AI 交接、设计评审、排查记录）——只留本地，不上公开仓库
+# 对外文档放 docs/（会被提交）；内部文档一律放 docs/internal/
+**/docs/internal/
+
+# 测试与排查产生的临时产物。约定：临时文件一律加前导下划线，
+# 截图/UI dump 不进入源码仓库（体积大且常含真实学号、课表等个人数据）。
+_*
+**/_*
+*.tmpdir/
+.pin-widget-receiver*

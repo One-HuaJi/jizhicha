@@ -45,3 +45,9 @@ app.*.map.json
 
 # Gradle 会从 Rust 源码按 ABI 自动生成；不要提交带本机路径的原生构建产物。
 /android/app/src/main/jniLibs/**/libhuse_vpn_mobile_ffi.so
+
+# Jiui UI Kit 的生成产物属于 **另一个仓库**（uisettings），不属于本项目。
+# 2026-09-19：并发工作时它曾被误提交进 v1.1.0，导致 59KB 死文件 + 40 条 analyze 告警。
+# 这里显式排除，防止再次混入。
+/jiui_kits.g.dart
+

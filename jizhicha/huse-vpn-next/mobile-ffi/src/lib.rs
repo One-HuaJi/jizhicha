@@ -14,12 +14,37 @@ use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::RawFd;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 const SERVER: &str = "222.243.204.22:6443";
+
+/// 原生内部异常统一映射成这个返回码；Kotlin 侧只判「非 0 即失败」。
+const FFI_PANIC_CODE: jint = -99;
+
+/// 状态序列化失败或 panic 时的兜底 JSON。
+const FALLBACK_STATUS_JSON: &str = "{\"connected\":false,\"stage\":\"ffi_error\"}";
+
+/// 在 JNI 边界捕获 panic。
+///
+/// 跨 JNI 展开比跨 C FFI 更致命：JVM 会直接 abort，整个 Android 应用进程立即
+/// 死亡且无法上报。内部约 19 处 `.lock()`、`Runtime::new().expect()` 与
+/// `SERVER.parse().expect()` 都是潜在 panic 源，因此每个导出都必须兜住并返回
+/// 错误码，而不是让 panic 穿过 JNI。
+///
+/// **注意**：依赖 `panic = "unwind"`。若日后给 `[profile.release]` 加上
+/// `panic = "abort"`，catch_unwind 会完全失效，两个方向只能选一个（见交接文档 §9.5）。
+///
+/// `fallback` 是闭包而非值，避免在正常路径上白白构造兜底对象。
+fn ffi_guard<T>(fallback: impl FnOnce() -> T, body: impl FnOnce() -> T) -> T {
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => fallback(),
+    }
+}
 const REQUIRED_TARGETS: [Ipv4Addr; 4] = [
     Ipv4Addr::new(172, 19, 0, 192),
     Ipv4Addr::new(172, 19, 0, 200),
@@ -100,7 +125,11 @@ impl Default for MobileStatus {
 }
 
 fn cancel_task(slot: &Mutex<Option<JoinHandle<()>>>) {
-    if let Some(task) = slot.lock().unwrap().take() {
+    if let Some(task) = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
         task.abort();
     }
 }
@@ -109,18 +138,28 @@ fn stop_all(host: &MobileHost) {
     cancel_task(&host.state.operation);
     cancel_task(&host.state.tunnel);
     cancel_task(&host.state.heartbeat);
-    host.state.session.lock().unwrap().take();
+    host.state
+        .session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
 }
 
 fn set_stage(state: &MobileState, stage: &str, message: &str) {
-    let mut status = state.status.lock().unwrap();
+    let mut status = state
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     status.stage = stage.to_string();
     status.message = message.to_string();
     status.error = None;
 }
 
 fn fail(state: &MobileState, username: String, stage: &str, error: impl Into<String>) {
-    let mut status = state.status.lock().unwrap();
+    let mut status = state
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     status.connected = false;
     status.stage = stage.to_string();
     status.message = "连接未完成".into();
@@ -133,7 +172,11 @@ fn spawn_prepare(host: &'static MobileHost, username: String, password: String, 
     let task = host.runtime.handle().spawn(async move {
         prepare_inner(username, password, source, state).await;
     });
-    *host.state.operation.lock().unwrap() = Some(task);
+    *host
+        .state
+        .operation
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task);
 }
 
 async fn prepare_inner(
@@ -169,7 +212,11 @@ async fn prepare_inner(
             return;
         }
     };
-    state.status.lock().unwrap().sac = Some(diagnostics);
+    state
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sac = Some(diagnostics);
 
     let ticket = sac_login.ticket;
     set_stage(
@@ -187,7 +234,10 @@ async fn prepare_inner(
         }
     };
     {
-        let mut status = state.status.lock().unwrap();
+        let mut status = state
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(sac) = status.sac.as_mut() {
             sac.get_userdata_request_len = Some(request_len);
             sac.get_userdata_response_len = Some(response_len);
@@ -239,13 +289,19 @@ async fn prepare_inner(
 
     let routes = route_prefixes(&reply);
     let virtual_ip = reply.virtual_ip.clone();
-    *state.session.lock().unwrap() = Some(PendingSession {
+    *state
+        .session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingSession {
         tls: Some(tls),
         reply,
         ticket,
         username: username.clone(),
     });
-    let mut status = state.status.lock().unwrap();
+    let mut status = state
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     status.connected = false;
     status.stage = "awaiting_tun".into();
     status.message = "学校加速器认证完成，正在请求 Android 系统网络授权".into();
@@ -260,7 +316,13 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
     if tun_fd < 0 {
         return -1;
     }
-    let Some(mut pending) = host.state.session.lock().unwrap().take() else {
+    let Some(mut pending) = host
+        .state
+        .session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
         return -2;
     };
     let Some(tls) = pending.tls.take() else {
@@ -275,7 +337,10 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
 
     let tunnel_task = host.runtime.handle().spawn(async move {
         let result = run_android_tunnel(tls, tun_fd).await;
-        let mut status = state.status.lock().unwrap();
+        let mut status = state
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         status.connected = false;
         status.stage = "tunnel_stopped".into();
         status.error = Some(match result {
@@ -283,27 +348,87 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
             Err(error) => error.to_string(),
         });
     });
-    *host.state.tunnel.lock().unwrap() = Some(tunnel_task);
+    *host
+        .state
+        .tunnel
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tunnel_task);
 
     let heartbeat_state = host.state.clone();
     let heartbeat = host.runtime.handle().spawn(async move {
         let client = SacClient::new(SERVER.parse().expect("valid Gateway address"));
+        // 学校网关的会话有 **15 分钟**时限（用户实测），心跳就是用来续期的。
+        //
+        // ⚠️ 旧实现：心跳失败一次就 `break` 永久退出循环，且只把状态写成
+        // `heartbeat_error` 而不通知任何人 —— 结果网关到期踢人之后，客户端
+        // 再也不会心跳，只能等 Dart 侧 60 秒健康检查慢慢发现，用户感知就是
+        // "用着用着就掉了，而且要等很久才恢复"。
+        //
+        // 现在：失败不再退出循环，而是记录 `heartbeat_error` 让 Dart 侧能
+        // **立刻**看到并触发重认证；同时继续按退避重试，万一只是瞬时抖动，
+        // 续期成功就把状态恢复成正常，不需要任何重连。
+        let mut consecutive_failures: u32 = 0;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            if let Err(error) = client.heartbeat(&ticket).await {
-                let mut status = heartbeat_state.status.lock().unwrap();
-                if status.connected {
-                    status.stage = "heartbeat_error".into();
-                    status.error = Some(error.to_string());
+            // 正常 60 秒一次；连续失败时退避到最多 30 秒，尽快恢复续期。
+            let interval = if consecutive_failures == 0 {
+                std::time::Duration::from_secs(60)
+            } else {
+                std::time::Duration::from_secs(
+                    (10 * consecutive_failures.min(3) as u64).max(5),
+                )
+            };
+            tokio::time::sleep(interval).await;
+
+            match client.heartbeat(&ticket).await {
+                Ok(()) => {
+                    if consecutive_failures > 0 {
+                        // 续期恢复：把状态改回正常，消除误导性的错误提示。
+                        let mut status = heartbeat_state
+                            .status
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        status.stage = "connected".into();
+                        status.error = None;
+                        eprintln!(
+                            "HUSE VPN heartbeat recovered after {consecutive_failures} failures"
+                        );
+                    }
+                    consecutive_failures = 0;
                 }
-                break;
+                Err(error) => {
+                    consecutive_failures += 1;
+                    let mut status = heartbeat_state
+                        .status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // 只有仍标记为连接中时才写错误，避免覆盖 tunnel_stopped
+                    // 等更准确的原因。
+                    if status.connected || status.stage == "connected" {
+                        status.stage = "heartbeat_error".into();
+                        status.error = Some(error.to_string());
+                    }
+                }
             }
         }
     });
-    *host.state.heartbeat.lock().unwrap() = Some(heartbeat);
+    *host
+        .state
+        .heartbeat
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(heartbeat);
 
-    let sac = host.state.status.lock().unwrap().sac.clone();
-    *host.state.status.lock().unwrap() = MobileStatus {
+    let sac = host
+        .state
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sac
+        .clone();
+    *host
+        .state
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = MobileStatus {
         connected: true,
         stage: "connected".into(),
         message: "校园内网隧道已建立".into(),
@@ -398,24 +523,33 @@ pub extern "system" fn Java_com_one_huaji_CampusVpnService_nativePrepare(
     password: JString<'_>,
     auth_source: JString<'_>,
 ) -> jint {
-    let Some(username) = read_jstring(&mut env, username) else {
-        return -1;
-    };
-    let Some(password) = read_jstring(&mut env, password) else {
-        return -2;
-    };
-    let source = read_jstring(&mut env, auth_source).unwrap_or_else(|| "SAM-all".into());
-    let host = instance();
-    stop_all(host);
-    *host.state.status.lock().unwrap() = MobileStatus {
-        connected: false,
-        stage: "starting".into(),
-        message: "正在启动 Android 校园加速器".into(),
-        username: Some(username.clone()),
-        ..MobileStatus::default()
-    };
-    spawn_prepare(host, username, password, source);
-    0
+    ffi_guard(
+        || FFI_PANIC_CODE,
+        || {
+            let Some(username) = read_jstring(&mut env, username) else {
+                return -1;
+            };
+            let Some(password) = read_jstring(&mut env, password) else {
+                return -2;
+            };
+            let source = read_jstring(&mut env, auth_source).unwrap_or_else(|| "SAM-all".into());
+            let host = instance();
+            stop_all(host);
+            *host
+                .state
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = MobileStatus {
+                connected: false,
+                stage: "starting".into(),
+                message: "正在启动 Android 校园加速器".into(),
+                username: Some(username.clone()),
+                ..MobileStatus::default()
+            };
+            spawn_prepare(host, username, password, source);
+            0
+        },
+    )
 }
 
 #[no_mangle]
@@ -423,8 +557,21 @@ pub extern "system" fn Java_com_one_huaji_CampusVpnService_nativeStatusJson(
     env: JNIEnv<'_>,
     _this: JObject<'_>,
 ) -> jstring {
-    let status = serde_json::to_string(&*instance().state.status.lock().unwrap())
-        .unwrap_or_else(|_| "{\"connected\":false,\"stage\":\"ffi_error\"}".into());
+    // guard 只包住「取锁 + 序列化」这段（panic 源都在这里）并返回 String；
+    // to_jstring 留在 guard 外，否则 env 会被兜底闭包和主体闭包同时借用。
+    let status = ffi_guard(
+        || FALLBACK_STATUS_JSON.to_string(),
+        || {
+            serde_json::to_string(
+                &*instance()
+                    .state
+                    .status
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+            .unwrap_or_else(|_| FALLBACK_STATUS_JSON.to_string())
+        },
+    );
     to_jstring(env, status)
 }
 
@@ -434,7 +581,10 @@ pub extern "system" fn Java_com_one_huaji_CampusVpnService_nativeStartTunnel(
     _this: JObject<'_>,
     tun_fd: jint,
 ) -> jint {
-    start_tunnel(instance(), tun_fd as RawFd)
+    ffi_guard(
+        || FFI_PANIC_CODE,
+        || start_tunnel(instance(), tun_fd as RawFd),
+    )
 }
 
 #[no_mangle]
@@ -442,10 +592,19 @@ pub extern "system" fn Java_com_one_huaji_CampusVpnService_nativeDisconnect(
     _env: JNIEnv<'_>,
     _this: JObject<'_>,
 ) -> jint {
-    let host = instance();
-    stop_all(host);
-    *host.state.status.lock().unwrap() = MobileStatus::default();
-    0
+    ffi_guard(
+        || FFI_PANIC_CODE,
+        || {
+            let host = instance();
+            stop_all(host);
+            *host
+                .state
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = MobileStatus::default();
+            0
+        },
+    )
 }
 
 #[no_mangle]

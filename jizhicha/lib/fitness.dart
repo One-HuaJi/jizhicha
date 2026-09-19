@@ -858,6 +858,259 @@ class _FitnessPageState extends State<FitnessPage> {
     );
   }
 
+  /// 弹出「体测评分标准」详细划分：权重、总分等级、BMI 分档、各单项评分曲线。
+  void _showScoringDetails() {
+    final isMale = _male;
+    final gradeLabel = _gradeLevel == 1 ? '大一大二' : '大三大四';
+    final items = _items;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        final colorScheme = Theme.of(ctx).colorScheme;
+        var selected = 0;
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final it = items[selected];
+            final table =
+                (it.higher ? fitHigher : fitLower)['$_prefix${it.key}'] ??
+                const <List<double>>[];
+            return AlertDialog(
+              title: const Text('体测评分标准'),
+              content: SizedBox(
+                width: double.maxFinite,
+                child: SingleChildScrollView(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        '当前：${isMale ? '男生' : '女生'} · $gradeLabel',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      _sectionLabel(ctx, '单项权重'),
+                      const Text(
+                        'BMI 15% · 肺活量 15% · 50米跑 20% · 坐位体前屈 10% · '
+                        '立定跳远 10% · 引体向上(男)/仰卧起坐(女) 10% · '
+                        '1000米(男)/800米(女) 20%',
+                      ),
+                      const SizedBox(height: 12),
+                      _sectionLabel(ctx, '总分等级'),
+                      const Text(
+                        '优秀 ≥90 分 · 良好 ≥80 分 · 及格 ≥60 分 · 不及格 <60 分',
+                      ),
+                      const SizedBox(height: 12),
+                      _sectionLabel(ctx, 'BMI 评分（${isMale ? '男' : '女'}）'),
+                      Text(
+                        isMale
+                            ? '正常 17.9~23.9 = 100 分 · 低体重 ≤17.8 = 80 分 · '
+                                  '超重 24.0~27.9 = 80 分 · 肥胖 ≥28.0 = 60 分'
+                            : '正常 17.2~23.9 = 100 分 · 低体重 ≤17.1 = 80 分 · '
+                                  '超重 24.0~27.9 = 80 分 · 肥胖 ≥28.0 = 60 分',
+                      ),
+                      const SizedBox(height: 16),
+                      _sectionLabel(ctx, '各项目评分曲线'),
+                      const SizedBox(height: 8),
+                      GridView.count(
+                        crossAxisCount: 3,
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        mainAxisSpacing: 6,
+                        crossAxisSpacing: 6,
+                        childAspectRatio: 3.4,
+                        children: [
+                          for (var i = 0; i < items.length; i++)
+                            _itemButton(
+                              ctx,
+                              selected == i,
+                              () => setDialogState(() => selected = i),
+                              items[i],
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        '${it.label}（${it.unit}）',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: colorScheme.onSurface,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      _buildScoreTable(ctx, it),
+                      const SizedBox(height: 8),
+                      Text(
+                        _scoreSummary(it),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(),
+                  child: const Text('知道了'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _sectionLabel(BuildContext context, String text) {
+    return Text(
+      text,
+      style: TextStyle(
+        fontWeight: FontWeight.bold,
+        fontSize: 14,
+        color: Theme.of(context).colorScheme.onSurface,
+      ),
+    );
+  }
+
+  /// 等宽的评分项目选择按钮：选中态用背景色区分、不出现 √，避免字数不一导致错落。
+  Widget _itemButton(
+    BuildContext ctx,
+    bool isSelected,
+    VoidCallback onTap,
+    _FitItemDef item,
+  ) {
+    final colorScheme = Theme.of(ctx).colorScheme;
+    return Material(
+      color: isSelected
+          ? colorScheme.primaryContainer
+          : colorScheme.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: onTap,
+        child: Center(
+          child: Text(
+            item.label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+              color: isSelected
+                  ? colorScheme.onPrimaryContainer
+                  : colorScheme.onSurface,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 满分 / 及格 标准一句话说明。
+  String _scoreSummary(_FitItemDef it) {
+    final table = (it.higher ? fitHigher : fitLower)['$_prefix${it.key}'];
+    if (table == null || table.isEmpty) return '';
+    final cmp = it.higher ? '≥' : '≤';
+    final full = table.first;
+    final pass = table.firstWhere((r) => r[1] <= 60, orElse: () => table.last);
+    return '满分（100分）：$cmp${_formatThreshold(it, full[0])} · '
+        '及格（60分）：$cmp${_formatThreshold(it, pass[0])}';
+  }
+
+  /// 对称美观的「成绩 → 得分」表格：两列（成绩 | 得分），每条成绩一行。
+  Widget _buildScoreTable(BuildContext ctx, _FitItemDef it) {
+    final table = (it.higher ? fitHigher : fitLower)['$_prefix${it.key}'];
+    if (table == null || table.isEmpty) return const Text('暂无数据');
+    final colorScheme = Theme.of(ctx).colorScheme;
+
+    Widget cell(String text, {bool header = false}) {
+      return Padding(
+        padding: EdgeInsets.symmetric(
+          vertical: header ? 8 : 6,
+          horizontal: 6,
+        ),
+        child: Text(
+          text,
+          textAlign: TextAlign.center,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: header ? FontWeight.bold : FontWeight.normal,
+            color: header
+                ? colorScheme.onSurface
+                : colorScheme.onSurfaceVariant,
+          ),
+        ),
+      );
+    }
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          border: Border.all(color: colorScheme.outlineVariant.withAlpha(140)),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Table(
+          columnWidths: const {
+            0: FlexColumnWidth(3),
+            1: FlexColumnWidth(2),
+          },
+          defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+          border: TableBorder(
+            horizontalInside: BorderSide(
+              color: colorScheme.outlineVariant.withAlpha(120),
+              width: 0.5,
+            ),
+            verticalInside: BorderSide(
+              color: colorScheme.outlineVariant.withAlpha(120),
+              width: 0.5,
+            ),
+          ),
+          children: [
+            TableRow(
+              decoration: BoxDecoration(
+                color: colorScheme.surfaceContainerHighest,
+              ),
+              children: [
+                cell('成绩', header: true),
+                cell('得分', header: true),
+              ],
+            ),
+            for (var i = 0; i < table.length; i++)
+              TableRow(
+                decoration: i.isEven
+                    ? null
+                    : BoxDecoration(
+                        color: colorScheme.surfaceContainerHighest.withAlpha(50),
+                      ),
+                children: [
+                  cell(_formatThreshold(it, table[i][0])),
+                  cell('${table[i][1].toInt()}'),
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatThreshold(_FitItemDef it, double v) {
+    if (it.isRun) {
+      final total = v.round();
+      return '${total ~/ 60}分${(total % 60).toString().padLeft(2, '0')}秒';
+    }
+    if (v == v.roundToDouble()) return v.toInt().toString();
+    return v.toStringAsFixed(1);
+  }
+
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
@@ -865,7 +1118,16 @@ class _FitnessPageState extends State<FitnessPage> {
     final bmiSc = bmi == null ? null : bmiScore(bmi, _male).toDouble();
     final total = _total;
     return Scaffold(
-      appBar: AppBar(title: const Text('体测成绩计算器')),
+      appBar: AppBar(
+        title: const Text('体测成绩计算器'),
+        actions: [
+          IconButton(
+            tooltip: '评分标准',
+            icon: const Icon(Icons.rule),
+            onPressed: _showScoringDetails,
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
@@ -1066,3 +1328,4 @@ class _FitnessPageState extends State<FitnessPage> {
     );
   }
 }
+

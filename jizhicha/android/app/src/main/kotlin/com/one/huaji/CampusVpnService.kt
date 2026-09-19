@@ -211,7 +211,7 @@ class CampusVpnService : VpnService() {
         )
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.ic_stat_notification)
                 .setContentTitle("稽之查")
                 .setContentText(text)
                 .setContentIntent(pendingIntent)
@@ -220,7 +220,7 @@ class CampusVpnService : VpnService() {
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.ic_stat_notification)
                 .setContentTitle("稽之查")
                 .setContentText(text)
                 .setContentIntent(pendingIntent)

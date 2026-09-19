@@ -4,15 +4,13 @@ import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'academic_calendar.dart';
 import 'app_mode.dart';
 import 'app_settings.dart';
+import 'auth_pages.dart';
 import 'campus_environment.dart';
+import 'campus_sync_helpers.dart';
 import 'common.dart';
-import 'credential_store.dart';
-import 'jwxt_client.dart';
 import 'offline_sync.dart';
 import 'schedule_cache_store.dart';
-import 'schedule_time.dart';
 import 'sync_cooldown.dart';
-import 'ui_constants.dart';
 
 // ==================== 成绩页 ====================
 class GradesPage extends StatefulWidget {
@@ -24,7 +22,11 @@ class GradesPage extends StatefulWidget {
   State<GradesPage> createState() => _GradesPageState();
 }
 
-class _GradesPageState extends State<GradesPage> {
+class _GradesPageState extends State<GradesPage>
+    with CampusSyncHelpers<GradesPage> {
+  /// [CampusSyncHelpers] 需要知道当前页面对应的学号。
+  @override
+  String get campusStudentId => widget.studentId;
   static const _latestGradeTermsValue = '__latest_grade_term__';
   static const _allGradeTermsValue = '__all_grade_terms__';
   List<Map<String, String>> _grades = [];
@@ -72,44 +74,26 @@ class _GradesPageState extends State<GradesPage> {
   Future<void> _openAcceleratorSetup() async {
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => buildVpnSetupPage!(mode: AppMode.education),
+        builder: (_) => VpnSetupPage(mode: AppMode.education),
       ),
     );
     if (mounted) await campusEnvironment.detect();
   }
 
-  Future<bool> _canReuseEducationSession() async {
-    if (campusEnvironment.checking) await campusEnvironment.detect();
-    if (campusEnvironment.online != true) {
-      await campusEnvironment.detect();
-    }
-    final client = JwxtClient();
-    return campusEnvironment.online == true &&
-        client.isLoggedIn &&
-        client.authenticatedStudentId == widget.studentId;
-  }
-
-  void _showSyncCooldownMessage() {
-    final remaining = dataSyncCooldown.remainingText(SyncResource.grade);
-    if (remaining.isEmpty || !mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text('成绩更新冷却中，还需 $remaining 后重试')));
-  }
 
   /// 手动刷新成绩默认只请求最新学期；可切换为指定学期或全部已知学期。
   /// 校园内网和当前教务会话都有效时直接请求，不重复打开认证页。
   Future<void> _openGradeUpdate() async {
     if (_loading) return;
     if (dataSyncCooldown.isCooling(SyncResource.grade)) {
-      _showSyncCooldownMessage();
+      showSyncCooldownMessage(SyncResource.grade);
       return;
     }
     final selected = _selectedGradeUpdateTerm;
     final fetchAll = selected == _allGradeTermsValue;
     final term = fetchAll || selected == null ? null : selected;
     final scope = fetchAll ? GradeSyncScope.all : GradeSyncScope.latest;
-    if (await _canReuseEducationSession()) {
+    if (await canReuseEducationSession()) {
       setState(() {
         _loading = true;
         _error = null;
@@ -144,7 +128,7 @@ class _GradesPageState extends State<GradesPage> {
     if (!mounted) return;
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => buildVpnSetupPage!(
+        builder: (_) => VpnSetupPage(
           mode: AppMode.education,
           gradeSyncScope: scope,
           syncSchedules: false,
@@ -269,11 +253,6 @@ class _GradesPageState extends State<GradesPage> {
     );
   }
 
-  String _formatCachedAt(DateTime value) {
-    String two(int number) => number.toString().padLeft(2, '0');
-    return '${value.year}-${two(value.month)}-${two(value.day)} '
-        '${two(value.hour)}:${two(value.minute)}';
-  }
 
   Widget _buildGradeUpdateControls() {
     final terms = _availableGradeUpdateTerms();
@@ -481,7 +460,7 @@ class _GradesPageState extends State<GradesPage> {
                   alignment: Alignment.centerLeft,
                   child: Text(
                     '账号 ${widget.studentId} · 本地保存于 '
-                    '${_formatCachedAt(_cachedAt!)}',
+                    '${formatCachedAt(_cachedAt!)}',
                     style: TextStyle(
                       fontSize: 12,
                       color: colorScheme.onSurfaceVariant,
@@ -528,7 +507,7 @@ class _GradesPageState extends State<GradesPage> {
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
             child: Text(
               '正在显示账号 ${widget.studentId} 的本地成绩'
-              '${_cachedAt == null ? '' : ' · ${_formatCachedAt(_cachedAt!)}'}',
+              '${_cachedAt == null ? '' : ' · ${formatCachedAt(_cachedAt!)}'}',
               style: TextStyle(
                 fontSize: 12,
                 color: colorScheme.onSurfaceVariant,

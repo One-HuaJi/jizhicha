@@ -10,6 +10,8 @@ import 'package:ffi/ffi.dart' as ffi_utils;
 import 'package:flutter/services.dart' show MethodChannel;
 
 import 'credential_store.dart';
+// 扩展方法 `isRetryable` / `message` 定义在 VpnFailureText 里，必须一并引入。
+import 'vpn_session.dart' show VpnFailure, VpnFailureText, classifyVpnError;
 
 typedef _ConnectNative =
     ffi.Int32 Function(
@@ -132,10 +134,20 @@ class _EmbeddedVpnBindings {
   }
 }
 
+/// 用户尚未授予 Android 系统 VPN 权限。
+///
+/// 单独一个类型是为了让重试逻辑能识别它并**不重试** —— 重试只会重复弹
+/// 系统授权对话框，必须让用户先去点"允许"。
+class AcceleratorPermissionDenied implements Exception {
+  const AcceleratorPermissionDenied();
+
+  @override
+  String toString() => '请在 Android 系统网络授权对话框中允许稽之查，然后再次点击连接';
+}
+
 class CampusVpnLauncher {
   /// 由 main.dart 注入：隧道状态变化时同步教务 HTTP 探测的源地址。
   static void Function(String?)? onSourceAddressChanged;
-
   static final _EmbeddedVpnBindings _bindings = _EmbeddedVpnBindings();
 
   static void shutdownNow() {
@@ -144,17 +156,24 @@ class CampusVpnLauncher {
 
   Future<void> start() async => _bindings.ensureLoaded();
 
-  bool _isWintunCleanupFailure(Object error) {
-    final message = '$error'.toLowerCase();
-    return message.contains('wintunstartsession failed') ||
-        message.contains('failed to create wintun adapter');
-  }
+  // 错误归类统一走 `vpn_session.dart` 的 `classifyVpnError`，避免同一批
+  // 英文子串在本文件与 UI 层各匹配一次（改造前就是那样，改文案会静默
+  // 破坏重试策略）。
+  bool _isWintunCleanupFailure(Object error) =>
+      classifyVpnError(error) == VpnFailure.adapterBusy;
+
+  /// 是否属于"值得重试"的瞬时失败。
+  ///
+  /// 两个平台共用同一套判定 —— 以前 Android 分支完全没有重试，导致
+  /// 同样一个瞬时错误在桌面端被自动兜住、在手机上直接甩给用户。
+  bool _isTransientFailure(Object error) => classifyVpnError(error).isRetryable;
 
   bool _isTransientWindowsFailure(Object error) {
-    final message = '$error'.toLowerCase();
-    return _isWintunCleanupFailure(error) ||
-        message.contains('no physical ipv4 default route') ||
-        message.contains('0x020004ab');
+    final kind = classifyVpnError(error);
+    return kind == VpnFailure.adapterBusy ||
+        kind == VpnFailure.gatewayUnreachable ||
+        kind == VpnFailure.badCredentials ||
+        kind == VpnFailure.gatewayTimeout;
   }
 
   /// 获取当前隧道状态。读取失败时视为未连接，避免状态接口异常阻断页面跳转。
@@ -233,6 +252,90 @@ class CampusVpnLauncher {
     }
   }
 
+  /// Android 单次连接尝试：准备 → 发起 → 轮询到 connected 或错误。
+  Future<void> _connectAndroidOnce({
+    required String username,
+    required String password,
+    String? authSource,
+    void Function(String message)? onProgress,
+  }) async {
+    final prepared = await _bindings.androidPrepare();
+    if (!prepared) {
+      // 这条不该重试：需要用户去点系统授权弹窗，重试只会重复弹。
+      throw const AcceleratorPermissionDenied();
+    }
+    await _bindings.androidConnect(
+      username: username,
+      password: password,
+      authSource: authSource ?? 'SAM-all',
+    );
+    final deadline = DateTime.now().add(const Duration(seconds: 60));
+    Object? lastError;
+    while (DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 350));
+      final status = await _bindings.androidStatus();
+      final message = status['message']?.toString();
+      if (message != null && message.isNotEmpty) onProgress?.call(message);
+      if (status['connected'] == true) {
+        // 隧道刚标记 connected 时，原生层有时还没把虚拟 IP 填进 status。
+        // 探测 HttpClient 必须绑定这个虚拟 IP 才能避开 FlClash TUN，
+        // 因此再短轮询一段，直到拿到非空值。最多 2.5 秒；
+        // 2.5 秒后仍为空视为配置异常，回落到断开重建。
+        var virtualIp = status['virtual_ip']?.toString();
+        var attempts = 0;
+        while ((virtualIp == null || virtualIp.isEmpty) && attempts < 5) {
+          attempts += 1;
+          await Future<void>.delayed(const Duration(milliseconds: 500));
+          // This is the Android branch.  The Windows-only `status()` binding
+          // is never loaded here (`ensureLoaded` returns early on Android),
+          // so calling it throws a null-check error instead of retrying.
+          virtualIp = (await _bindings.androidStatus())['virtual_ip']
+              ?.toString();
+        }
+        if (virtualIp == null || virtualIp.isEmpty) {
+          throw '加速器已连接但虚拟 IP 未下发，请重试';
+        }
+        onSourceAddressChanged?.call(virtualIp);
+        return;
+      }
+      final error = status['error']?.toString();
+      if (error != null && error.isNotEmpty) {
+        lastError = error;
+        final stage = status['stage']?.toString() ?? '';
+        if (stage.endsWith('_error') || stage == 'tunnel_stopped') {
+          throw error;
+        }
+      }
+    }
+    throw lastError ?? '校园加速器连接超时';
+  }
+
+  /// 等待原生状态回到 idle（或超时）。
+  ///
+  /// ⚠️ 重连前必须等这一步。学校网关是**"同账号新会话踢掉旧会话"**的语义，
+  /// 而 Rust 侧 `stop_all()` 里的 `task.abort()` 只是"请求取消"，老 tunnel 的
+  /// TLS 连接、老 heartbeat 在途请求并不会立刻释放。若不等就发起新的 LOGIN，
+  /// 新旧会话会在网关侧撞车 —— 这正是"第 1、2 次连接失败、第 3 次才成功"
+  /// 的直接原因（真机实测：失败重试最久到 30 秒以上才收敛）。
+  Future<void> _waitForIdle({
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      try {
+        final status = await _bindings.androidStatus();
+        final stage = status['stage']?.toString() ?? '';
+        if (!(status['connected'] == true) &&
+            (stage == 'idle' || stage.isEmpty || stage == 'starting')) {
+          return;
+        }
+      } catch (_) {
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+    }
+  }
+
   Future<void> connect({
     required String username,
     required String password,
@@ -240,50 +343,60 @@ class CampusVpnLauncher {
     void Function(String message)? onProgress,
   }) async {
     if (Platform.isAndroid) {
-      final prepared = await _bindings.androidPrepare();
-      if (!prepared) {
-        throw '请在 Android 系统网络授权对话框中允许稽之查，然后再次点击连接';
+      // ⚠️ Android 以前完全没有重试，任何瞬时失败都直接抛给用户。
+      // Windows 侧一直有 `_isTransientWindowsFailure` + 最多 2 次重试，
+      // 两边行为不一致是"Android 上第 1、2 次失败"的成因之一。
+      // 这里对齐 Windows：瞬时错误重试，凭据/权限错误立即上抛。
+      Object lastError;
+      try {
+        await _connectAndroidOnce(
+          username: username,
+          password: password,
+          authSource: authSource,
+          onProgress: onProgress,
+        );
+        return;
+      } on AcceleratorPermissionDenied {
+        rethrow;
+      } catch (error) {
+        lastError = error;
       }
-      await _bindings.androidConnect(
-        username: username,
-        password: password,
-        authSource: authSource ?? 'SAM-all',
-      );
-      final deadline = DateTime.now().add(const Duration(seconds: 60));
-      Object? lastError;
-      while (DateTime.now().isBefore(deadline)) {
-        await Future<void>.delayed(const Duration(milliseconds: 350));
-        final status = await _bindings.androidStatus();
-        final message = status['message']?.toString();
-        if (message != null && message.isNotEmpty) onProgress?.call(message);
-        if (status['connected'] == true) {
-          // 隧道刚标记 connected 时，原生层有时还没把虚拟 IP 填进 status。
-          // 探测 HttpClient 必须绑定这个虚拟 IP 才能避开 FlClash TUN，
-          // 因此再短轮询一段，直到拿到非空值。最多 2.5 秒；
-          // 2.5 秒后仍为空视为配置异常，回落到断开重建。
-          var virtualIp = status['virtual_ip']?.toString();
-          var attempts = 0;
-          while ((virtualIp == null || virtualIp.isEmpty) && attempts < 5) {
-            attempts += 1;
-            await Future<void>.delayed(const Duration(milliseconds: 500));
-            virtualIp = _bindings.status()['virtual_ip']?.toString();
-          }
-          if (virtualIp == null || virtualIp.isEmpty) {
-            throw '加速器已连接但虚拟 IP 未下发，请重试';
-          }
-          onSourceAddressChanged?.call(virtualIp);
+
+      if (!_isTransientFailure(lastError) ||
+          classifyVpnError(lastError) == VpnFailure.badCredentials) {
+        throw lastError;
+      }
+
+      // 与 Windows 相同：最多再试 2 次，每次先真正断开并等待原生回到 idle，
+      // 让网关有机会淘汰旧会话后再重建。
+      for (var retry = 0; retry < 2; retry++) {
+        onProgress?.call('正在等待学校网关释放上一次会话…');
+        try {
+          await disconnect();
+        } catch (_) {
+          // 断开本身失败不阻断重试；下一次连接会给出最终错误。
+        }
+        await _waitForIdle();
+        await Future<void>.delayed(
+          Duration(milliseconds: retry == 0 ? 1200 : 2500),
+        );
+        try {
+          await _connectAndroidOnce(
+            username: username,
+            password: password,
+            authSource: authSource,
+            onProgress: onProgress,
+          );
           return;
-        }
-        final error = status['error']?.toString();
-        if (error != null && error.isNotEmpty) {
+        } catch (error) {
           lastError = error;
-          final stage = status['stage']?.toString() ?? '';
-          if (stage.endsWith('_error') || stage == 'tunnel_stopped') {
-            throw error;
+          if (!_isTransientFailure(error) ||
+              classifyVpnError(error) == VpnFailure.badCredentials) {
+            rethrow;
           }
         }
       }
-      throw lastError ?? '校园加速器连接超时';
+      throw lastError;
     }
     try {
       await _connectWindowsOnce(

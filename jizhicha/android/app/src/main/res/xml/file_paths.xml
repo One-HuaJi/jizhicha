@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 可共享的路径白名单。
+  综测自评表先写到 getTemporaryDirectory()（对应 cache-path），再经 FileProvider
+  转成 content:// URI 交给系统分享面板。不要开放整个存储根目录。
+-->
+<paths>
+    <cache-path name="cache" path="." />
+    <files-path name="files" path="." />
+    <external-files-path name="external_files" path="." />
+</paths>

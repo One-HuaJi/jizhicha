@@ -2,6 +2,7 @@ import 'academic_calendar.dart';
 import 'jwxt_client.dart';
 import 'schedule_cache_store.dart';
 import 'sync_cooldown.dart';
+import 'widget_schedule_store.dart';
 
 class OfflineSyncResult {
   final int savedTermCount;
@@ -162,6 +163,8 @@ Future<OfflineSyncResult> syncOfflineUserData({
     replaceGradeTerms: gradeResult.successfulTerms,
     replaceSchedules: false,
   );
+  // 同步完课表后，顺手刷新桌面小组件要读的 JSON（失败静默）。
+  await WidgetScheduleStore.writeCurrentSchedule(studentId);
   return OfflineSyncResult(
     savedTermCount: htmlByTerm.length,
     gradeCount: gradeResult.grades.length,

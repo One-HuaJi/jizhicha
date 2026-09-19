@@ -125,8 +125,17 @@ async fn run_target_tunnel_inner(
             if length == 0 {
                 return Err(HuseVpnError::Tunnel("Wintun reader closed".into()));
             }
-            validate_ip_packet(&packet[..length])?;
-            let frame = build_nc_data_frame(&packet[..length])?;
+            // ⚠️ 单个坏包不能拖垮整条隧道（与 Android 侧同一处理）。
+            // 旧实现用 `?` 上抛，Wintun 上出现一个非 IP 包就会让 select!
+            // 结束整个 tunnel；而坏包本该只被丢弃。
+            // 只吞"包内容非法"；读失败仍上抛，因为那确实意味着隧道不可用。
+            if validate_ip_packet(&packet[..length]).is_err() {
+                continue;
+            }
+            let frame = match build_nc_data_frame(&packet[..length]) {
+                Ok(frame) => frame,
+                Err(_) => continue,
+            };
             packet_count += 1;
             if packet_count <= 24 || packet_count % 100 == 0 {
                 eprintln!(
@@ -146,7 +155,10 @@ async fn run_target_tunnel_inner(
             let record = tls_reader.read_record().await?;
             eprintln!("HUSE VPN downlink TLS plaintext: len={}", record.len());
             for packet in parse_nc_data_frames(&record)? {
-                validate_ip_packet(&packet)?;
+                // 下行同理：坏包丢弃，不中断整条隧道。
+                if validate_ip_packet(&packet).is_err() {
+                    continue;
+                }
                 tun_writer
                     .write_all(&packet)
                     .await

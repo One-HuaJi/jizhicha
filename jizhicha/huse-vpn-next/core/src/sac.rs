@@ -9,8 +9,10 @@ use crate::error::{HuseVpnError, Result};
 use crate::nc::decode_ticket_hex;
 use crate::tls::RawTlsClient;
 use serde::Serialize;
+use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const MSG_SAC_GET_PORTAL: u32 = 0x0200_0002;
 pub const MSG_SAC_LOGIN: u32 = 0x0200_0003;
@@ -29,12 +31,39 @@ pub struct SacAuthSource {
     pub sub_auth_type: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// SAC 登录成功后拿到的 NC ticket 与选中的认证源。
+///
+/// 刻意**不** derive `Debug` / `Serialize`：ticket 是后续 NC 认证的凭据，
+/// 任何一次 `{:?}` 调试打印、或被误加进 status JSON，都会把 32 字节原始
+/// ticket 整段 dump 出去（§4 红线：Ticket 不入日志）。Debug 手工实现为脱敏
+/// 输出，Drop 时擦除 ticket 与认证源名。
+#[derive(Clone)]
 pub struct SacLogin {
     pub ticket: [u8; 32],
     pub auth_id: u32,
     pub sub_auth_id: u32,
     pub auth_name: String,
+}
+
+impl fmt::Debug for SacLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SacLogin")
+            .field(
+                "ticket",
+                &format_args!("[REDACTED; {} bytes]", self.ticket.len()),
+            )
+            .field("auth_id", &self.auth_id)
+            .field("sub_auth_id", &self.sub_auth_id)
+            .field("auth_name", &self.auth_name)
+            .finish()
+    }
+}
+
+impl Drop for SacLogin {
+    fn drop(&mut self) {
+        self.ticket.zeroize();
+        self.auth_name.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,15 +144,17 @@ impl SacClient {
             })?;
 
         let gateway_name = self.gateway_name();
-        let login_request = build_login_request(
+        // login_request 的字节里含**明文密码**，login_reply 含 32 字节 NC ticket；
+        // 两者都用 Zeroizing 包裹，出作用域立即擦除，不留给换页/核心转储/内存取证。
+        let login_request = Zeroizing::new(build_login_request(
             username,
             password,
             selected.auth_id,
             selected.sub_auth_id,
             selected.sub_auth_type,
             &gateway_name,
-        )?;
-        let login_reply = self.exchange(&login_request).await?;
+        )?);
+        let login_reply = Zeroizing::new(self.exchange(&login_request).await?);
         let login_response_summary = summarize_login_response(&login_reply);
         let (ticket, result) = parse_login_reply(&login_reply)?;
         let diagnostics = SacDiagnostics {
@@ -463,6 +494,20 @@ fn parse_login_reply(frame: &[u8]) -> Result<([u8; 32], u32)> {
     Ok((ticket, result))
 }
 
+/// 把远端给出的长度向上对齐到 4 字节；溢出返回 `None`。
+///
+/// 长度字段直接来自网关报文，必须用 checked 运算。32 位目标
+/// （`armeabi-v7a`，是正式发布的架构之一）上 `len = 0xFFFFFFFF` 时
+/// `len + 3` 在 release 会回绕成 2、`& !3` 归零，`take(0)` 顺利通过后
+/// `bytes[len..]` 立即 panic；debug 构建则在加法处就直接 panic。网关或
+/// 中间人可借此打挂整个 Flutter 进程。
+///
+/// `nc.rs` 有一个语义相同的 checked helper；两套帧读取器尚未合并，
+/// 合并计划见交接文档 §9.5。
+fn padded_len(len: usize) -> Option<usize> {
+    len.checked_add(3).map(|value| value & !3)
+}
+
 fn parse_ticket_field(reader: &mut SacReader<'_>) -> Result<[u8; 32]> {
     let start = reader.offset;
 
@@ -471,7 +516,11 @@ fn parse_ticket_field(reader: &mut SacReader<'_>) -> Result<[u8; 32]> {
     // deliberately strict and never truncates or pads.
     if reader.data.len().saturating_sub(start) >= 4 {
         let len = u32::from_be_bytes(reader.data[start..start + 4].try_into().unwrap()) as usize;
-        let padded = (len + 3) & !3;
+        // 只在 len 已确认为常量 64 之后才做对齐运算：len 来自远端，32 位目标上
+        // `len + 3` 会回绕（debug 构建在加法处直接 panic）。len != 64 时短路，
+        // 下面 if 的第一个条件也保证这个 0 永远不会被用到，随后落到原始 32 字节
+        // 兼容分支，行为与改前完全一致。
+        let padded = if len == 64 { (len + 3) & !3 } else { 0 };
         if len == 64
             && start + 4 + padded <= reader.data.len()
             && reader.data[start + 4..start + 4 + len]
@@ -508,20 +557,26 @@ fn find_gateway_message(reader: &mut SacReader<'_>) -> Option<String> {
     while reader.offset + 4 <= reader.data.len() {
         let here = reader.offset;
         let length = u32::from_be_bytes(reader.data[here..here + 4].try_into().unwrap()) as usize;
-        let padded = (length + 3) & !3;
-        if length > 0 && length <= 1024 && here + 4 + padded <= reader.data.len() {
-            let candidate = &reader.data[here + 4..here + 4 + length];
-            if candidate
-                .iter()
-                .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
-                && best.as_ref().map_or(true, |current| length > current.len())
-            {
-                best = String::from_utf8(candidate.to_vec()).ok();
+        // 长度来自远端：用 checked 对齐。32 位目标上 `length + 3` 会回绕
+        // （debug 构建在加法处直接 panic）；溢出或长度越界都按「无法解析」处理，
+        // 前移 4 字节继续扫，语义与改前一致。length <= 1024 也保证了
+        // `here + 4 + padded` 不会溢出。
+        let aligned = padded_len(length).filter(|_| length > 0 && length <= 1024);
+        if let Some(padded) = aligned {
+            if here + 4 + padded <= reader.data.len() {
+                let candidate = &reader.data[here + 4..here + 4 + length];
+                if candidate
+                    .iter()
+                    .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+                    && best.as_ref().is_none_or(|current| length > current.len())
+                {
+                    best = String::from_utf8(candidate.to_vec()).ok();
+                }
+                reader.offset = here + 4 + padded;
+                continue;
             }
-            reader.offset = here + 4 + padded;
-        } else {
-            reader.offset = here + 4;
         }
+        reader.offset = here + 4;
     }
     best
 }
@@ -645,7 +700,9 @@ impl<'a> SacReader<'a> {
 
     fn string(&mut self) -> Result<String> {
         let len = self.u32()? as usize;
-        let padded = (len + 3) & !3;
+        let padded = padded_len(len).ok_or_else(|| {
+            HuseVpnError::Protocol("SAC string length overflows the address space".into())
+        })?;
         let bytes = self.take(padded)?;
         if bytes[len..].iter().any(|byte| *byte != 0) {
             return Err(HuseVpnError::Protocol(
@@ -773,6 +830,74 @@ mod tests {
         login_frame.extend_from_slice(&(login_body.len() as u32).to_be_bytes());
         login_frame.extend_from_slice(&login_body);
         assert!(parse_login_reply(&login_frame).is_err());
+    }
+
+    /// `padded_len` 的不变量：远端长度不得让对齐运算溢出。
+    ///
+    /// 32 位目标（armeabi-v7a，正式发布架构之一）上 `usize::MAX` 就等于网关能
+    /// 送来的 0xFFFFFFFF；旧代码 `(len + 3) & !3` 会回绕成 0，`take(0)` 通过后
+    /// `bytes[len..]` 直接 panic。直接断言 helper 契约，使这条回归测试在 64 位
+    /// 主机上同样有效（否则 64 位下 padded 只是超大、被 take 的边界检查挡下）。
+    #[test]
+    fn padded_len_rejects_address_space_overflow() {
+        assert_eq!(padded_len(usize::MAX), None);
+        assert_eq!(padded_len(usize::MAX - 1), None);
+        assert_eq!(padded_len(usize::MAX - 2), None);
+        assert_eq!(padded_len(0), Some(0));
+        assert_eq!(padded_len(1), Some(4));
+        assert_eq!(padded_len(4), Some(4));
+        assert_eq!(padded_len(5), Some(8));
+        assert_eq!(padded_len(64), Some(64));
+    }
+
+    /// 畸形长度字段必须变成 Err 而不是 panic（网关/中间人可触发的 DoS）。
+    #[test]
+    fn rejects_overflowing_ticket_length() {
+        let mut login_body = 0u32.to_be_bytes().to_vec();
+        login_body.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut login_frame = (MSG_SAC_LOGIN | 0x8000_0000).to_be_bytes().to_vec();
+        login_frame.extend_from_slice(&(login_body.len() as u32).to_be_bytes());
+        login_frame.extend_from_slice(&login_body);
+        assert!(parse_login_reply(&login_frame).is_err());
+    }
+
+    /// 同上，但走 result != 0 的 find_gateway_message 扫描分支。
+    #[test]
+    fn rejects_overflowing_gateway_message_length() {
+        let mut login_body = 1u32.to_be_bytes().to_vec();
+        login_body.extend_from_slice(&u32::MAX.to_be_bytes());
+        login_body.extend_from_slice(b"password error");
+        let mut login_frame = (MSG_SAC_LOGIN | 0x8000_0000).to_be_bytes().to_vec();
+        login_frame.extend_from_slice(&(login_body.len() as u32).to_be_bytes());
+        login_frame.extend_from_slice(&login_body);
+        assert!(parse_login_reply(&login_frame).is_err());
+    }
+
+    /// 红线守卫：ticket 绝不能出现在 Debug 输出里（§4：Ticket 不入日志）。
+    /// 原来 `SacLogin` derive 了 `Debug` + `Serialize`，下游任何一句 `{:?}`
+    /// 就会把 32 字节原始 ticket 整段打出来。
+    #[test]
+    fn sac_login_debug_redacts_ticket() {
+        let ticket = [0x5a; 32];
+        let login = SacLogin {
+            ticket,
+            auth_id: 1,
+            sub_auth_id: 2,
+            auth_name: "SAM-all".into(),
+        };
+        let rendered = format!("{login:?}");
+        assert!(rendered.contains("REDACTED"), "should redact: {rendered}");
+        assert!(
+            !rendered.contains(&hex::encode(ticket)),
+            "ticket hex leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("5a5a"),
+            "ticket bytes leaked: {rendered}"
+        );
+        // 其它字段仍要可见，否则脱敏就把诊断信息一起废掉了。
+        assert!(rendered.contains("SAM-all"), "{rendered}");
+        assert!(rendered.contains("auth_id"), "{rendered}");
     }
 
     fn push_string(out: &mut Vec<u8>, value: &str) {
