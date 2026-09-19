@@ -13,7 +13,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # Read more about Android versioning at https://developer.android.com/studio/publish/versioning
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.9+10900
+version: 1.1.0+11000
 
 environment:
   sdk: ^3.12.2
@@ -41,6 +41,11 @@ dependencies:
   url_launcher: ^6.3.2
   path_provider: ^2.1.5
   gal: ^2.3.0
+  # 综测自评表导出 Word：以官方 .docx 为模板替换文字（见 assets/templates/），
+  # 用 archive 读写 OOXML 包，纯 Dart、Windows 与 Android 共用。
+  archive: ^4.1.0
+  # 选证明图片 / 选体测成绩 Excel：两端（Android + Windows）都支持。
+  file_picker: ^12.3.0
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -65,6 +70,9 @@ flutter:
 
   assets:
     - assets/models/ddddocr_common_old.onnx
+    # 综测自评表的导出模板（官方原表）。导出时只替换文字，保留官方字体、
+    # 边框、列宽与样式，避免自建表格走样。
+    - assets/templates/zongce_form_template.docx
 
   # To add assets to your application, add an assets section, like this:
   # assets:

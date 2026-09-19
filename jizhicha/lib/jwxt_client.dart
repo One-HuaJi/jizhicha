@@ -683,15 +683,33 @@ class JwxtClient {
     }
   }
 
+  /// 轮询内网可达性，直到成功或超时。
+  ///
+  /// ⚠️ **预算必须给足。** 真机实测（Redmi K80 Pro / 校园网）：隧道建立后
+  /// 教务端点需要 **6～9 秒**才开始响应，个别情况下超过 30 秒。
+  /// 期间 `curl` 返回 `000`（连接被网关丢弃），随后突然变成 `200`。
+  ///
+  /// 这不是"网络不好"，而是**学校网关在为新会话做后端准备**：隧道/TLS 层
+  /// 已经通了，但网关到教务系统的转发链路还没就绪。属于必然经历的阶段，
+  /// 不该判定为失败。
+  ///
+  /// 因此这里默认给 **45 秒**（每次探测 5 秒 + 间隔 1 秒，约 7 次机会），
+  /// 并允许调用方通过 [onTick] 展示进度 —— 让用户看到"正在等待网关准备"，
+  /// 而不是盯着转圈以为卡死了。
   Future<bool> waitForIntranet({
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = const Duration(seconds: 45),
+    void Function(int attempt, int maxAttempts)? onTick,
   }) async {
+    const perProbe = Duration(seconds: 5);
+    const gap = Duration(milliseconds: 1000);
     final deadline = DateTime.now().add(timeout);
+    var attempt = 0;
     while (DateTime.now().isBefore(deadline)) {
-      if (await checkIntranetReachable(timeout: const Duration(seconds: 4))) {
-        return true;
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 800));
+      attempt += 1;
+      if (await checkIntranetReachable(timeout: perProbe)) return true;
+      onTick?.call(attempt, 7);
+      if (!DateTime.now().add(gap).isBefore(deadline)) break;
+      await Future<void>.delayed(gap);
     }
     return false;
   }
