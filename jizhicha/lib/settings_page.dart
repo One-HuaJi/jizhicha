@@ -129,7 +129,7 @@ class _SettingsPageState extends State<SettingsPage> {
       await CampusVpnLauncher().logout();
       await JwxtClient().resetSession();
       if (!mounted) return;
-      navigateToBootstrap!(context);
+      navigateToBootstrap(context);
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(
@@ -189,7 +189,7 @@ class _SettingsPageState extends State<SettingsPage> {
         throw '无法彻底删除：${failures.join('、')}';
       }
       if (!mounted) return;
-      navigateToBootstrap!(context);
+      navigateToBootstrap(context);
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(

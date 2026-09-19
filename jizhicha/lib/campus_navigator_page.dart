@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'app_mode.dart';
+import 'auth_pages.dart';
 import 'campus_vpn.dart';
 import 'common.dart';
+import 'home_page.dart';
 import 'jwxt_client.dart';
 
 class CampusNavigatorPage extends StatefulWidget {
@@ -52,15 +54,27 @@ class _CampusNavigatorPageState extends State<CampusNavigatorPage> {
     }
   }
 
-  /// 返回连接页，不中断校园加速器隧道。
-  Future<void> _returnToConnect() async {
+  /// 返回应用首页（课表页），**不中断**校园加速器隧道。
+  ///
+  /// ## 为什么不是"返回连接页"
+  ///
+  /// 旧实现是把本页 `pushReplacement` 成 `VpnSetupPage` —— 但用户此刻
+  /// **已经连上了**，把他送回去重新认证是反直觉的：他按返回多半只是想
+  /// "回到应用里"，而不是"断开重连"。
+  ///
+  /// 而且连接成功后认证页已经清栈（见 `auth_pages.dart` 的 `_openTarget`），
+  /// 所以这里也无法再"弹回上一页"——必须有明确的目的地。
+  /// 语义上最自然的落点就是应用首页。
+  ///
+  /// 想断开连接的用户有明确的入口：页内的「断开加速器」按钮。
+  Future<void> _returnToHome() async {
     if (_disconnecting) return;
-    await JwxtClient().resetSession();
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(
+    Navigator.of(context).pushAndRemoveUntil(
       MaterialPageRoute(
-        builder: (_) => buildVpnSetupPage!(mode: AppMode.vpnOnly),
+        builder: (_) => HomePage(studentId: widget.studentId),
       ),
+      (_) => false,
     );
   }
 
@@ -73,7 +87,7 @@ class _CampusNavigatorPageState extends State<CampusNavigatorPage> {
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(
         MaterialPageRoute(
-          builder: (_) => buildVpnSetupPage!(mode: AppMode.vpnOnly),
+          builder: (_) => VpnSetupPage(mode: AppMode.vpnOnly),
         ),
         (_) => false,
       );
@@ -85,11 +99,27 @@ class _CampusNavigatorPageState extends State<CampusNavigatorPage> {
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
+    // 系统返回键/手势与页内「返回」按钮走同一条路径。
+    //
+    // 连接成功后认证页已经清栈，本页下面是空的；若放任系统返回直接 pop，
+    // 行为会与页内按钮不一致（安卓上表现为退回桌面或上一个应用），
+    // 用户会以为"登录被取消了"。这里统一成"回到应用首页"。
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        _returnToHome();
+      },
+      child: _buildScaffold(context, colorScheme),
+    );
+  }
+
+  Widget _buildScaffold(BuildContext context, ColorScheme colorScheme) {
     return Scaffold(
       appBar: AppBar(
         leadingWidth: 106,
         leading: TextButton.icon(
-          onPressed: _disconnecting ? null : _returnToConnect,
+          onPressed: _disconnecting ? null : _returnToHome,
           icon: const Icon(Icons.arrow_back, size: 23),
           label: const Text('返回', style: TextStyle(fontSize: 17)),
         ),

@@ -1,12 +1,13 @@
-import 'package:flutter/foundation.dart' show ValueNotifier;
 import 'package:flutter/material.dart';
 
+import 'app_bootstrap_page.dart';
 import 'app_mode.dart';
+import 'auth_pages.dart';
 import 'campus_environment.dart';
 import 'credential_store.dart';
+import 'home_page.dart';
 import 'jwxt_client.dart';
 import 'schedule_cache_store.dart';
-import 'sync_cooldown.dart';
 
 /// 首页的页面栈会保留课表、成绩与设置页各自的 State。设置写入本地文件后，
 /// 通过统一修订号通知其它仍在内存中的页面立即重新读取，避免必须重启或重新登录。
@@ -127,10 +128,6 @@ Future<StoredAccount?> pickSavedEducationAccount(
   );
 }
 
-/// 由 main.dart 注入：根据学号和是否有本地数据，构建切换账号后的目标页面。
-/// 用回调打破 common.dart 对 HomePage / VpnSetupPage 的循环依赖。
-Widget Function(String studentId, bool hasLocalData)? buildAccountDestination;
-
 /// 切换仅影响当前展示与教务 Cookie；校园加速器不会断开。
 Future<void> switchToSavedAccount(
   BuildContext context, {
@@ -153,32 +150,28 @@ Future<void> switchToSavedAccount(
   final profile = await UserDataCacheStore.loadProfile(account.username);
   if (!context.mounted) return;
   final hasLocalData = cached != null || profile != null;
-  final destination = buildAccountDestination!(account.username, hasLocalData);
+  // 原先这里走 buildAccountDestination 注入回调，现改为编译期直接依赖：
+  // 依赖方向固定为 common → pages，由本文件单向导入各页面即可。
+  // 不再需要运行时可空的函数指针（漏注入会在运行时才崩，且测试覆盖不到）。
+  final destination = hasLocalData
+      ? HomePage(studentId: account.username)
+      : VpnSetupPage(
+          mode: AppMode.education,
+          initialNotice: '您之前未进行过认证，本地暂无存储，请认证后保存课表',
+        );
   Navigator.of(context).pushAndRemoveUntil(
     MaterialPageRoute(builder: (_) => destination),
     (_) => false,
   );
 }
 
-/// 由 main.dart 注入：构建加速器认证页（VpnSetupPage）。
-/// 用回调打破 common/页面 对 VpnSetupPage 的循环依赖。
-Widget Function({
-  required AppMode mode,
-  String? initialNotice,
-  GradeSyncScope gradeSyncScope,
-  bool syncSchedules,
-  bool forceScheduleSync,
-  bool fetchAllSchedules,
-  String? scheduleTerm,
-  String? gradeTerm,
-  bool syncGrades,
-})? buildVpnSetupPage;
-
-/// 由 main.dart 注入：退出登录/删除账号后回到启动页（AppBootstrapPage）。
-void Function(BuildContext context)? navigateToBootstrap;
-
-/// 由 main.dart 注入：构建教务首页（HomePage），登录成功后跳转用。
-Widget Function(String studentId, String? initialNotice)? buildHomePage;
+/// 退出登录/删除账号后回到启动页（AppBootstrapPage）。
+void navigateToBootstrap(BuildContext context) {
+  Navigator.of(context).pushAndRemoveUntil(
+    MaterialPageRoute(builder: (_) => const AppBootstrapPage()),
+    (_) => false,
+  );
+}
 
 /// 课表页与成绩页共用的加速器按钮逻辑：在线则登出，离线则跳认证页。
 Future<void> handleCampusAcceleratorAction(

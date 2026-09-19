@@ -9,7 +9,7 @@ import 'app_settings.dart';
 // ==================== 更新检测 ====================
 
 /// 当前应用版本（与 pubspec.yaml 保持一致）。
-const String currentAppVersion = '1.0.9';
+const String currentAppVersion = '1.1.0';
 
 /// 比较版本号 a 与 b：a>b 返回正数，a<b 返回负数，相等返回 0。
 int compareVersions(String a, String b) {

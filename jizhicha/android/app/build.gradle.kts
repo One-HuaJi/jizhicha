@@ -37,7 +37,9 @@ val rustRemapFlags = listOf(
 
 android {
     namespace = "com.one.huaji"
-    compileSdk = flutter.compileSdkVersion
+    // 编译目标显式升到 37（Android 17）：只影响编译期能看到哪些 API 与弃用告警，
+    // 不改变运行时行为。Flutter 3.44.8 默认仍是 36，所以这里不跟默认走。
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -51,6 +53,10 @@ android {
         // Android 8.0 (API 26) is the minimum supported platform. This is
         // also the first Android version used by the mobile VPN service.
         minSdk = 26
+        // 运行时 targetSdk 刻意保持 Flutter 默认（当前 36），不跟着 compileSdk 升到 37。
+        // Android 17 对 targetSdk 37 的应用有若干**强制**行为变更（RemoteViews 位图内存
+        // 上限超限直接崩溃、新增 ACCESS_LOCAL_NETWORK 运行时权限、后台音频限制等），
+        // 必须先在 Android 17 真机逐项回归通过再升，否则升级动作本身就会引入崩溃。
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -184,5 +190,63 @@ val rustAndroidBuildTasks = listOf(
 tasks.configureEach {
     if (name.startsWith("merge") && name.endsWith("JniLibFolders")) {
         dependsOn(rustAndroidBuildTasks)
+    }
+}
+
+// ==================== 只打包真机 arm64 ====================
+//
+// 用户要求：只发 arm64 真机包，不发布模拟器版本。
+//
+// ⚠️ 为什么需要这段：`flutter build apk --target-platform android-arm64`
+// **不够** —— 它只限制 Flutter 自己的 libflutter/libapp，而：
+//   - Rust 产物 `jniLibs/*/libhuse_vpn_mobile_ffi.so` 有三套 ABI；
+//   - ONNX Runtime 的预编译 AAR 自带 arm64-v8a / armeabi-v7a / x86 / x86_64；
+// 两者都会在 merge 阶段被无条件并进 APK。实测三套 ABI 全在（84MB）。
+//
+// 也试过另外两种写法，都不行：
+//   - `defaultConfig.ndk.abiFilters`：AGP 9 下不参与 merge 过滤；
+//   - `splits.abi`：与 Flutter Gradle 插件已设的 abiFilters 直接冲突
+//     （EvalIssueException: Conflicting configuration）。
+//   - `androidComponents.onVariants { it.ndk.abiFilters }`：AGP 9 新 DSL 里
+//     没有 `ndk` 属性（Unresolved reference）。
+//
+// 因此改为在 merge 之后、打包之前**删除非 arm64 的 so 目录**。
+// 这样与 AGP 版本无关，且不触碰 Flutter/插件的既有配置。
+//
+// ⚠️ 注意：必须挂到 `merge*NativeLibs`（而不是 JniLibFolders），
+// 因为 ONNX 的 so 是在 NativeLibs 阶段才从 AAR 解出来的。
+val keepAbis = setOf("arm64-v8a")
+
+fun stripNonArm64NativeLibs(dir: File) {
+    val jniRoot = File(dir, "out/lib")
+    if (!jniRoot.isDirectory) return
+    jniRoot.listFiles()?.forEach { abiDir ->
+        if (abiDir.isDirectory && abiDir.name !in keepAbis) {
+            abiDir.deleteRecursively()
+        }
+    }
+}
+
+// 只保留 arm64：在 merge 之后、打包之前删掉其它 ABI 的 so。
+//
+// 实际目录形如：
+//   build/app/intermediates/merged_native_libs/release/mergeReleaseNativeLibs/out/lib/<abi>/
+// 这里直接从任务自己的输出目录推导，避免手写路径出错。
+tasks.configureEach {
+    if (name.startsWith("merge") && name.endsWith("NativeLibs")) {
+        doLast {
+            val taskDir = layout.buildDirectory
+                .dir("intermediates/merged_native_libs/release/$name")
+                .get().asFile
+            val jniRoot = File(taskDir, "out/lib")
+            logger.lifecycle("[abi-filter] $name -> ${jniRoot.absolutePath} exists=${jniRoot.isDirectory}")
+            if (!jniRoot.isDirectory) return@doLast
+            jniRoot.listFiles()?.forEach { abiDir ->
+                if (abiDir.isDirectory && abiDir.name !in keepAbis) {
+                    logger.lifecycle("[abi-filter] removing ${abiDir.name}")
+                    abiDir.deleteRecursively()
+                }
+            }
+        }
     }
 }
