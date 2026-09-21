@@ -1,5 +1,6 @@
 import 'dart:async' show runZonedGuarded;
 
+import 'package:flutter/foundation.dart' show debugPrint, kReleaseMode;
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
@@ -12,7 +13,6 @@ import 'theme.dart';
 void main() {
   // 用 runZonedGuarded 包一层：所有未捕获的异步异常都会进 zoneError，
   // 避免被 Flutter 静默吞掉导致 UI 看起来"卡死未响应"。
-  // VS Code 调试控制台会直接看到 stack trace，下次卡住能精确定位。
   runZonedGuarded(
     () {
       WidgetsFlutterBinding.ensureInitialized();
@@ -22,13 +22,9 @@ void main() {
       };
       // 给环境控制器注入真实的内网探测与会话重置实现。
       //
-      // ⚠️ 探测用的是**教务端点**（172.20.63.226/jsxsd/）而不是 ns.huse.cn。
-      // 真机实测（Redmi K80 Pro / 校园网）：同一个时刻
-      //     curl http://172.20.63.226/jsxsd/  → 200
-      //     curl http://ns.huse.cn/            → 000（完全不可达）
-      // 即 ns.huse.cn 在这里根本不通，用它当在线判据会让状态机永远
-      // 停在 tunnelUp、UI 一直显示"离线模式"。
-      // 教务端点才是用户真正要用的那个，探它才有意义。
+      // 探测使用**教务端点**而不是校内域名服务器：实测同一时刻教务端点可达、
+      // 校内域名服务器可能完全不可达。用后者当在线判据会让状态机永远停在
+      // tunnelUp、UI 一直显示"离线模式"。教务端点才是用户真正要用的那个。
       campusEnvironment.configure(
         probe: ({required Duration timeout}) =>
             JwxtClient().checkIntranetReachable(timeout: timeout),
@@ -38,6 +34,13 @@ void main() {
       runApp(const MyApp());
     },
     (e, st) {
+      // Release builds must not emit full exception text + stack traces:
+      // uncaught network/file errors can contain URLs, local paths, student IDs
+      // or backend response text. Keep diagnostics minimal outside debug builds.
+      if (kReleaseMode) {
+        debugPrint('[zoneError] uncaught async error (details suppressed in release)');
+        return;
+      }
       debugPrint('=== [zoneError] 未捕获异步异常: $e');
       debugPrint('$st');
     },

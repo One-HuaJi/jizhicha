@@ -305,7 +305,7 @@ class _ZongcePageState extends State<ZongcePage> {
     final sid = _studentIdCtrl.text.trim();
     final nm = _nameCtrl.text.trim();
     if (sid.isEmpty || nm.isEmpty) {
-      _toast('请先填写学号与姓名，导入时要用它们筛选');
+      _toast('请先填写学号与姓名，导入时要按它们匹配体测成绩');
       return;
     }
 
@@ -324,8 +324,8 @@ class _ZongcePageState extends State<ZongcePage> {
         dialogTitle: '选择体测成绩表（.xlsx）',
         type: FileType.any,
       );
-    } catch (e) {
-      _toast('无法打开文件选择器：$e');
+    } catch (_) {
+      _toast('无法打开文件选择器，请重试');
       return;
     }
     if (picked.isEmpty) return;
@@ -398,7 +398,12 @@ class _ZongcePageState extends State<ZongcePage> {
     } catch (e) {
       if (!mounted) return;
       setState(() => _busy = false);
-      _toast('导入失败：$e', dur: const Duration(seconds: 4));
+      // 上面主动 throw 的都是面向用户的中文说明（文件格式、缺列等），
+      // 可以原样展示；其它异常（IO/解码）可能是原始堆栈，只给通用提示。
+      _toast(
+        e is String ? e : '导入失败，请确认这是体测总成绩表（.xlsx）后重试',
+        dur: const Duration(seconds: 4),
+      );
     }
   }
 
@@ -459,7 +464,11 @@ class _ZongcePageState extends State<ZongcePage> {
       final fileName = '综测加减分自评表$safeName$stamp.docx';
 
       if (Platform.isAndroid) {
-        final dir = await getTemporaryDirectory();
+        // FileProvider exposes only cache/exports/ (not the complete cache
+        // tree). Keep shareable documents in that dedicated, short-lived dir.
+        final cache = await getTemporaryDirectory();
+        final dir = Directory('${cache.path}${Platform.pathSeparator}exports');
+        if (!await dir.exists()) await dir.create(recursive: true);
         final file = File('${dir.path}${Platform.pathSeparator}$fileName');
         await file.writeAsBytes(result.bytes, flush: true);
         if (!mounted) return;
@@ -483,10 +492,10 @@ class _ZongcePageState extends State<ZongcePage> {
           ? '（含 ${result.imageCount} 张证明图）'
           : '';
       _toast('已导出$imgTip：${file.path}', dur: const Duration(seconds: 4));
-    } catch (e) {
+    } catch (_) {
       if (!mounted) return;
       setState(() => _busy = false);
-      _toast('导出失败：$e', dur: const Duration(seconds: 4));
+      _toast('导出失败，请重试', dur: const Duration(seconds: 4));
     }
   }
 
@@ -519,8 +528,8 @@ class _ZongcePageState extends State<ZongcePage> {
         type: FileType.image,
         allowMultiple: true,
       );
-    } catch (e) {
-      _toast('无法打开图片选择器：$e');
+    } catch (_) {
+      _toast('无法打开图片选择器，请重试');
       return;
     }
     if (picked.isEmpty) return;
@@ -1471,8 +1480,9 @@ class _AcademicPickDialogState extends State<_AcademicPickDialog> {
             ),
             const SizedBox(height: 6),
             Text(
+              // 这里是普通 Text，不支持 Markdown；写 **粗体** 会原样显示出星号。
               '细则要求排除体育课、网络通识课、公共选修课、等级课程。'
-              '已自动判断并预勾选，请**核对**下面的列表——'
+              '已自动判断并预勾选，请核对下面的列表——'
               '判断依据是课程名与课程性质，可能与学院口径不同。',
               style: TextStyle(
                 fontSize: 11,
@@ -1636,7 +1646,11 @@ class _FitnessImportDialog extends StatelessWidget {
           onPressed: matches.length == 1
               ? () => Navigator.of(context).pop(matches.first)
               : null,
-          child: Text(matches.length == 1 ? '采用' : '多行请改用单条（见下）'),
+          // 多行匹配时这个按钮是禁用的，按不了；文案要说明"该怎么办"，
+          // 而不是旧版的"见下"（按钮上写"见下"用户找不到指向）。
+          child: Text(
+            matches.length == 1 ? '采用' : '请在下面选择正确的行',
+          ),
         ),
         if (matches.length > 1)
           ...matches.asMap().entries.map(

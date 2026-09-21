@@ -14,6 +14,27 @@ if (keystorePropertiesFile.exists()) {
 
 val allowDebugSigning = System.getenv("ALLOW_DEBUG_SIGNING") == "true"
 
+// 签名凭据：环境变量优先（CI 用），key.properties 仅作本地兼容回退，
+// 且按新约定只放非敏感的 storeFile / keyAlias。
+// 在这里（而不是在 buildTypes.release 内部）求值，是为了让「缺密钥」只在
+// 真的要打包 release 时才报错 —— 否则连 `flutter analyze`、单元测试、
+// `assembleDebug` 都会在配置阶段直接失败。
+fun signingSecret(env: String, property: String): String? =
+    System.getenv(env)?.takeIf { it.isNotBlank() }
+        ?: keystoreProperties.getProperty(property)?.takeIf { it.isNotBlank() }
+
+val releaseStoreFile = signingSecret("JIZHICHA_KEYSTORE_FILE", "storeFile")
+val releaseStorePassword = signingSecret("JIZHICHA_STORE_PASSWORD", "storePassword")
+val releaseKeyAlias = signingSecret("JIZHICHA_KEY_ALIAS", "keyAlias")
+val releaseKeyPassword = signingSecret("JIZHICHA_KEY_PASSWORD", "keyPassword")
+val hasReleaseKeystore = listOf(
+    releaseStoreFile,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+).all { !it.isNullOrBlank() }
+val debugSigningAllowed = allowDebugSigning && System.getenv("CI").isNullOrBlank()
+
 val localProperties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) file.inputStream().use { load(it) }
@@ -64,34 +85,46 @@ android {
 
     buildTypes {
         release {
-            val storeFilePath = keystoreProperties.getProperty("storeFile")
-            val storePassword = keystoreProperties.getProperty("storePassword")
-            val keyAlias = keystoreProperties.getProperty("keyAlias")
-            val keyPassword = keystoreProperties.getProperty("keyPassword")
-            val hasReleaseKeystore = listOf(
-                storeFilePath,
-                storePassword,
-                keyAlias,
-                keyPassword,
-            ).all { !it.isNullOrBlank() }
-
+            // 「缺密钥」的报错移到下面的 taskGraph 校验里：只在真的要打包 release
+            // 时才失败，避免配置阶段就炸掉 analyze / 单测 / assembleDebug。
             if (hasReleaseKeystore) {
                 val releaseSigning = signingConfigs.maybeCreate("release")
-                releaseSigning.storeFile = file(storeFilePath!!)
-                releaseSigning.storePassword = storePassword
-                releaseSigning.keyAlias = keyAlias
-                releaseSigning.keyPassword = keyPassword
+                releaseSigning.storeFile = file(releaseStoreFile!!)
+                releaseSigning.storePassword = releaseStorePassword
+                releaseSigning.keyAlias = releaseKeyAlias
+                releaseSigning.keyPassword = releaseKeyPassword
                 signingConfig = releaseSigning
-            } else if (allowDebugSigning) {
-                // 仅供本地内测；正式构建绝不能依赖 Debug 证书。
+            } else if (debugSigningAllowed) {
+                // 仅本地内测；CI 与正式发布绝不静默使用 Debug 证书。
                 signingConfig = signingConfigs.getByName("debug")
-            } else {
-                throw GradleException(
-                    "正式 Android Release 需要 android/key.properties 中的独立 release keystore；" +
-                        "若只是内测，请显式设置 ALLOW_DEBUG_SIGNING=true。",
-                )
             }
+            // 其余情况：保持未签名。真正打包 release 时由下面校验报错。
         }
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+}
+
+// 只有真的要产出 release 包时才要求签名凭据。
+// 这样 `flutter analyze`、`testDebugUnitTest`、`assembleDebug` 在没有密钥的
+// 干净 checkout / CI 上也能正常工作。
+gradle.taskGraph.whenReady {
+    val packagingRelease = allTasks.any { task ->
+        task.project.path == project.path &&
+            (
+                task.name.startsWith("assembleRelease") ||
+                    task.name.startsWith("bundleRelease") ||
+                    task.name.startsWith("packageRelease")
+                )
+    }
+    if (packagingRelease && !hasReleaseKeystore && !debugSigningAllowed) {
+        throw GradleException(
+            "正式 Android Release 需要 JIZHICHA_* signing 环境变量或 " +
+                "android/key.properties 中的独立 release keystore；" +
+                "CI 中禁止 ALLOW_DEBUG_SIGNING。",
+        )
     }
 }
 
@@ -99,6 +132,14 @@ kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
     }
+}
+
+dependencies {
+    // JVM 单测只覆盖纯函数（提醒时刻/跨周换算/格式解析），不依赖设备或 Android 框架。
+    testImplementation("junit:junit:4.13.2")
+    // Android 的 android.jar 里 org.json 是「抛异常的空壳」，单测里必须换成
+    // 真实实现，否则 JSONObject 一构造就抛 "not mocked"。
+    testImplementation("org.json:json:20250107")
 }
 
 flutter {

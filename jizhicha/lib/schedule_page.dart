@@ -306,7 +306,8 @@ class _SchedulePageState extends State<SchedulePage>
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              '预设学期已结束，请手动更改开学日期',
+              // 补上"去哪里改"：设置页里那个字段就叫「开学日期」。
+              '预设学期已结束。若本学期还没结束，请到设置里更新「开学日期」',
               style: TextStyle(
                 fontSize: 13,
                 color: colorScheme.onTertiaryContainer,
@@ -328,7 +329,8 @@ class _SchedulePageState extends State<SchedulePage>
   String _emptyMessageFor(String term) {
     return term == AcademicCalendar.latestTerm &&
             AcademicCalendar.isBeforeLatestTermQueryDate(DateTime.now())
-        ? '课表为空，可能是未开放查询'
+        // 旧版「可能是未开放查询」语气不定，且没给下一步。
+        ? '本学期课表还没开放查询，等学校发布后再试'
         : '暂无课程安排';
   }
 
@@ -1441,7 +1443,7 @@ class _SchedulePageState extends State<SchedulePage>
                             SnackBar(
                               content: Text(
                                 tables.isEmpty
-                                    ? '未找到表格'
+                                    ? '本页没有 <table> 表格'
                                     : '已复制 ${tables.length} 个表格',
                               ),
                             ),
@@ -1459,7 +1461,7 @@ class _SchedulePageState extends State<SchedulePage>
                           if (tt == null) {
                             if (!context.mounted) return;
                             ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('未找到 #timetable')),
+                              const SnackBar(content: Text('本页没有 id="timetable" 的表格')),
                             );
                             return;
                           }
@@ -2070,9 +2072,15 @@ class _SchedulePageState extends State<SchedulePage>
 
   Future<Directory> _scheduleExportDirectory() async {
     if (Platform.isWindows) {
-      final current = Directory.current.path;
-      final sep = Platform.pathSeparator;
-      final dir = Directory('$current$sep' + 'screen');
+      // 必须用 **exe 所在目录**，不能用 Directory.current。
+      // 双击 exe 时两者碰巧一致，但从快捷方式（"起始位置"不同）、开始菜单、
+      // 终端或 IDE 启动时 CWD 会是别处，导出会落到用户找不到的地方；CWD 不可写
+      // （如装在 Program Files）时 dir.create() 直接抛异常、导出失败。
+      // 与 zongce_page.dart 的 _exportDirectory() 保持同一约定。
+      final exeDir = File(Platform.resolvedExecutable).parent;
+      final dir = Directory(
+        '${exeDir.path}${Platform.pathSeparator}screen',
+      );
       if (!await dir.exists()) await dir.create(recursive: true);
       return dir;
     }
@@ -2153,8 +2161,10 @@ class _SchedulePageState extends State<SchedulePage>
       } finally {
         image.dispose();
       }
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('导出失败：$e')));
+    } catch (_) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('导出失败，请重试')),
+      );
     }
   }
 

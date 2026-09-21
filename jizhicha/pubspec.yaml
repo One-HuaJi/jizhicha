@@ -13,7 +13,10 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # Read more about Android versioning at https://developer.android.com/studio/publish/versioning
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.1.0+11000
+# v1.0.9 arm64 的 versionCode 是 12900（历史 split-per-abi 偏移）。
+# v1.1.0 当前只发单 arm64 包，最终 APK code 就是这里的值，必须严格大于 12900，
+# 否则 Android 会拒绝覆盖升级（INSTALL_FAILED_VERSION_DOWNGRADE）。
+version: 1.1.0+13000
 
 environment:
   sdk: ^3.12.2

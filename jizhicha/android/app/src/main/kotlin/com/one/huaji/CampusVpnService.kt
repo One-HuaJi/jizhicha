@@ -28,6 +28,9 @@ class CampusVpnService : VpnService() {
         private const val CHANNEL_ID = "huse-campus-vpn"
         private const val NOTIFICATION_ID = 2608
         private const val POLL_MS = 250L
+        // Once connected, native status only needs a health poll; polling at
+        // 250ms forever wastes battery and previously hid terminal stages.
+        private const val HEALTH_POLL_MS = 5_000L
         private const val VPN_PERMISSION_REQUEST = 2609
 
         @Volatile
@@ -60,10 +63,25 @@ class CampusVpnService : VpnService() {
 
         private fun updateStatus(value: String) {
             cachedStatus = value
+            // Status transitions are logged so a stuck "connecting" state can be
+            // diagnosed from logcat without a debugger attached.
+            android.util.Log.i("JizhichaVpn", "status=$value")
         }
     }
 
     private val handler = Handler(Looper.getMainLooper())
+
+    /// Native setup runs here, never on the main thread.
+    ///
+    /// `nativePrepare`/`nativeDisconnect` take native locks that an in-flight
+    /// task may still hold. Blocking the main thread would also block the
+    /// Flutter MethodChannel (`status`/`connect` replies are delivered on the
+    /// main looper), which made the UI hang forever at "正在连接".
+    private val workerThread = android.os.HandlerThread("CampusVpnNative").apply {
+        start()
+    }
+    private val worker = Handler(workerThread.looper)
+
     private var nativeStarted = false
     private var tun: ParcelFileDescriptor? = null
 
@@ -82,26 +100,59 @@ class CampusVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        android.util.Log.i("JizhichaVpn", "onStartCommand action=${intent?.action}")
         when (intent?.action) {
             ACTION_CONNECT -> {
                 startForeground(NOTIFICATION_ID, buildNotification("正在连接校园加速器"))
                 val username = intent.getStringExtra(EXTRA_USERNAME).orEmpty()
                 val password = intent.getStringExtra(EXTRA_PASSWORD).orEmpty()
                 val source = intent.getStringExtra(EXTRA_AUTH_SOURCE) ?: "SAM-all"
-                beginConnect(username, password, source)
+                // Off the main thread: native setup can block on native locks.
+                worker.post { beginConnect(username, password, source) }
             }
             ACTION_DISCONNECT -> disconnectAndStop()
         }
         return START_NOT_STICKY
     }
 
+    private fun statusJson(stage: String, error: String? = null): String {
+        return JSONObject().apply {
+            put("connected", false)
+            put("stage", stage)
+            if (!error.isNullOrBlank()) put("error", error)
+        }.toString()
+    }
+
+    /**
+     * One terminal path for every failed/ended connection attempt.
+     *
+     * Previously startForeground() happened before native work, but SAC/TLS/NC
+     * errors only updated cached status; the service, ongoing notification and
+     * 250ms poll could survive indefinitely. Preserve a non-connected error
+     * snapshot for Dart, then fully tear down the service.
+     */
+    private fun terminalFailure(stage: String, error: String?) {
+        handler.removeCallbacksAndMessages(null)
+        runCatching { nativeDisconnect() }
+        nativeStarted = false
+        closeTun()
+        updateStatus(statusJson(stage, error))
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
+        stopSelf()
+    }
+
     private fun beginConnect(username: String, password: String, source: String) {
         handler.removeCallbacksAndMessages(null)
         closeTun()
         nativeStarted = false
+        // `nativePrepare` already calls stop_all() internally; calling
+        // nativeDisconnect() here as well only added a second native lock round
+        // trip on the setup path.
         val result = nativePrepare(username, password, source)
+        android.util.Log.i("JizhichaVpn", "nativePrepare=$result")
         if (result != 0) {
-            updateStatus("{\"connected\":false,\"stage\":\"native_error\",\"error\":\"native prepare failed ($result)\"}")
+            terminalFailure("native_error", "native prepare failed ($result)")
             return
         }
         handler.post(pollForTun)
@@ -110,16 +161,35 @@ class CampusVpnService : VpnService() {
     private val pollForTun = object : Runnable {
         override fun run() {
             val statusText = runCatching { nativeStatusJson() }.getOrElse {
-                "{\"connected\":false,\"stage\":\"native_error\",\"error\":\"${it.message}\"}"
+                statusJson("native_error", it.message ?: "native status failed")
+            }
+            val status = runCatching { JSONObject(statusText) }.getOrElse {
+                terminalFailure("native_error", "native status JSON malformed")
+                return
             }
             updateStatus(statusText)
-            val status = runCatching { JSONObject(statusText) }.getOrNull()
-            when (status?.optString("stage")) {
-                "awaiting_tun" -> establishTun(status)
-                "connected", "tunnel_stopped", "heartbeat_error" -> {
-                    if (status.optBoolean("connected", false)) {
-                        updateNotification("校园加速器已连接")
-                    }
+            val stage = status.optString("stage")
+            val error = status.optString("error").takeIf { it.isNotBlank() }
+            when {
+                stage == "awaiting_tun" -> establishTun(status)
+                status.optBoolean("connected", false) -> {
+                    updateNotification("校园加速器已连接")
+                    // Keep a low-rate health poll so tunnel_stopped reaches Dart
+                    // and terminal cleanup; do not busy-poll a healthy tunnel.
+                    handler.postDelayed(this, HEALTH_POLL_MS)
+                }
+                stage == "heartbeat_error" -> {
+                    // NOT terminal: the native heartbeat backs off and restores
+                    // `connected` by itself once the gateway answers again.
+                    // Tearing the tunnel down here killed recoverable sessions.
+                    updateNotification("校园加速器连接不稳定，正在重试")
+                    handler.postDelayed(this, HEALTH_POLL_MS)
+                }
+                stage == "tunnel_stopped" -> {
+                    terminalFailure(stage, error ?: "校园加速器连接已停止")
+                }
+                stage.endsWith("_error") -> {
+                    terminalFailure(stage, error ?: "校园加速器连接失败")
                 }
                 else -> handler.postDelayed(this, POLL_MS)
             }
@@ -162,21 +232,23 @@ class CampusVpnService : VpnService() {
             updateNotification("校园加速器已连接")
             updateStatus(nativeStatusJson())
         } catch (error: Throwable) {
-            updateStatus(
-                "{\"connected\":false,\"stage\":\"adapter_error\",\"error\":${JSONObject.quote(error.message ?: "failed to establish Android accelerator")}}"
+            terminalFailure(
+                "adapter_error",
+                error.message ?: "failed to establish Android accelerator",
             )
-            handler.removeCallbacks(pollForTun)
-            nativeDisconnect()
         }
     }
 
     private fun disconnectAndStop() {
         handler.removeCallbacksAndMessages(null)
-        nativeDisconnect()
-        updateStatus(nativeStatusJson())
+        runCatching { nativeDisconnect() }
         nativeStarted = false
         closeTun()
+        // Explicit user disconnect should not leave a stale connected/error
+        // snapshot for the next Flutter activity instance.
+        updateStatus(statusJson("idle"))
         stopForeground(STOP_FOREGROUND_REMOVE)
+        getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
         stopSelf()
     }
 
@@ -185,10 +257,25 @@ class CampusVpnService : VpnService() {
         tun = null
     }
 
+    override fun onRevoke() {
+        // Android normally stopSelf()s after revoke, but explicit cleanup makes
+        // native/TUN/status behavior deterministic and avoids stale UI state.
+        disconnectAndStop()
+        super.onRevoke()
+    }
+
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
-        nativeDisconnect()
+        worker.removeCallbacksAndMessages(null)
+        workerThread.quitSafely()
+        runCatching { nativeDisconnect() }
+        nativeStarted = false
         closeTun()
+        // Do not leave a static connected=true snapshot after system teardown.
+        val current = runCatching { JSONObject(cachedStatus) }.getOrNull()
+        if (current?.optBoolean("connected", false) != false) {
+            updateStatus(statusJson("idle"))
+        }
         super.onDestroy()
     }
 

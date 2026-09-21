@@ -547,7 +547,7 @@ class JwxtClient {
               DioException(
                 requestOptions: e.requestOptions,
                 type: e.type,
-                error: '无法连接校园内网（$_hostAddress），请确认已连接校园加速器后重试',
+                error: '无法连接校园内网，请确认已连接校园加速器后重试',
                 stackTrace: e.stackTrace,
               ),
             );
@@ -624,7 +624,9 @@ class JwxtClient {
   /// HTTP packets then travel inside that verified encrypted tunnel.
   void _requireVerifiedCampusTunnel() {
     if (_vpnSourceAddress == null) {
-      throw '安全保护：未检测到经过网关身份校验的校园加速器隧道，请先重新连接加速器';
+      // 用户视角只需要知道"校园网没就绪、要重新连"，不需要"网关身份校验""隧道"
+      // 这些实现概念。
+      throw '校园网尚未就绪，请先连接校园加速器后重试';
     }
   }
 
@@ -861,7 +863,7 @@ class JwxtClient {
     if (!isRedirect || location.isEmpty) return initial;
     final absolute = Uri.tryParse(location);
     if (absolute?.hasScheme == true &&
-        absolute!.host != '172.20.63.226' &&
+        absolute!.host != _hostAddress &&
         absolute.host.toLowerCase() != 'jw.huse.cn') {
       return initial;
     }
@@ -1080,7 +1082,8 @@ class JwxtClient {
           (html.contains('登录') ||
               html.contains('login') ||
               html.contains('Logon'))
-          ? '（疑似会话失效，请退出重新登录）'
+          // 旧版「疑似会话失效」既有"疑似"又是术语，建议直接说结论与做法。
+          ? '（登录状态可能已失效，请退出后重新登录）'
           : '（未解析到课程，可能页面结构变化或本学期暂无课表）';
       throw '未查询到课程数据$hint';
     }
@@ -1128,9 +1131,11 @@ class JwxtClient {
       ),
     );
 
-    // 显式报错，避免静默吞掉
+    // 显式报错，避免静默吞掉。
+    // 不把 HTTP 状态码给用户看：普通用户不知道 500/404 意味着什么，
+    // 只给"可能要重新登录"这个可执行动作。（状态码仍可从 debug 日志排查。）
     if (res.statusCode != 200) {
-      throw '课表查询返回 HTTP ${res.statusCode}（可能会话失效，请退出重新登录）';
+      throw '课表查询失败，可能需要重新登录后再试';
     }
 
     var html = res.data.toString();

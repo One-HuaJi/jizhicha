@@ -5,14 +5,13 @@ import 'package:url_launcher/url_launcher.dart';
 import 'academic_calendar.dart';
 import 'app_settings.dart';
 import 'campus_environment.dart';
-import 'campus_vpn.dart';
 import 'common.dart';
 import 'credential_store.dart';
-import 'jwxt_client.dart';
 import 'schedule_cache_store.dart';
 import 'schedule_time.dart';
 import 'theme.dart';
 import 'update_check.dart';
+import 'widget_schedule_store.dart';
 
 // ==================== 设置页 ====================
 class SettingsPage extends StatefulWidget {
@@ -126,15 +125,16 @@ class _SettingsPageState extends State<SettingsPage> {
     if (!confirmed || !mounted) return;
     setState(() => _accountActionLoading = true);
     try {
-      await CampusVpnLauncher().logout();
-      await JwxtClient().resetSession();
+      // Keep native tunnel, VpnSession phase and JwxtClient source identity in
+      // one transition; direct launcher logout left UI online until a later poll.
+      await campusEnvironment.logout();
       if (!mounted) return;
       navigateToBootstrap(context);
-    } catch (error) {
+    } catch (_) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('退出登录失败：$error')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('退出登录失败，请重试')),
+        );
       }
     } finally {
       if (mounted) setState(() => _accountActionLoading = false);
@@ -147,11 +147,11 @@ class _SettingsPageState extends State<SettingsPage> {
     setState(() => _accountActionLoading = true);
     try {
       await switchToSavedAccount(context, currentStudentId: widget.studentId);
-    } catch (error) {
+    } catch (_) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('切换用户失败：$error')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('切换用户失败，请重试')),
+        );
       }
     } finally {
       if (mounted) setState(() => _accountActionLoading = false);
@@ -173,28 +173,35 @@ class _SettingsPageState extends State<SettingsPage> {
     }
     setState(() => _accountActionLoading = true);
     try {
-      // 必须先断开：logout 需要读取当前账号的安全存储，以便静默清理学校网关
-      // 可能遗留的会话；删除后再执行会失去该凭据。
-      await CampusVpnLauncher().logout();
-      await JwxtClient().resetSession();
+      // Must disconnect before deleting credentials so the active tunnel/session
+      // is cleared while current account context still exists.
+      await campusEnvironment.logout();
       final credentialsDeleted = await CredentialStore.deleteAll();
       final userDataDeleted = await UserDataCacheStore.clearAll();
       final scheduleDeleted = await ScheduleCacheStore.clearAll();
+      // Widget data is a global file, not account-namespaced. Clear JSON and
+      // alarms as part of the deletion contract to avoid prior-user disclosure.
+      await WidgetScheduleStore.clear();
       final failures = <String>[
-        if (!credentialsDeleted) '加密账号',
-        if (!userDataDeleted) '成绩与课表快照',
-        if (!scheduleDeleted) '旧版课表缓存',
+        // 用用户能理解的名称，而不是内部存储名（UserDataCacheStore 之类）。
+        if (!credentialsDeleted) '保存的账号密码',
+        if (!userDataDeleted) '成绩与课表',
+        if (!scheduleDeleted) '旧课表缓存',
       ];
       if (failures.isNotEmpty) {
-        throw '无法彻底删除：${failures.join('、')}';
+        throw '以下数据未能删除：${failures.join('、')}。请重试；'
+            '若始终失败，可在系统设置中清除稽之查的应用数据';
       }
       if (!mounted) return;
       navigateToBootstrap(context);
     } catch (error) {
       if (mounted) {
+        // 上面主动 throw 的是面向用户的字符串，可以原样展示；
+        // 其它来源的异常（logout/存储层）可能是原始堆栈，不外显。
+        final text = error is String ? error : '删除本地信息失败，请重试';
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text('删除本地信息失败：$error')));
+        ).showSnackBar(SnackBar(content: Text(text)));
       }
     } finally {
       if (mounted) setState(() => _accountActionLoading = false);
@@ -641,7 +648,8 @@ class _SettingsPageState extends State<SettingsPage> {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 8),
             child: Text(
-              '该项目处于测试阶段，发现bug属于特性，请多多反馈或提出issue',
+              // 原文案「发现 bug 属于特性」是玩笑话且中英混排，正式发布不合适。
+              '本项目仍在持续完善中。遇到问题或想提建议，欢迎在 GitHub 提交 Issue。',
               style: TextStyle(
                 fontSize: 12,
                 color: colorScheme.onSurfaceVariant,

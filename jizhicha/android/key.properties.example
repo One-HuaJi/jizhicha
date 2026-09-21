@@ -1,6 +1,7 @@
-# Copy this file to android/key.properties and fill in local-only values.
-# Never commit android/key.properties or the keystore file.
+# Optional local compatibility file. Never commit this file or the keystore.
+# Keep only non-secret location/alias values here. Provide passwords via user/CI environment:
+#   JIZHICHA_KEYSTORE_FILE, JIZHICHA_KEY_ALIAS,
+#   JIZHICHA_STORE_PASSWORD, JIZHICHA_KEY_PASSWORD
+# Environment values take precedence over this file.
 storeFile=../keystore/jizhicha-release.jks
-storePassword=REPLACE_WITH_YOUR_STORE_PASSWORD
 keyAlias=jizhicha
-keyPassword=REPLACE_WITH_YOUR_KEY_PASSWORD

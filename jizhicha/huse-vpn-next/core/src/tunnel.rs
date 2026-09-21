@@ -1,7 +1,8 @@
 //! Windows layer-3 forwarding for the Gateway NC tunnel.
 
 use crate::error::{HuseVpnError, Result};
-use crate::nc::{build_nc_data_frame, parse_nc_data_frames, NcAuthReply};
+use crate::nc::{build_nc_data_frame, NcAuthReply, NcFrameAssembler};
+use crate::packet_trace_enabled;
 use crate::tls::RawTlsClient;
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -137,7 +138,10 @@ async fn run_target_tunnel_inner(
                 Err(_) => continue,
             };
             packet_count += 1;
-            if packet_count <= 24 || packet_count % 100 == 0 {
+            // Packet telemetry contains real source/destination addresses
+            // (including internal campus destinations). Keep it strictly
+            // opt-in so release builds cannot leak network topology.
+            if packet_trace_enabled() && (packet_count <= 24 || packet_count % 100 == 0) {
                 eprintln!(
                     "HUSE VPN uplink packet: count={}, ip_len={}, nc_frame_len={}, {}",
                     packet_count,
@@ -151,10 +155,11 @@ async fn run_target_tunnel_inner(
     };
 
     let downlink = async {
+        // Reassemble NC frames that may be split across TLS record boundaries.
+        let mut assembler = NcFrameAssembler::new();
         loop {
             let record = tls_reader.read_record().await?;
-            eprintln!("HUSE VPN downlink TLS plaintext: len={}", record.len());
-            for packet in parse_nc_data_frames(&record)? {
+            for packet in assembler.feed(&record)? {
                 // 下行同理：坏包丢弃，不中断整条隧道。
                 if validate_ip_packet(&packet).is_err() {
                     continue;
@@ -341,6 +346,8 @@ fn validate_ip_packet(packet: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Packet telemetry is opt-in: it prints real addresses, so a release build must
+/// never emit it unless someone explicitly asks for diagnostics.
 fn packet_summary(packet: &[u8], virtual_ip: Ipv4Addr) -> String {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
         return format!(
@@ -351,11 +358,11 @@ fn packet_summary(packet: &[u8], virtual_ip: Ipv4Addr) -> String {
 
     let source = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
     let destination = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    let destination_class = match destination.octets() {
-        [172, 20, 63, 226] => "jw",
-        [222, 243, 204, 25] => "library",
-        [172, 19, 0, 192] | [172, 19, 0, 200] => "campus",
-        _ => "other",
+    // Classify without embedding concrete campus addresses in the source tree.
+    let destination_class = if destination.is_private() {
+        "private"
+    } else {
+        "public"
     };
     format!(
         "ipv4_src={}, dst={}, ipv4_src_virtual={}, dst_class={}, proto={}",

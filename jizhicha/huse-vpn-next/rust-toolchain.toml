@@ -1,0 +1,12 @@
+[toolchain]
+# Release toolchain pinned after v1.1.0 audit.  Keep Rust/NDK ABI output stable
+# across local builds and CI; update deliberately with a release note and full ABI regression.
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = [
+  "x86_64-pc-windows-msvc",
+  "aarch64-linux-android",
+  "armv7-linux-androideabi",
+  "x86_64-linux-android",
+]

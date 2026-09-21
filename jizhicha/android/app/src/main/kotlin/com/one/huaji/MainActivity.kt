@@ -77,6 +77,10 @@ class MainActivity : FlutterActivity() {
                         refreshWidget()
                         result.success(true)
                     }
+                    "clearWidgetData" -> {
+                        clearWidgetData()
+                        result.success(true)
+                    }
                     "requestPinWidget" -> {
                         requestPinWidget(result)
                     }
@@ -178,16 +182,25 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun refreshWidget() {
+        // 与「开机 / 应用更新」路径共用同一份刷新实现（AppWidget.refreshAll），
+        // 避免两处各抄一遍 widgetId 遍历后行为漂移。
+        AppWidget.refreshAll(this)
+        AppWidget.scheduleNextReminder(this)
+    }
+
+    /**
+     * Privacy cleanup for account deletion / switch to an account without a
+     * schedule. Widget JSON is a global app file, so leaving it behind would
+     * show the prior student's course, teacher and room on the launcher.
+     */
+    private fun clearWidgetData() {
         try {
-            val manager = android.appwidget.AppWidgetManager.getInstance(this)
-            val component = android.content.ComponentName(this, AppWidget::class.java)
-            val ids = manager.getAppWidgetIds(component)
-            for (id in ids) {
-                AppWidget.updateWidget(this, manager, id)
-            }
-            AppWidget.scheduleNextReminder(this)
+            val flutterDir = getDir("flutter", MODE_PRIVATE)
+            java.io.File(flutterDir, "widget_schedule.json").delete()
         } catch (_: Exception) {
         }
+        AppWidget.cancelReminder(this)
+        refreshWidget()
     }
 
     private fun requestPinWidget(result: MethodChannel.Result) {

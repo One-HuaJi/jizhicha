@@ -628,6 +628,19 @@ void main() {
       };
     }
 
+    test('模板元数据已中性化，不能把作者或编辑器身份打进 APK', () {
+      final parts = unzip(tpl);
+      final core = utf8.decode(parts['docProps/core.xml']!);
+      final app = utf8.decode(parts['docProps/app.xml']!);
+      final custom = utf8.decode(parts['docProps/custom.xml']!);
+
+      expect(core, contains('<dc:creator>稽之查</dc:creator>'));
+      expect(core, contains('<cp:lastModifiedBy>稽之查</cp:lastModifiedBy>'));
+      expect(app, contains('<Application>稽之查</Application>'));
+      // 不保留原办公软件 build、文档 GUID 等可关联来源的 custom property。
+      expect(custom, isNot(contains('lpwstr')));
+    });
+
     test('保留模板的全部部件（不被精简掉）', () async {
       final r = await buildZongceDocx(filled(), templateBytes: tpl);
       final parts = unzip(r.bytes);
