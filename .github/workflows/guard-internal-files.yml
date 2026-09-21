@@ -110,13 +110,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # 必须固定到与本仓库 pubspec.lock 相同的 Flutter 版本。
+      # intl / matcher / meta / test_api / vector_math 这几个是被 Flutter SDK
+      # 自身锁定的包，跟着 `channel: stable` 走会在 SDK 一升级时就让
+      # `--enforce-lockfile` 失败 —— 那是 SDK 版本差异，不是依赖漂移。
+      # 版本与 jizhicha/.metadata 记录的 revision 对应（058e0af2c2 / 3.44.8）。
       - uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.44.8'
           channel: stable
       - name: Flutter lockfile is respected
         working-directory: jizhicha
         run: flutter pub get --enforce-lockfile
-      - uses: dtolnay/rust-toolchain@stable
+      # 与 jizhicha/huse-vpn-next/rust-toolchain.toml 保持一致，
+      # 避免 CI 用另一版 Rust 校验出与发布工具链无关的差异。
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.98.1'
       - name: Cargo workspace metadata is locked
         working-directory: jizhicha/huse-vpn-next
         run: cargo metadata --locked --format-version 1 > /dev/null
