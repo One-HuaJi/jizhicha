@@ -293,8 +293,7 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
         // 已经等了 45 秒还没通，说明这次确实没能就绪。文案要给出**下一步**
         // 而不是制造焦虑：隧道是好的，再点一次通常就好（网关那边可能刚
         // 完成准备）。
-        customMessage: '校园网已连接，但学校教务服务器还没准备好。'
-            '请稍等片刻再点一次「连接校园网」，或先进入校园导航使用其它服务',
+        customMessage: '校方握手失败，请再试一次',
       );
     }
     if (!mounted) return;
@@ -330,7 +329,7 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
     final studentId = _idCtrl.text.trim();
     final password = _passwordCtrl.text;
     if (studentId.isEmpty || password.isEmpty) {
-      setState(() => _error = '请输入学号和加速器密码');
+      setState(() => _error = '请输入学号和加速器密码（默认为身份证后六位）');
       return;
     }
     final selectedMode = targetMode ?? widget.mode;
@@ -470,7 +469,11 @@ class _VpnSetupPageState extends State<VpnSetupPage> {
                         const SizedBox(width: 12),
                         Expanded(
                           child: Text(
-                            '手机端界面已就绪，Android 系统网络隧道引擎正在接入。当前 APK 可用于体验首页和教务流程，加速器连接功能暂不可用。',
+                            // 这个分支只在非 Windows、非 Android（实际是 Linux）
+                            // 出现。VPN 核心只为 Windows / Android 编译，所以
+                            // 这里说"不支持"是准确的；原文案"Android 隧道引擎
+                            // 正在接入"是 Android 尚未完成时的残留，已过时。
+                            '当前平台暂不支持校园加速器功能。如需在校园外访问教务、图书馆等服务，请在 Windows 或 Android 上使用。',
                             style: TextStyle(
                               color: colorScheme.onSurfaceVariant,
                               height: 1.45,
@@ -922,7 +925,7 @@ class _EducationPasswordRecoveryPageState
     final account = _verifiedAccount;
     final identity = _identityCtrl.text.trim();
     if (account == null) {
-      setState(() => _error = '账号验证会话已失效，请返回上一步重新验证');
+      setState(() => _error = '验证已超时，请返回上一步重新验证');
       return;
     }
     if (identity.length < 4) {
@@ -1309,8 +1312,10 @@ class _EducationPasswordRecoveryPageState
           ),
           child: Text(
             _localCredentialsInvalidated
-                ? '旧教务密码已从本地删除。请返回登录页，手动输入身份证后六位临时密码；临时密码不会保存。登录后请按提示设置至少 8 位且同时包含字母、数字的新密码。'
-                : '学校已完成重置，但本地安全存储清理未能确认。应用仍会禁止保存 6 位数字临时密码；请返回后不要选择任何旧账号密码，并尽快完成强制改密。',
+                ? '旧教务密码已从本机删除。请返回登录页手动输入身份证后六位临时密码（不会被保存），'
+                    '登录后请设置至少 8 位、同时包含字母和数字的新密码。'
+                : '学校已完成重置，但本机旧密码未能确认清除。请手动输入身份证后六位登录，'
+                    '不要选用已保存的旧密码；登录后请尽快设置新密码。',
           ),
         ),
         const SizedBox(height: 22),
@@ -1841,11 +1846,13 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
         });
       }
       await _refreshCaptcha(clearError: false);
-    } catch (error) {
+    } catch (_) {
       if (mounted) {
         setState(() {
           _notice = null;
-          _error = '无法打开忘记密码流程：$error';
+          // 不要把原始异常抛给用户：它可能是英文堆栈或 DioException，
+          // 既看不懂也可能带内部地址。只给可执行的下一步。
+          _error = '无法打开忘记密码流程，请重试；若多次失败请联系作者';
         });
       }
     } finally {
@@ -1974,10 +1981,12 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
             await CredentialStore.clearEducationPasswordResetPending(studentId);
             _passwordResetPendingInMemory = false;
           } else if (!saved) {
-            credentialNotice = '当前密码不符合最终强密码规则或安全存储写入失败，未保存到本地';
+            // 走到这里说明 maySave 为真 —— 密码规则已经满足，失败原因只可能是
+            // 安全存储写入失败。旧文案把两个原因并列，用户无法分辨。
+            credentialNotice = '密码未能保存到本机，请稍后重试';
           }
         } else {
-          credentialNotice = '当前使用的是临时密码，已禁止保存；请尽快设置最终新密码';
+          credentialNotice = '当前是临时密码，不会被保存。请登录后尽快设置新密码';
         }
         await _loadSavedAccounts();
       }
@@ -1999,9 +2008,11 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
       } catch (syncError) {
         if (!mounted) return;
         final raw = '$syncError';
+        // 「更新冷却中，还需 X 后重试」是我们自己生成的提示（含剩余时间），
+        // 可以直接展示；其它异常可能是原始堆栈，不外显。
         final syncNotice = raw.contains('更新冷却中')
             ? '已登录，$raw；稍后重试更新'
-            : '已登录，但数据更新失败：$raw；稍后可在课表或成绩页面重试更新';
+            : '已登录，但数据更新失败，稍后可在课表或成绩页面重试更新';
         final completeNotice = credentialNotice == null
             ? syncNotice
             : '$syncNotice；$credentialNotice';
@@ -2062,14 +2073,18 @@ class _EducationLoginPageState extends State<EducationLoginPage> {
             MaterialPageRoute(
               builder: (_) => HomePage(
                 studentId: studentId,
-                initialNotice:
-                    '已登录，但本次离线数据同步未完成：$error；稍后可在课表或成绩页面重试更新',
+                // 不把 $error 原始异常贴给用户；同步失败的具体原因
+                // 可以在课表/成绩页重试时看到更明确的提示。
+                initialNotice: '已登录，但本次数据同步未完成，'
+                    '稍后可在课表或成绩页面重试更新',
               ),
             ),
             (_) => false,
           );
         } else {
-          setState(() => _error = '$error');
+          // jwxt_client 抛的是面向用户的中文说明（如"请检查教务密码和验证码"），
+          // 可以原样展示；其它异常（网络层/Dio）可能是原始堆栈，不外显。
+          _error = error is String ? error : '教务登录失败，请重试';
           _captchaCtrl.clear();
           await _refreshCaptcha(clearError: false);
         }

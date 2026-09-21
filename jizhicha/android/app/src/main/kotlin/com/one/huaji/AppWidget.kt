@@ -4,6 +4,7 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -52,6 +53,25 @@ class AppWidget : AppWidgetProvider() {
         /// 保留原签名：自行读盘后转调带参重载。
         fun updateWidget(context: Context, manager: AppWidgetManager, widgetId: Int) {
             updateWidget(context, manager, widgetId, readJson(context), readSettings(context))
+        }
+
+        /// 刷新全部已添加的小组件实例。
+        ///
+        /// 抽出来是为了让「开机 / 应用更新」路径也能复用同一份刷新逻辑，
+        /// 避免在接收器里再抄一遍 widgetId 遍历。
+        fun refreshAll(context: Context) {
+            try {
+                val manager = AppWidgetManager.getInstance(context)
+                val component = ComponentName(context, AppWidget::class.java)
+                // 读盘只做一次，多个实例共用同一份数据。
+                val json = readJson(context)
+                val settings = readSettings(context)
+                for (id in manager.getAppWidgetIds(component)) {
+                    updateWidget(context, manager, id, json, settings)
+                }
+            } catch (_: Exception) {
+                // 刷新失败不影响提醒重排。
+            }
         }
 
         fun updateWidget(
@@ -126,7 +146,14 @@ class AppWidget : AppWidgetProvider() {
         /// 连堂课必然漏提醒。
         fun scheduleNextReminder(context: Context) {
             try {
-                val json = readJson(context) ?: return
+                // Missing/corrupt widget JSON means account data was removed or
+                // no longer usable. Cancel the old PendingIntent before returning;
+                // otherwise an already scheduled reminder can expose prior-user
+                // course/teacher/room information after logout/data deletion.
+                val json = readJson(context) ?: run {
+                    cancelReminder(context)
+                    return
+                }
                 val settings = readSettings(context)
                 if (!settings.optBoolean("reminderEnabled", true)) {
                     cancelReminder(context)
@@ -216,12 +243,26 @@ class AppWidget : AppWidgetProvider() {
         }
 
         private fun reminderTime(next: Course, minutes: Int): Long? {
-            val dayOffset = (next.day - todayIso() + 7) % 7
+            return reminderTriggerAt(next, minutes, todayIso(), Calendar.getInstance())
+        }
+
+        /// 可注入「今天」与基准时刻的提醒时刻计算。
+        ///
+        /// 真实调用点只传系统时钟（见上面的 `reminderTime`），行为与改造前完全一致；
+        /// 拆出参数是为了让「提醒时刻是否已过」这类边界能在 JVM 单测里确定复现
+        /// —— §9.1 的两个提醒 bug 正出在这段逻辑里。
+        internal fun reminderTriggerAt(
+            next: Course,
+            minutes: Int,
+            today: Int,
+            base: Calendar,
+        ): Long? {
+            val dayOffset = (next.day - today + 7) % 7
             val parts = next.start.split(":")
             if (parts.size < 2) return null
             val h = parts[0].toIntOrNull() ?: return null
             val m = parts[1].toIntOrNull() ?: return null
-            val classTime = Calendar.getInstance().apply {
+            val classTime = (base.clone() as Calendar).apply {
                 add(Calendar.DAY_OF_YEAR, dayOffset)
                 set(Calendar.HOUR_OF_DAY, h)
                 set(Calendar.MINUTE, m)
@@ -231,7 +272,7 @@ class AppWidget : AppWidgetProvider() {
             return classTime.timeInMillis - minutes * 60_000L
         }
 
-        private data class Course(
+        internal data class Course(
             val day: Int,
             val start: String,
             val name: String,
@@ -240,13 +281,13 @@ class AppWidget : AppWidgetProvider() {
             val weeks: List<Int>,
         )
 
-        private data class ReminderTarget(
+        internal data class ReminderTarget(
             val course: Course,
             val triggerAt: Long,
         )
 
         /// 解析全部课程（不做周次过滤），由调用方按各自口径筛选。
-        private fun parseCourses(json: JSONObject): List<Course> {
+        internal fun parseCourses(json: JSONObject): List<Course> {
             val courses = json.optJSONArray("courses") ?: return emptyList()
             val all = ArrayList<Course>(courses.length())
             for (i in 0 until courses.length()) {
@@ -275,23 +316,36 @@ class AppWidget : AppWidgetProvider() {
         /// 课程是否在 [targetWeek] 这周上。
         /// weeks 为空表示 Dart 侧未能解析出周次，按「每周都有」处理：宁可多显示一节
         /// 课，也不要让学生因脏数据漏掉一节课。
-        private fun runsInWeek(course: Course, targetWeek: Int): Boolean {
+        internal fun runsInWeek(course: Course, targetWeek: Int): Boolean {
             return course.weeks.isEmpty() || targetWeek in course.weeks
         }
 
         /// 跨周换算：7 天前瞻窗口会落到下一周（例如周日看明天周一），此时必须用
         /// week+1 过滤单双周课程，否则周日晚会把下周一不该上的课当成「下一节课」。
         private fun weekForOffset(week: Int, dayOffset: Int): Int {
-            return if (todayIso() + dayOffset <= 7) week else week + 1
+            return weekForOffsetAt(todayIso(), week, dayOffset)
+        }
+
+        /// 可注入「今天」的跨周换算（行为与 `weekForOffset` 完全一致，仅供测试）。
+        internal fun weekForOffsetAt(today: Int, week: Int, dayOffset: Int): Int {
+            return if (today + dayOffset <= 7) week else week + 1
         }
 
         /// 显示用：未来 7 天内（含今天剩余）最近的一节课。
         private fun findNextClass(json: JSONObject): Course? {
-            val week = json.optInt("week", 0)
             val now = Calendar.getInstance()
-            val today = todayIso()
             val nowMinutes =
                 now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE)
+            return findNextClassAt(json, todayIso(), nowMinutes)
+        }
+
+        /// 可注入「今天」与「当日分钟数」的下一节课查询（仅供测试复用）。
+        internal fun findNextClassAt(
+            json: JSONObject,
+            today: Int,
+            nowMinutes: Int,
+        ): Course? {
+            val week = json.optInt("week", 0)
 
             var best: Course? = null
             var bestOffset = Int.MAX_VALUE
@@ -299,7 +353,7 @@ class AppWidget : AppWidgetProvider() {
                 if (course.day <= 0 || course.start.isEmpty()) continue
                 val startMinutes = parseMinutes(course.start) ?: continue
                 val dayOffset = (course.day - today + 7) % 7
-                val targetWeek = weekForOffset(week, dayOffset)
+                val targetWeek = weekForOffsetAt(today, week, dayOffset)
                 if (targetWeek > MAX_WEEK) continue
                 if (week > 0 && !runsInWeek(course, targetWeek)) continue
                 val offset = dayOffset * 24 * 60 + (startMinutes - nowMinutes)
@@ -319,19 +373,37 @@ class AppWidget : AppWidgetProvider() {
             week: Int,
             reminderMinutes: Int,
         ): ReminderTarget? {
-            val now = System.currentTimeMillis()
-            val today = todayIso()
+            return nextReminderTargetAt(
+                json = json,
+                week = week,
+                reminderMinutes = reminderMinutes,
+                today = todayIso(),
+                nowMillis = System.currentTimeMillis(),
+                base = Calendar.getInstance(),
+            )
+        }
+
+        /// 可注入时钟的提醒目标查询（仅供测试复用；生产路径只传系统时钟）。
+        internal fun nextReminderTargetAt(
+            json: JSONObject,
+            week: Int,
+            reminderMinutes: Int,
+            today: Int,
+            nowMillis: Long,
+            base: Calendar,
+        ): ReminderTarget? {
             var best: ReminderTarget? = null
             for (course in parseCourses(json)) {
                 if (course.day <= 0 || course.start.isEmpty()) continue
                 val dayOffset = (course.day - today + 7) % 7
-                val targetWeek = weekForOffset(week, dayOffset)
+                val targetWeek = weekForOffsetAt(today, week, dayOffset)
                 if (targetWeek > MAX_WEEK) continue
                 if (!runsInWeek(course, targetWeek)) continue
-                val triggerAt = reminderTime(course, reminderMinutes) ?: continue
+                val triggerAt = reminderTriggerAt(course, reminderMinutes, today, base)
+                    ?: continue
                 // 提醒时刻已过（含「距上课不足 reminderMinutes 分钟」）：跳过这节继续
                 // 找下一节，而不是直接返回。
-                if (triggerAt <= now) continue
+                if (triggerAt <= nowMillis) continue
                 if (best == null || triggerAt < best.triggerAt) {
                     best = ReminderTarget(course, triggerAt)
                 }
@@ -341,7 +413,7 @@ class AppWidget : AppWidgetProvider() {
 
         /// "HH:mm" → 当日分钟数；非法格式返回 null，避免坏数据以「午夜 0 分」参与
         /// 排序而错误地当选下一节课。
-        private fun parseMinutes(hhmm: String): Int? {
+        internal fun parseMinutes(hhmm: String): Int? {
             val parts = hhmm.split(":")
             if (parts.size < 2) return null
             val h = parts[0].toIntOrNull() ?: return null

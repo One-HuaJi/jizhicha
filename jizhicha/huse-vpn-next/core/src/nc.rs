@@ -99,8 +99,75 @@ pub fn build_nc_data_frame(ip_packet: &[u8]) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
+/// Reassembles NC data frames that may be split across TLS record boundaries.
+///
+/// A sender is free to split one NC frame over several TLS records (a single
+/// IP packet may exceed the 2^14-byte TLS plaintext limit), and one TLS record
+/// may contain several complete frames. Parsing each record independently used
+/// to treat a legal split as a malformed frame and tear the tunnel down.
+#[derive(Default)]
+pub struct NcFrameAssembler {
+    buffer: Vec<u8>,
+}
+
+/// Upper bound on buffered undecoded data. Any legal frame is far below this;
+/// the cap only exists so a hostile/broken peer cannot grow memory without end.
+const MAX_ASSEMBLY_BUFFER: usize = 256 * 1024;
+
+impl NcFrameAssembler {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Feed one decrypted TLS application record; return every complete packet.
+    pub fn feed(&mut self, record: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.buffer.extend_from_slice(record);
+        if self.buffer.len() > MAX_ASSEMBLY_BUFFER {
+            return Err(HuseVpnError::Protocol(
+                "NC reassembly buffer exceeded its bound".into(),
+            ));
+        }
+
+        let mut packets = Vec::new();
+        let mut offset = 0usize;
+        while self.buffer.len().saturating_sub(offset) >= 12 {
+            let header = &self.buffer[offset..];
+            let command = u32::from_be_bytes(header[0..4].try_into().unwrap());
+            if command != CMD_NC_DATA {
+                return Err(HuseVpnError::Protocol(format!(
+                    "unexpected NC data command 0x{command:08x}"
+                )));
+            }
+            let payload_len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+            if payload_len < 4 {
+                return Err(HuseVpnError::Protocol(
+                    "NC data payload length is smaller than its reserved field".into(),
+                ));
+            }
+            let frame_len = payload_len
+                .checked_add(8)
+                .ok_or_else(|| HuseVpnError::Protocol("NC data frame length overflow".into()))?;
+            if self.buffer.len() - offset < frame_len {
+                // Incomplete: wait for the next TLS record.
+                break;
+            }
+            packets.push(self.buffer[offset + 12..offset + frame_len].to_vec());
+            offset += frame_len;
+        }
+        if offset > 0 {
+            self.buffer.drain(..offset);
+        }
+        Ok(packets)
+    }
+}
+
 /// Parse all complete NC data frames from one decrypted TLS application
 /// record. The native client accepts multiple concatenated frames.
+///
+/// ⚠️ This requires the record to contain **only** whole frames (see
+/// [NcFrameAssembler] for the streaming/tunnel case).
 pub fn parse_nc_data_frames(mut data: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut packets = Vec::new();
     while !data.is_empty() {
@@ -353,6 +420,55 @@ mod tests {
             parse_nc_data_frames(&joined).unwrap(),
             [vec![0x45, 1, 2], vec![0x60, 3, 4, 5]]
         );
+    }
+
+    #[test]
+    fn assembler_reassembles_a_frame_split_across_records() {
+        // A legal NC frame may be split over several TLS records. Parsing each
+        // record independently used to tear the tunnel down.
+        let frame = build_nc_data_frame(&[0x45, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        let (head, tail) = frame.split_at(6);
+        let mut assembler = NcFrameAssembler::new();
+        assert!(assembler.feed(head).unwrap().is_empty(), "未完整时不应产出包");
+        assert_eq!(assembler.feed(tail).unwrap(), [vec![0x45, 1, 2, 3, 4, 5, 6, 7]]);
+    }
+
+    #[test]
+    fn assembler_handles_many_frames_across_many_records() {
+        let packets: Vec<Vec<u8>> = (1..=5u8).map(|n| vec![0x45, n, 0, 0]).collect();
+        let stream: Vec<u8> = packets
+            .iter()
+            .map(|p| build_nc_data_frame(p).unwrap())
+            .collect::<Vec<_>>()
+            .concat();
+
+        let mut assembler = NcFrameAssembler::new();
+        let mut got = Vec::new();
+        // Feed in awkward 7-byte slices to force arbitrary record boundaries.
+        for chunk in stream.chunks(7) {
+            got.extend(assembler.feed(chunk).unwrap());
+        }
+        assert_eq!(got, packets);
+    }
+
+    #[test]
+    fn assembler_defers_until_a_full_header_is_available() {
+        // Fewer than 12 bytes cannot be judged yet: buffering (not erroring) is
+        // what makes cross-record reassembly work.
+        let frame = build_nc_data_frame(&[0x45, 1, 2, 3]).unwrap();
+        let mut assembler = NcFrameAssembler::new();
+        assert!(assembler.feed(&frame[..5]).unwrap().is_empty());
+        assert_eq!(assembler.feed(&frame[5..]).unwrap(), [vec![0x45, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn assembler_rejects_unexpected_command() {
+        let mut assembler = NcFrameAssembler::new();
+        // Corrupt the command word of a well-formed frame so only the command
+        // check can reject it (header length is otherwise valid).
+        let mut bad = build_nc_data_frame(&[0x45, 1, 2, 3]).unwrap();
+        bad[0] = bad[0].wrapping_add(0xff);
+        assert!(assembler.feed(&bad).is_err());
     }
 
     #[test]

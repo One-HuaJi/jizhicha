@@ -5,10 +5,16 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 重启后重排上课提醒（BootReceiver）。 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Course/grade/widget caches contain personal academic data. Disable Android
+         Auto Backup and device-transfer backup rather than relying on app sandbox
+         storage; private files can otherwise migrate to cloud/another device. -->
     <application
         android:label="稽之查"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -57,6 +63,18 @@
         <receiver
             android:name=".ReminderReceiver"
             android:exported="false" />
+        <!-- 重启与应用更新都会清空已注册的闹钟；没有这个接收器时上课提醒会
+             静默失效，直到用户手动打开 App。只重排提醒 + 刷新小组件，不启动服务。 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
         <receiver
             android:name=".PinWidgetReceiver"
             android:exported="false" />

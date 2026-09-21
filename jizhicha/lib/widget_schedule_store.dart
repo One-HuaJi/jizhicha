@@ -22,22 +22,58 @@ class WidgetScheduleStore {
   static const _fileName = 'widget_schedule.json';
   static const _channel = MethodChannel('com.one.huaji/widget_settings');
 
+  /// 小组件数据文件。此文件是**全局单份**（不是按账号分文件），因此在删除
+  /// 账号或切换到无课表账号时必须显式清理，不能让 launcher 继续显示前一人的
+  /// 课程/老师/教室。
+  static Future<File> _file() async {
+    final dir = await getApplicationDocumentsDirectory();
+    return File(dir.path + Platform.pathSeparator + _fileName);
+  }
+
+  /// 删除 widget JSON、取消旧提醒并刷新为“暂无课表”。
+  /// 任一失败都不阻塞主流程，但该方法必须被删除账号/切换账号路径调用。
+  static Future<void> clear() async {
+    try {
+      final file = await _file();
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Native side will retry deletion/cancel when invoked below.
+    }
+    try {
+      await _channel.invokeMethod('clearWidgetData');
+    } catch (_) {
+      // Widgets are optional; privacy-sensitive file deletion above already ran.
+    }
+  }
+
   /// 把当前账号的课表写入小组件 JSON；任何失败都不影响主流程。
   static Future<void> writeCurrentSchedule(String studentId) async {
     try {
       final normalized = studentId.trim();
-      if (normalized.isEmpty) return;
+      if (normalized.isEmpty) {
+        await clear();
+        return;
+      }
 
       final settings = await AppSettings.load();
       final profile = await UserDataCacheStore.loadProfile(normalized);
-      if (profile == null || profile.scheduleTerms.isEmpty) return;
+      if (profile == null || profile.scheduleTerms.isEmpty) {
+        await clear();
+        return;
+      }
 
       final term = profile.scheduleTerms.first;
       final html = await UserDataCacheStore.loadScheduleHtml(normalized, term);
-      if (html == null || html.trim().isEmpty) return;
+      if (html == null || html.trim().isEmpty) {
+        await clear();
+        return;
+      }
 
       final courses = parseScheduleHtml(html);
-      if (courses.isEmpty) return;
+      if (courses.isEmpty) {
+        await clear();
+        return;
+      }
 
       // 当前周次：按开学日期自动算；算出的周次可能 <1（未开学）或 >20（已结束），
       // 小组件侧据此显示「还没开学 / 本学期已结束」。
@@ -74,8 +110,7 @@ class WidgetScheduleStore {
         });
       }
 
-      final dir = await getApplicationDocumentsDirectory();
-      final file = File(dir.path + Platform.pathSeparator + _fileName);
+      final file = await _file();
       await file.writeAsString(
         jsonEncode({
           'week': week,

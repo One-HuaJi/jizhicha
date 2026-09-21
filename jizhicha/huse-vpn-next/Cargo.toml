@@ -4,6 +4,11 @@ resolver = "2"
 # now embeds the VPN through Flutter FFI, so workspace builds must not compile
 # or package the obsolete second desktop application.
 members = ["core", "ffi", "mobile-ffi"]
+# `desktop/src-tauri` is archived source: it still declares workspace-inherited
+# fields, so it must be excluded explicitly. Without this, running cargo in that
+# directory fails with "current package believes it's in a workspace when it's
+# not" instead of behaving predictably.
+exclude = ["desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

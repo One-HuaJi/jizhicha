@@ -442,7 +442,8 @@ class _GradesPageState extends State<GradesPage>
         appBar: _buildAppBar(),
         body: Center(
           child: Text(
-            '本地成绩读取失败：$_error',
+            // 不显示 $_error 原始异常：可能是英文堆栈或文件路径。
+            '本地成绩读取失败，请重新同步成绩',
             style: TextStyle(color: colorScheme.onSurfaceVariant),
           ),
         ),

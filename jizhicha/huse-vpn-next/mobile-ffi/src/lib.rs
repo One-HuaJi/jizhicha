@@ -16,6 +16,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::RawFd;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
@@ -51,6 +52,11 @@ const REQUIRED_TARGETS: [Ipv4Addr; 4] = [
     Ipv4Addr::new(172, 20, 63, 226),
     Ipv4Addr::new(222, 243, 204, 25),
 ];
+
+/// Deadline for a single setup step (SAC login, TLS connect, NC handshake).
+/// Bounds worst-case connect time so a stalled Gateway always ends in a
+/// terminal, user-visible failure instead of an indefinitely pending future.
+const SETUP_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct PendingSession {
     tls: Option<RawTlsClient>,
@@ -105,6 +111,10 @@ struct MobileStatus {
     required_route_count: usize,
     sac: Option<SacDiagnostics>,
     error: Option<String>,
+    /// Non-fatal problem worth surfacing (e.g. the Gateway's session
+    /// notification failed). Deliberately separate from `error` so a partially
+    /// degraded but usable tunnel is not reported as a hard failure.
+    warning: Option<String>,
 }
 
 impl Default for MobileStatus {
@@ -120,6 +130,7 @@ impl Default for MobileStatus {
             required_route_count: REQUIRED_TARGETS.len(),
             sac: None,
             error: None,
+            warning: None,
         }
     }
 }
@@ -153,6 +164,9 @@ fn set_stage(state: &MobileState, stage: &str, message: &str) {
     status.stage = stage.to_string();
     status.message = message.to_string();
     status.error = None;
+    // A new stage belongs to a new attempt: do not carry a previous attempt's
+    // non-fatal warning into a later, unrelated stage.
+    status.warning = None;
 }
 
 fn fail(state: &MobileState, username: String, stage: &str, error: impl Into<String>) {
@@ -201,9 +215,28 @@ async fn prepare_inner(
     set_stage(&state, "sac", "正在通过学校加速器网关进行原生认证");
     let sac_client = SacClient::new(address);
     let password = Zeroizing::new(password);
-    let login = sac_client
-        .login_with_source(&username, password.as_str(), Some(&source))
-        .await;
+    // Every setup step needs its own deadline: without one, a half-open Gateway
+    // socket leaves the whole connect future pending forever, so the UI spinner
+    // spins, silent re-auth never finishes, and the Android foreground service
+    // can never report a terminal state.
+    let login = match tokio::time::timeout(
+        SETUP_STEP_TIMEOUT,
+        sac_client.login_with_source(&username, password.as_str(), Some(&source)),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => {
+            drop(password);
+            fail(
+                &state,
+                username,
+                "sac_error",
+                "Gateway authentication timed out",
+            );
+            return;
+        }
+    };
     drop(password);
     let (sac_login, diagnostics) = match login {
         Ok(value) => value,
@@ -255,25 +288,53 @@ async fn prepare_inner(
     }
 
     set_stage(&state, "tls", "正在建立网关 TLS 数据通道");
-    let mut tls = match RawTlsClient::connect(address).await {
-        Ok(value) => value,
-        Err(error) => {
+    let mut tls = match tokio::time::timeout(SETUP_STEP_TIMEOUT, RawTlsClient::connect(address))
+        .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
             fail(&state, username, "tls_error", error.to_string());
+            return;
+        }
+        Err(_) => {
+            fail(&state, username, "tls_error", "Gateway TLS handshake timed out");
             return;
         }
     };
     set_stage(&state, "nc_auth", "正在使用 NC Ticket 请求虚拟 IP");
-    if let Err(error) = tls.send_nc_auth(&ticket, &username).await {
-        fail(&state, username, "nc_error", error.to_string());
-        return;
+    match tokio::time::timeout(SETUP_STEP_TIMEOUT, tls.send_nc_auth(&ticket, &username)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            fail(&state, username, "nc_error", error.to_string());
+            return;
+        }
+        Err(_) => {
+            fail(&state, username, "nc_error", "NC auth request timed out");
+            return;
+        }
     }
     if let Err(error) = notify_safeupdate(address, &ticket).await {
-        eprintln!("HUSE mobile VPN session notification skipped: {error}");
+        // The Gateway's session notification is required for forwarding on some
+        // deployments. It is not fatal to keep connecting (the tunnel may still
+        // work), but silently logging hid a possible "connected but no traffic"
+        // state — record it as a surfaced warning instead.
+        eprintln!("HUSE mobile VPN session notification failed: {error}");
+        let mut status = state
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        status.warning = Some(format!(
+            "Gateway session notification failed; forwarding may be unavailable: {error}"
+        ));
     }
-    let reply = match tls.read_nc_auth_reply().await {
-        Ok(value) => value,
-        Err(error) => {
+    let reply = match tokio::time::timeout(SETUP_STEP_TIMEOUT, tls.read_nc_auth_reply()).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
             fail(&state, username, "nc_error", error.to_string());
+            return;
+        }
+        Err(_) => {
+            fail(&state, username, "nc_error", "NC auth reply timed out");
             return;
         }
     };
@@ -417,13 +478,18 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(heartbeat);
 
-    let sac = host
-        .state
-        .status
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .sac
-        .clone();
+    let (sac, warning) = {
+        let status = host
+            .state
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Preserve a non-fatal warning raised during setup (e.g. the Gateway
+        // session notification failed): it must survive the transition to
+        // connected, otherwise "connected but forwarding may be unavailable"
+        // is silently indistinguishable from a healthy tunnel.
+        (status.sac.clone(), status.warning.clone())
+    };
     *host
         .state
         .status
@@ -439,6 +505,7 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
         required_route_count: REQUIRED_TARGETS.len(),
         sac,
         error: None,
+        warning,
     };
     0
 }

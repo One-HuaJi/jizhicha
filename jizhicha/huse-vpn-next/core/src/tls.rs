@@ -1,5 +1,6 @@
 //! TLS 1.2 + RSA-AES128-CBC-SHA + EMS（精确匹配 GWSetup.exe ClientHello）
 use crate::error::{HuseVpnError, Result};
+use crate::packet_trace_enabled;
 use num_bigint::BigUint;
 use rsa::{pkcs1::DecodeRsaPublicKey, traits::PublicKeyParts, RsaPublicKey};
 use sha1::Sha1;
@@ -237,10 +238,11 @@ impl RawTlsClient {
     }
 
     async fn send(&mut self, ct: u8, pl: &[u8]) -> Result<()> {
-        let record = encrypt_record(ct, &self.client_key, &self.client_mac, self.send_seq, pl);
-        self.send_seq += 1;
+        let (records, used) =
+            encrypt_fragments(ct, &self.client_key, &self.client_mac, self.send_seq, pl);
+        self.send_seq += used;
         self.stream
-            .write_all(&record)
+            .write_all(&records)
             .await
             .map_err(|e| HuseVpnError::Tls(format!("s {e}")))?;
         Ok(())
@@ -292,10 +294,12 @@ impl RawTlsClient {
 impl RawTlsReader {
     pub async fn read_record(&mut self) -> Result<Vec<u8>> {
         let (content_type, body) = read_tls_record(&mut self.stream).await?;
-        eprintln!(
-            "HUSE VPN downlink TLS record: type=0x{content_type:02x}, encrypted_len={}",
-            body.len()
-        );
+        if packet_trace_enabled() {
+            eprintln!(
+                "HUSE VPN downlink TLS record: type=0x{content_type:02x}, encrypted_len={}",
+                body.len()
+            );
+        }
         let plaintext = decrypt_record(
             content_type,
             &body,
@@ -316,16 +320,11 @@ impl RawTlsReader {
 
 impl RawTlsWriter {
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
-        let record = encrypt_record(
-            0x17,
-            &self.client_key,
-            &self.client_mac,
-            self.send_seq,
-            data,
-        );
-        self.send_seq += 1;
+        let (records, used) =
+            encrypt_fragments(0x17, &self.client_key, &self.client_mac, self.send_seq, data);
+        self.send_seq += used;
         self.stream
-            .write_all(&record)
+            .write_all(&records)
             .await
             .map_err(|e| HuseVpnError::Tls(format!("application data write: {e}")))?;
         Ok(())
@@ -342,6 +341,42 @@ fn finished_verify_data(master_secret: &[u8; 48], label: &[u8], transcript: &[u8
         .expect("TLS Finished verify_data length")
 }
 
+/// TLS 1.2 limits a single record's plaintext to 2^14 bytes, and the record
+/// length field is only 16 bits. One NC data frame can carry a 65535-byte IP
+/// packet plus a 12-byte header, so writing it as one record would wrap the
+/// length field and permanently desynchronize the peer's record parser.
+/// Every application-data write is therefore split into legal records.
+const MAX_TLS_PLAINTEXT: usize = 16_384;
+
+/// Encrypt `plaintext` into one or more TLS records.
+///
+/// Returns the concatenated records and how many TLS sequence numbers were
+/// consumed, so callers keep their send sequence in sync.
+fn encrypt_fragments(
+    content_type: u8,
+    key: &[u8; 16],
+    mac_secret: &[u8; 20],
+    sequence: u64,
+    plaintext: &[u8],
+) -> (Vec<u8>, u64) {
+    if plaintext.is_empty() {
+        // Keep empty writes representable as a single legal record.
+        return (
+            encrypt_record(content_type, key, mac_secret, sequence, &[]),
+            1,
+        );
+    }
+    let mut out = Vec::with_capacity(plaintext.len() + (plaintext.len() / MAX_TLS_PLAINTEXT + 1) * 64);
+    let mut seq = sequence;
+    let mut used = 0u64;
+    for chunk in plaintext.chunks(MAX_TLS_PLAINTEXT) {
+        out.extend_from_slice(&encrypt_record(content_type, key, mac_secret, seq, chunk));
+        seq += 1;
+        used += 1;
+    }
+    (out, used)
+}
+
 fn encrypt_record(
     content_type: u8,
     key: &[u8; 16],
@@ -349,6 +384,10 @@ fn encrypt_record(
     sequence: u64,
     plaintext: &[u8],
 ) -> Vec<u8> {
+    debug_assert!(
+        plaintext.len() <= MAX_TLS_PLAINTEXT,
+        "encrypt_record must only receive pre-fragmented plaintext"
+    );
     let mac = record_mac(mac_secret, sequence, content_type, plaintext);
     let mut fragment = plaintext.to_vec();
     fragment.extend_from_slice(&mac);
@@ -770,7 +809,8 @@ mod tests {
         ms_seed.extend_from_slice(&sr);
         let ms = p_sha256(&pre, &ms_seed, 48);
         let ms_hex = hex::encode(&ms);
-        println!("master_secret: {ms_hex}");
+        // NOTE: do not print derived key material, even for synthetic vectors —
+        // the pattern gets copied into real code and leaks into CI logs.
         assert_eq!(ms_hex, "38dc329f2291aee192b0059a28b78f86ea6d0fd10bcdf75b1f067d365e986b6dfc2850c10e154c304c432fbe5691010f",
             "master_secret should match Python");
 
@@ -781,8 +821,6 @@ mod tests {
         let kb = p_sha256(&ms, &ke_seed, 72);
         let cm = &kb[0..20];
         let ck = &kb[40..56];
-        println!("client_write_key: {}", hex::encode(ck));
-        println!("client_write_mac: {}", hex::encode(cm));
 
         let (derived_ck, derived_sk, derived_cm, derived_sm, derived_ms) =
             derive_keys(&pre, &cr, &sr, false, hs_data);
@@ -794,11 +832,10 @@ mod tests {
 
         // verify_data
         let hh = Sha256::digest(hs_data);
-        println!("HS hash: {}", hex::encode(&hh));
         let mut vd_seed = b"client finished".to_vec();
         vd_seed.extend_from_slice(&hh);
         let vd = p_sha256(&ms, &vd_seed, 12);
-        println!("verify_data: {}", hex::encode(&vd));
+        assert_eq!(vd.len(), 12, "TLS Finished verify_data is 12 bytes");
 
         // AES round-trip test
         let ac = AesCbc::new(ck.try_into().unwrap());
@@ -807,7 +844,123 @@ mod tests {
         let enc = ac.enc(&iv, plain);
         let dec = ac.dec(&iv, &enc[16..]);
         assert_eq!(plain, &dec[..plain.len()], "AES round-trip failed");
-        println!("AES round-trip: OK");
+        let _ = cm;
+    }
+
+    /// A single NC frame can exceed the TLS 1.2 plaintext limit; writing it as one
+    /// record used to wrap the 16-bit length field and desynchronize the stream.
+    #[test]
+    fn oversized_application_data_is_split_into_legal_records() {
+        let key = [0x11u8; 16];
+        let mac_secret = [0x22u8; 20];
+        // 65535-byte IP packet + 12-byte NC header, the real worst case.
+        let plaintext = vec![0x45u8; 65_535 + 12];
+
+        let (records, used) = encrypt_fragments(0x17, &key, &mac_secret, 0, &plaintext);
+
+        assert!(used >= 4, "超长 payload 必须拆成多条 record，实际 {used}");
+        // Walk the record headers back out and assert each declared length is
+        // consistent with the bytes that actually follow it.
+        let mut offset = 0usize;
+        let mut seen = 0u64;
+        while offset < records.len() {
+            let content_type = records[offset];
+            let version = &records[offset + 1..offset + 3];
+            let declared = u16::from_be_bytes(
+                records[offset + 3..offset + 5].try_into().unwrap(),
+            ) as usize;
+            assert_eq!(content_type, 0x17);
+            assert_eq!(version, &V12);
+            assert!(
+                offset + 5 + declared <= records.len(),
+                "record 长度字段越界（发生了 16 位截断）"
+            );
+            offset += 5 + declared;
+            seen += 1;
+        }
+        assert_eq!(offset, records.len(), "record 必须精确首尾相接");
+        assert_eq!(seen, used, "解析出的 record 数必须等于消耗的序列号数");
+    }
+
+    #[test]
+    fn fragmented_records_stay_within_the_tls_plaintext_limit() {
+        let key = [0x33u8; 16];
+        let mac_secret = [0x44u8; 20];
+        let plaintext = vec![0x60u8; MAX_TLS_PLAINTEXT * 2 + 1];
+        let (records, used) = encrypt_fragments(0x17, &key, &mac_secret, 0, &plaintext);
+        assert_eq!(used, 3, "两倍上限加一字节应拆成 3 条");
+        assert!(!records.is_empty());
+    }
+
+    #[test]
+    fn empty_write_still_emits_one_record() {
+        let key = [0x55u8; 16];
+        let mac_secret = [0x66u8; 20];
+        let (records, used) = encrypt_fragments(0x17, &key, &mac_secret, 0, &[]);
+        assert_eq!(used, 1);
+        assert!(records.len() >= 24, "空记录仍需带 IV 与 HMAC");
+    }
+
+    /// Strongest local proof that fragmentation is wire-correct: split the
+    /// records back out, decrypt each with its own sequence number, verify the
+    /// MAC, and confirm the plaintext reassembles byte-for-byte.
+    #[test]
+    fn fragmented_records_round_trip_through_the_decryptor() {
+        let key = [0x77u8; 16];
+        let mac_secret = [0x88u8; 20];
+        // Deliberately cross both the single-record limit and a partial tail.
+        let mut plaintext = Vec::new();
+        for i in 0..(MAX_TLS_PLAINTEXT * 2 + 123) {
+            plaintext.push((i % 251) as u8);
+        }
+
+        let (records, used) = encrypt_fragments(0x17, &key, &mac_secret, 7, &plaintext);
+        assert_eq!(used, 3, "应拆成 3 条 record");
+
+        let mut offset = 0usize;
+        let mut seq = 7u64;
+        let mut rebuilt = Vec::new();
+        while offset < records.len() {
+            let content_type = records[offset];
+            let declared =
+                u16::from_be_bytes(records[offset + 3..offset + 5].try_into().unwrap()) as usize;
+            let body = &records[offset + 5..offset + 5 + declared];
+            let decrypted = decrypt_record(content_type, body, &key, &mac_secret, seq)
+                .expect("分片后的每条 record 都必须能通过 MAC 校验");
+            rebuilt.extend_from_slice(&decrypted);
+            offset += 5 + declared;
+            seq += 1;
+        }
+
+        assert_eq!(rebuilt, plaintext, "重组后的明文必须与原文完全一致");
+    }
+
+    /// A single sequence number reused across fragments would produce duplicate
+    /// MACs and a rejected stream; assert the sequence advances per record.
+    #[test]
+    fn each_fragment_uses_a_distinct_sequence_number() {
+        let key = [0x99u8; 16];
+        let mac_secret = [0xaau8; 20];
+        let plaintext = vec![0x5au8; MAX_TLS_PLAINTEXT + 1];
+        let (records, used) = encrypt_fragments(0x17, &key, &mac_secret, 0, &plaintext);
+        assert_eq!(used, 2);
+
+        // Decrypting the second record with sequence 0 (the first record's
+        // number) must fail; with sequence 1 it must succeed.
+        let first_len = 5 + u16::from_be_bytes(records[3..5].try_into().unwrap()) as usize;
+        let second = &records[first_len..];
+        let second_type = second[0];
+        let second_body_len = u16::from_be_bytes(second[3..5].try_into().unwrap()) as usize;
+        let second_body = &second[5..5 + second_body_len];
+
+        assert!(
+            decrypt_record(second_type, second_body, &key, &mac_secret, 0).is_err(),
+            "第二条 record 不能用序号 0 解密"
+        );
+        assert!(
+            decrypt_record(second_type, second_body, &key, &mac_secret, 1).is_ok(),
+            "第二条 record 必须使用序号 1"
+        );
     }
 
     #[test]

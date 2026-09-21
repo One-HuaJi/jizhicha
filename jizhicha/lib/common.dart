@@ -8,6 +8,7 @@ import 'credential_store.dart';
 import 'home_page.dart';
 import 'jwxt_client.dart';
 import 'schedule_cache_store.dart';
+import 'widget_schedule_store.dart';
 
 /// 首页的页面栈会保留课表、成绩与设置页各自的 State。设置写入本地文件后，
 /// 通过统一修订号通知其它仍在内存中的页面立即重新读取，避免必须重启或重新登录。
@@ -39,7 +40,12 @@ Future<void> showStudentIdHelp(BuildContext context) async {
       ),
       content: const SingleChildScrollView(
         child: SelectableText(
-          '学号为湘科院官方下发的纯数字学号，格式为[年份][专业][系别][学号]的十二位纯数字学号，密码为身份证后六位,若显示无法登陆则可能校方并未录入数据，我们无能为力，请静待校方添加。',
+          // 原文案 80+ 字、夹半角逗号、结尾"我们无能为力"偏消极。
+          // 拆成三段，用中文标点，并给出可执行的下一步。
+          '学号：学校下发的 12 位纯数字学号，格式为「年份 + 专业 + 系别 + 序号」。\n\n'
+          '密码：身份证后六位。\n\n'
+          '如果提示无法登录，通常是学校尚未把该学号录入或开通。'
+          '这需要学校侧处理，请联系辅导员或教务处确认后再试。',
           style: TextStyle(height: 1.6),
         ),
       ),
@@ -148,6 +154,9 @@ Future<void> switchToSavedAccount(
   await JwxtClient().resetSession();
   final cached = await ScheduleCacheStore.loadLatest(account.username);
   final profile = await UserDataCacheStore.loadProfile(account.username);
+  // Keep the single global widget cache aligned with the newly selected
+  // account. If it has no schedule, writeCurrentSchedule clears prior data.
+  await WidgetScheduleStore.writeCurrentSchedule(account.username);
   if (!context.mounted) return;
   final hasLocalData = cached != null || profile != null;
   // 原先这里走 buildAccountDestination 注入回调，现改为编译期直接依赖：

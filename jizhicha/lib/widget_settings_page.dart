@@ -218,14 +218,15 @@ class _WidgetSettingsPageState extends State<WidgetSettingsPage>
                     ),
                   ),
                 // 精确闹钟未授权时原生已降级为窗口闹钟，提醒会晚最多 2 分钟。
+                // 标题用用户视角（"提醒可能延迟"）而不是系统概念（"精确闹钟未授权"）。
                 if (Platform.isAndroid &&
                     _settings.reminderEnabled &&
                     !_canExactAlarm)
                   Card(
                     child: ListTile(
                       leading: const Icon(Icons.alarm_off),
-                      title: const Text('精确闹钟未授权'),
-                      subtitle: const Text('提醒会延后最多 2 分钟，点此授权可准点提醒'),
+                      title: const Text('提醒可能延迟'),
+                      subtitle: const Text('未授权精确闹钟，提醒最多晚 2 分钟。点此授权可准点提醒'),
                       onTap: _openExactAlarmSettings,
                     ),
                   ),

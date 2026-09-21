@@ -1,8 +1,7 @@
-gradle-wrapper.jar
+# Commit the standard Gradle wrapper scripts/JAR for clean-checkout reproducibility.
+# Local machine state remains ignored.
 /.gradle
 /captures/
-/gradlew
-/gradlew.bat
 /local.properties
 GeneratedPluginRegistrant.java
 .cxx/

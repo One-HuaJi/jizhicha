@@ -1,12 +1,24 @@
 pluginManagement {
-    val flutterSdkPath =
-        run {
-            val properties = java.util.Properties()
-            file("local.properties").inputStream().use { properties.load(it) }
-            val flutterSdkPath = properties.getProperty("flutter.sdk")
-            require(flutterSdkPath != null) { "flutter.sdk not set in local.properties" }
-            flutterSdkPath
+    // Clean checkout / CI must not require a developer-specific local.properties.
+    // Resolution priority: Gradle property -> environment -> optional local file.
+    // `local.properties` remains supported for Android Studio, but is never committed.
+    val localFlutterSdkPath = runCatching {
+        val properties = java.util.Properties()
+        val local = file("local.properties")
+        if (!local.isFile) null else {
+            local.inputStream().use { properties.load(it) }
+            properties.getProperty("flutter.sdk")
         }
+    }.getOrNull()
+    val flutterSdkPath =
+        providers.gradleProperty("flutter.sdk").orNull
+            ?: System.getenv("FLUTTER_ROOT")
+            ?: System.getenv("FLUTTER_SDK")
+            ?: localFlutterSdkPath
+            ?: error(
+                "Flutter SDK not configured. Set FLUTTER_ROOT/FLUTTER_SDK, " +
+                    "pass -Pflutter.sdk=<path>, or create android/local.properties.",
+            )
 
     includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
 

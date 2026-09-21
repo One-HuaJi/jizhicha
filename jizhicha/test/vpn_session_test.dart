@@ -231,6 +231,78 @@ void main() {
     });
   });
 
+  group('回归：断线必须清除虚拟 IP 与调用方绑定', () {
+    // 虚拟 IP 在 JwxtClient 里是一张"准入凭证"：非空就允许教务 HTTP 走隧道。
+    // 只把 phase 改成 idle、却留着旧 IP，会出现"UI 离线、请求仍绑定死地址"
+    // 的隐蔽状态，表现为难以解释的超时。
+    test('recheck 失败时清空虚拟 IP 并回调 null', () async {
+      var reachable = true;
+      final callbacks = <String?>[];
+      final session = VpnSession(
+        probe: ({required timeout}) async => reachable,
+        launcher: _FakeLauncher(),
+      )..onTunnelEstablished = callbacks.add;
+
+      await session.connect(username: 'u', password: 'p');
+      expect(session.virtualIp, '172.19.0.5');
+
+      reachable = false;
+      await session.recheck();
+
+      expect(session.virtualIp, isNull, reason: '探测失败后不能再保留旧虚拟 IP');
+      expect(callbacks.last, isNull, reason: '必须通知调用方解绑源地址');
+    });
+
+    test('disconnect 清空虚拟 IP 并回调 null', () async {
+      final callbacks = <String?>[];
+      final session = VpnSession(
+        probe: ({required timeout}) async => true,
+        launcher: _FakeLauncher(),
+      )..onTunnelEstablished = callbacks.add;
+
+      await session.connect(username: 'u', password: 'p');
+      await session.disconnect();
+
+      expect(session.virtualIp, isNull);
+      expect(callbacks.last, isNull);
+    });
+
+    test('connect 抛错时不会留下虚拟 IP', () async {
+      final callbacks = <String?>[];
+      final session = VpnSession(
+        probe: ({required timeout}) async => true,
+        launcher: _FakeLauncher(connectError: 'boom'),
+      )..onTunnelEstablished = callbacks.add;
+
+      await session.connect(username: 'u', password: 'p');
+
+      expect(session.virtualIp, isNull);
+      expect(session.phase, VpnPhase.failed);
+      expect(callbacks.every((value) => value == null), isTrue);
+    });
+
+    test('原生报告未连接时清空虚拟 IP', () async {
+      final callbacks = <String?>[];
+      final session = VpnSession(
+        probe: ({required timeout}) async => true,
+        launcher: _FakeLauncher(
+          status: {'connected': true, 'virtual_ip': '172.19.0.5'},
+        ),
+      )..onTunnelEstablished = callbacks.add;
+      await session.syncFromNative();
+      expect(session.virtualIp, '172.19.0.5');
+
+      final dropped = VpnSession(
+        probe: ({required timeout}) async => true,
+        launcher: _FakeLauncher(status: {'connected': false}),
+      )..onTunnelEstablished = callbacks.add;
+      await dropped.syncFromNative();
+
+      expect(dropped.virtualIp, isNull);
+      expect(callbacks.last, isNull);
+    });
+  });
+
   group('与原生状态同步', () {
     test('原生 connected 但网关不可达时不置 online', () async {
       final session = VpnSession(

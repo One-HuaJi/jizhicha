@@ -97,13 +97,15 @@ extension VpnFailureText on VpnFailure {
       case VpnFailure.gatewayTimeout:
         return '学校加速器网关响应超时，请稍候重试';
       case VpnFailure.tunnelStopped:
-        return '校园加速器隧道已停止，请重新认证';
+        return '校园网连接已断开，请重新连接';
       case VpnFailure.adapterBusy:
         return '上次没有正常下线，请再认证一次';
       case VpnFailure.gatewayUnreachable:
-        return '加速器已连接，但教务服务器无响应，请重试';
+        // 网关校验通过后需要 6~9 秒才开放教务访问（§9.7 实测）。
+        // 不说"教务服务器无响应"——那是把内网服务结构讲给用户，也无法行动。
+        return '校园网正在准备中，请稍候重试';
       case VpnFailure.noVirtualIp:
-        return '加速器已连接但虚拟 IP 未下发，请重试';
+        return '加速器已连接，但尚未获取到校园网地址，请重试';
       case VpnFailure.permissionDenied:
         return '请在 Android 系统网络授权对话框中允许稽之查，然后再次点击连接';
       case VpnFailure.unknown:
@@ -148,7 +150,8 @@ VpnFailure classifyVpnError(Object error) {
   if (m.contains('gateway session setup timed out')) {
     return VpnFailure.gatewayTimeout;
   }
-  if (m.contains('虚拟 ip 未下发')) return VpnFailure.noVirtualIp;
+  // 注意：这几个匹配键与抛错处/文案是**耦合**的，改文案必须同步改这里。
+  if (m.contains('尚未获取到校园网地址')) return VpnFailure.noVirtualIp;
   if (m.contains('隧道已停止')) return VpnFailure.tunnelStopped;
   if (m.contains('无 http 响应')) return VpnFailure.gatewayUnreachable;
   if (m.contains('网络授权') || m.contains('系统网络授权')) {
@@ -265,6 +268,31 @@ class VpnSession extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// The VPN source address is also a security capability in JwxtClient: a
+  /// non-null address permits HTTP requests to use the tunnel. Therefore every
+  /// transition away from a confirmed tunnel must clear it immediately, not
+  /// merely change [phase]. Keeping a stale IP produced a UI-idle/session-dead
+  /// state while requests still bound themselves to an old virtual interface.
+  void _setVirtualIp(String? value) {
+    final next = value?.trim();
+    final normalized = next == null || next.isEmpty ? null : next;
+    if (_virtualIp == normalized) return;
+    _virtualIp = normalized;
+    onTunnelEstablished?.call(normalized);
+    notifyListeners();
+  }
+
+  void _clearTunnelIdentity() {
+    // Clear unconditionally: JwxtClient is a separate singleton whose bound
+    // source address we cannot observe, so relying on our own copy already
+    // being null could leave a stale binding behind (and later requests would
+    // still try to use a dead virtual interface).
+    final changed = _virtualIp != null;
+    _virtualIp = null;
+    onTunnelEstablished?.call(null);
+    if (changed) notifyListeners();
+  }
+
   /// 连接。成功时 [phase] 到达 [VpnPhase.online]，失败时到达
   /// [VpnPhase.failed] 并设置 [failure]（**不抛异常**，调用方读状态即可）。
   ///
@@ -308,8 +336,7 @@ class VpnSession extends ChangeNotifier {
       // 隧道已建立。源地址由 CampusVpnLauncher 内部经 onSourceAddressChanged
       // 同步给 JwxtClient（在 connect 返回前完成），这里再兜一次，确保后续
       // 教务请求绑定到正确的虚拟 IP。
-      _virtualIp = await _readVirtualIp();
-      onTunnelEstablished?.call(_virtualIp);
+      _setVirtualIp(await _readVirtualIp());
 
       // 探测只用来"提升"状态，不用来"否决"连接。
       _set(VpnPhase.tunnelUp, progress: '正在验证校园内网连通性…');
@@ -317,6 +344,7 @@ class VpnSession extends ChangeNotifier {
       _set(reachable ? VpnPhase.online : VpnPhase.tunnelUp);
       return true;
     } catch (error) {
+      _clearTunnelIdentity();
       _set(VpnPhase.failed, failure: classifyVpnError(error));
       return false;
     }
@@ -329,7 +357,7 @@ class VpnSession extends ChangeNotifier {
     } catch (_) {
       // 断开失败也要落到 idle：否则 UI 会永远卡在"连接中"。
     }
-    _virtualIp = null;
+    _clearTunnelIdentity();
     _set(VpnPhase.idle);
   }
 
@@ -344,6 +372,7 @@ class VpnSession extends ChangeNotifier {
       if (_phase != VpnPhase.online) _set(VpnPhase.online);
       return true;
     }
+    _clearTunnelIdentity();
     _set(VpnPhase.idle);
     return false;
   }
@@ -358,11 +387,11 @@ class VpnSession extends ChangeNotifier {
       final status = await _launcher.currentStatus();
       final connected = status?['connected'] == true;
       if (!connected) {
-        _virtualIp = null;
+        _clearTunnelIdentity();
         if (_phase != VpnPhase.preparing) _set(VpnPhase.idle);
         return;
       }
-      _virtualIp = status?['virtual_ip']?.toString();
+      _setVirtualIp(status?['virtual_ip']?.toString());
       if (_phase == VpnPhase.online) return; // 已是稳定态，不打扰
       _set(VpnPhase.tunnelUp);
       final reachable = await _probeWithRetry();

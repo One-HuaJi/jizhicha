@@ -1,11 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   FileProvider 可共享的路径白名单。
-  综测自评表先写到 getTemporaryDirectory()（对应 cache-path），再经 FileProvider
-  转成 content:// URI 交给系统分享面板。不要开放整个存储根目录。
+  只开放 cache/exports/：综测 Word 先落到这个专用目录，再经 FileProvider
+  转为 content:// URI。绝不能开放整个 cache/files/external-files 树，里面可能
+  有成绩、课表、证明图或账号关联数据。
 -->
 <paths>
-    <cache-path name="cache" path="." />
-    <files-path name="files" path="." />
-    <external-files-path name="external_files" path="." />
+    <cache-path name="exports" path="exports/" />
 </paths>

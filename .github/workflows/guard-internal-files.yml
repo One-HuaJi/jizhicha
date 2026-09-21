@@ -6,14 +6,15 @@ on:
   pull_request:
 
 jobs:
-  guard:
+  # 1) Path guard: keep internal documents and binary release artifacts out of Git.
+  guard-paths:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Check for internal/local/build artifacts
         run: |
           set -o pipefail
-          forbidden='^(release/|.*/HANDOFF\.md$|.*/PROGRESS\.md$|.*\.(apk|zip|sha1|sha256|log)$|.*/key\.properties$|.*\.(keystore|jks|key|pem)$)'
+          forbidden='^(release/|.*/HANDOFF\.md$|.*/PROGRESS\.md$|.*/docs/internal/|.*\.(apk|aab|zip|sha1|sha256|log|exe|msi|dll|so|pdb|docx|xlsx)$|.*/key\.properties$|.*\.(keystore|jks|key|pem)$)'
           hits="$(git ls-files | grep -E "$forbidden" || true)"
           if [ -n "$hits" ]; then
             echo "::error::The following files must not be committed to the public repo:"
@@ -23,3 +24,69 @@ jobs:
             exit 1
           fi
           echo "OK: no internal/local/build artifacts found."
+
+  # 2) Privacy guard: personal identifiers must not appear in tracked text,
+  #    commit messages, or DOCX author metadata. A real author name previously
+  #    reached a public release because only file paths were checked.
+  guard-privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan tracked text for personal identifiers
+        run: |
+          set -o pipefail
+          pattern='(2024[0-9]{8}|生教[0-9]{4}班)'
+          hits="$(git grep -nIE "$pattern" -- . ':(exclude).github/workflows/*' || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::Personal identifiers found in tracked files:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no personal identifiers in tracked text."
+      - name: Scan commit messages for personal identifiers
+        run: |
+          set -o pipefail
+          pattern='(2024[0-9]{8}|生教[0-9]{4}班)'
+          hits="$(git log --format='%h %s' | grep -E "$pattern" || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::Personal identifiers found in commit messages:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no personal identifiers in commit messages."
+      - name: Scan DOCX assets for author metadata
+        run: |
+          set -o pipefail
+          fail=0
+          while IFS= read -r docx; do
+            [ -z "$docx" ] && continue
+            if ! unzip -p "$docx" docProps/core.xml > /tmp/core.xml 2>/dev/null; then
+              continue
+            fi
+            creator="$(grep -oE '<dc:creator>[^<]*' /tmp/core.xml | sed 's/<dc:creator>//' || true)"
+            modified="$(grep -oE '<cp:lastModifiedBy>[^<]*' /tmp/core.xml | sed 's/<cp:lastModifiedBy>//' || true)"
+            if [ "$creator" != "稽之查" ] || [ "$modified" != "稽之查" ]; then
+              echo "::error::$docx embeds non-neutral author metadata (creator='$creator', lastModifiedBy='$modified')"
+              fail=1
+            fi
+          done < <(git ls-files '*.docx')
+          [ "$fail" -eq 0 ] || exit 1
+          echo "OK: tracked DOCX assets have neutral author metadata."
+
+  # 3) Dependency guard: manifests must stay consistent with their lockfiles.
+  guard-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Flutter lockfile is respected
+        working-directory: jizhicha
+        run: flutter pub get --enforce-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo workspace metadata is locked
+        working-directory: jizhicha/huse-vpn-next
+        run: cargo metadata --locked --format-version 1 > /dev/null

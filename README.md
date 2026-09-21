@@ -45,20 +45,28 @@ flutter build windows --release
 ```powershell
 $env:PUB_CACHE = '<your-flutter-pub-cache>'
 rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
-flutter build apk --release --split-per-abi
-# 产物：build\app\outputs\flutter-apk\app-<arch>-release.apk
+flutter build apk --release --target-platform android-arm64
+# 产物：build\app\outputs\flutter-apk\app-release.apk（仅 arm64-v8a）
 ```
 
 > 最低支持 Android 8.0（API 26）
+>
+> **发布版只提供 arm64 真机包**（不含 armeabi-v7a 与 x86_64 模拟器版本）。
+> 其它 ABI 的原生库会在打包前被过滤，见 `android/app/build.gradle.kts` 末尾的
+> `[abi-filter]` 段。
+>
+> 签名凭据通过 `JIZHICHA_KEYSTORE_FILE` / `JIZHICHA_KEY_ALIAS` /
+> `JIZHICHA_STORE_PASSWORD` / `JIZHICHA_KEY_PASSWORD` 环境变量提供；
+> `android/key.properties` 只保留非敏感的路径与别名。
 
 ## 下载
 
 前往 [Releases](https://github.com/One-HuaJi/jizhicha/releases) 获取预编译安装包：
 
-- `Jizhicha-vX.X.X-Windows.zip` — 解压即用
-- `Jizhicha-vX.X.X-arm64.apk` — 主流 Android 手机
-- `Jizhicha-vX.X.X-armeabi-v7a.apk` — 老旧 Android 设备
-- `Jizhicha-vX.X.X-x86_64.apk` — 模拟器
+- `jizhicha-vX.X.X-arm64-v8a.apk` — Android 真机（当前唯一提供的 Android 包）
+
+> v1.1.0 起不再发布 armeabi-v7a / x86_64 模拟器版本，也不再发布 Windows 包。
+> 每个正式包都附带 `SHA1SUMS` / `SHA256SUMS`，安装前可自行校验。
 
 ## 反馈
 

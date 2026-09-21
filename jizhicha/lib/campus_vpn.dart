@@ -10,8 +10,9 @@ import 'package:ffi/ffi.dart' as ffi_utils;
 import 'package:flutter/services.dart' show MethodChannel;
 
 import 'credential_store.dart';
-// 扩展方法 `isRetryable` / `message` 定义在 VpnFailureText 里，必须一并引入。
-import 'vpn_session.dart' show VpnFailure, VpnFailureText, classifyVpnError;
+// `classifyVpnError` 与 `VpnFailure` 枚举来自状态机；错误文案（`message`）由
+// UI 层通过 `VpnFailureText` 取，这里不再需要引入该扩展名。
+import 'vpn_session.dart' show VpnFailure, classifyVpnError;
 
 typedef _ConnectNative =
     ffi.Int32 Function(
@@ -90,9 +91,9 @@ class _EmbeddedVpnBindings {
 
   Future<Map<String, dynamic>> androidStatus() async {
     final value = await _androidChannel.invokeMethod<String>('status');
-    if (value == null || value.isEmpty) throw 'Android 加速器状态为空';
+    if (value == null || value.isEmpty) throw '加速器未返回状态信息，请重试';
     final decoded = jsonDecode(value);
-    if (decoded is! Map<String, dynamic>) throw 'Android 加速器状态格式错误';
+    if (decoded is! Map<String, dynamic>) throw '加速器状态异常，请重试';
     return decoded;
   }
 
@@ -124,9 +125,9 @@ class _EmbeddedVpnBindings {
     ensureLoaded();
     final pointer = _status!();
     try {
-      if (pointer.address == 0) throw '加速器状态接口返回为空';
+      if (pointer.address == 0) throw '加速器未返回状态信息，请重试';
       final decoded = jsonDecode(pointer.toDartString());
-      if (decoded is! Map<String, dynamic>) throw '加速器状态接口返回格式错误';
+      if (decoded is! Map<String, dynamic>) throw '加速器状态异常，请重试';
       return decoded;
     } finally {
       _freeString!(pointer);
@@ -162,12 +163,6 @@ class CampusVpnLauncher {
   bool _isWintunCleanupFailure(Object error) =>
       classifyVpnError(error) == VpnFailure.adapterBusy;
 
-  /// 是否属于"值得重试"的瞬时失败。
-  ///
-  /// 两个平台共用同一套判定 —— 以前 Android 分支完全没有重试，导致
-  /// 同样一个瞬时错误在桌面端被自动兜住、在手机上直接甩给用户。
-  bool _isTransientFailure(Object error) => classifyVpnError(error).isRetryable;
-
   bool _isTransientWindowsFailure(Object error) {
     final kind = classifyVpnError(error);
     return kind == VpnFailure.adapterBusy ||
@@ -202,14 +197,12 @@ class CampusVpnLauncher {
         passwordPointer,
         sourcePointer,
       );
-      if (result != 0) throw '内置加速器参数无效';
+      if (result != 0) throw '加速器启动参数无效，请重试';
       final deadline = DateTime.now().add(const Duration(seconds: 60));
       Object? lastError;
-      String? lastStage;
       while (DateTime.now().isBefore(deadline)) {
         await Future<void>.delayed(const Duration(milliseconds: 350));
         final status = _bindings.status();
-        lastStage = status['stage']?.toString();
         final message = status['message']?.toString();
         if (message != null && message.isNotEmpty) onProgress?.call(message);
         if (status['connected'] == true) {
@@ -228,7 +221,9 @@ class CampusVpnLauncher {
             virtualIp = _bindings.status()['virtual_ip']?.toString();
           }
           if (virtualIp == null || virtualIp.isEmpty) {
-            throw '加速器已连接但虚拟 IP 未下发，请重试';
+            // ⚠️ 与 Android 分支同文案，且是 `classifyVpnError` 的匹配键
+            // （见 vpn_session.dart 的 '尚未获取到校园网地址'）。
+            throw '加速器已连接，但尚未获取到校园网地址，请重试';
           }
           onSourceAddressChanged?.call(virtualIp);
           return;
@@ -244,7 +239,8 @@ class CampusVpnLauncher {
           }
         }
       }
-      throw lastError ?? '校园加速器连接超时（当前阶段：${lastStage ?? '未知'}，请重试）';
+      // 不把内部阶段名（sac/session/tls/nc_auth）显示给用户：看不懂也没法行动。
+      throw lastError ?? '校园加速器连接超时，请重试';
     } finally {
       ffi_utils.calloc.free(userPointer);
       ffi_utils.calloc.free(passwordPointer);
@@ -275,7 +271,14 @@ class CampusVpnLauncher {
       await Future<void>.delayed(const Duration(milliseconds: 350));
       final status = await _bindings.androidStatus();
       final message = status['message']?.toString();
-      if (message != null && message.isNotEmpty) onProgress?.call(message);
+      if (message != null && message.isNotEmpty) {
+        onProgress?.call(message);
+      } else {
+        // No native message means the service has not produced a status yet.
+        // Surface the raw payload so a stalled connect is diagnosable from the
+        // screen (MIUI suppresses app Log output in release builds).
+        onProgress?.call('原生状态：${jsonEncode(status)}');
+      }
       if (status['connected'] == true) {
         // 隧道刚标记 connected 时，原生层有时还没把虚拟 IP 填进 status。
         // 探测 HttpClient 必须绑定这个虚拟 IP 才能避开 FlClash TUN，
@@ -293,7 +296,10 @@ class CampusVpnLauncher {
               ?.toString();
         }
         if (virtualIp == null || virtualIp.isEmpty) {
-          throw '加速器已连接但虚拟 IP 未下发，请重试';
+          // ⚠️ 这段文字同时是 `classifyVpnError` 的匹配键（见 vpn_session.dart
+          // 的 '尚未获取到校园网地址'）。改文案必须同步改分类器，否则会
+          // 静默退化成 unknown。
+          throw '加速器已连接，但尚未获取到校园网地址，请重试';
         }
         onSourceAddressChanged?.call(virtualIp);
         return;
@@ -310,32 +316,6 @@ class CampusVpnLauncher {
     throw lastError ?? '校园加速器连接超时';
   }
 
-  /// 等待原生状态回到 idle（或超时）。
-  ///
-  /// ⚠️ 重连前必须等这一步。学校网关是**"同账号新会话踢掉旧会话"**的语义，
-  /// 而 Rust 侧 `stop_all()` 里的 `task.abort()` 只是"请求取消"，老 tunnel 的
-  /// TLS 连接、老 heartbeat 在途请求并不会立刻释放。若不等就发起新的 LOGIN，
-  /// 新旧会话会在网关侧撞车 —— 这正是"第 1、2 次连接失败、第 3 次才成功"
-  /// 的直接原因（真机实测：失败重试最久到 30 秒以上才收敛）。
-  Future<void> _waitForIdle({
-    Duration timeout = const Duration(seconds: 6),
-  }) async {
-    final deadline = DateTime.now().add(timeout);
-    while (DateTime.now().isBefore(deadline)) {
-      try {
-        final status = await _bindings.androidStatus();
-        final stage = status['stage']?.toString() ?? '';
-        if (!(status['connected'] == true) &&
-            (stage == 'idle' || stage.isEmpty || stage == 'starting')) {
-          return;
-        }
-      } catch (_) {
-        return;
-      }
-      await Future<void>.delayed(const Duration(milliseconds: 300));
-    }
-  }
-
   Future<void> connect({
     required String username,
     required String password,
@@ -343,60 +323,24 @@ class CampusVpnLauncher {
     void Function(String message)? onProgress,
   }) async {
     if (Platform.isAndroid) {
-      // ⚠️ Android 以前完全没有重试，任何瞬时失败都直接抛给用户。
-      // Windows 侧一直有 `_isTransientWindowsFailure` + 最多 2 次重试，
-      // 两边行为不一致是"Android 上第 1、2 次失败"的成因之一。
-      // 这里对齐 Windows：瞬时错误重试，凭据/权限错误立即上抛。
-      Object lastError;
-      try {
-        await _connectAndroidOnce(
-          username: username,
-          password: password,
-          authSource: authSource,
-          onProgress: onProgress,
-        );
-        return;
-      } on AcceleratorPermissionDenied {
-        rethrow;
-      } catch (error) {
-        lastError = error;
-      }
-
-      if (!_isTransientFailure(lastError) ||
-          classifyVpnError(lastError) == VpnFailure.badCredentials) {
-        throw lastError;
-      }
-
-      // 与 Windows 相同：最多再试 2 次，每次先真正断开并等待原生回到 idle，
-      // 让网关有机会淘汰旧会话后再重建。
-      for (var retry = 0; retry < 2; retry++) {
-        onProgress?.call('正在等待学校网关释放上一次会话…');
-        try {
-          await disconnect();
-        } catch (_) {
-          // 断开本身失败不阻断重试；下一次连接会给出最终错误。
-        }
-        await _waitForIdle();
-        await Future<void>.delayed(
-          Duration(milliseconds: retry == 0 ? 1200 : 2500),
-        );
-        try {
-          await _connectAndroidOnce(
-            username: username,
-            password: password,
-            authSource: authSource,
-            onProgress: onProgress,
-          );
-          return;
-        } catch (error) {
-          lastError = error;
-          if (!_isTransientFailure(error) ||
-              classifyVpnError(error) == VpnFailure.badCredentials) {
-            rethrow;
-          }
-        }
-      }
-      throw lastError;
+      // ⚠️ Android 只做**一次**连接尝试，不在这一层做断开重连循环。
+      //
+      // 曾经在这里加过「失败 → disconnect → 等 idle → 再连」的最多 2 次重试，
+      // 结果是**把人卡死在"正在连接"**：重连会重启前台服务，而系统 VPN 权限、
+      // TUN 建立与网关侧的旧会话释放都不是"断开就能立刻干净"的，重试反而让
+      // 状态在 stopSelf / 重新 startForeground 之间来回摆动，Dart 侧最后
+      // 卡在一个等不到回包的原生调用上。
+      //
+      // 网关收敛（实测 6~9 秒，偶尔 >30 秒）本来就由调用方的
+      // `waitForIntranet`（45 秒、对**真正要用的教务端点**轮询）耐心等待，
+      // 不需要在这一层急着重连。失败就如实上报，交给用户决定是否重试。
+      await _connectAndroidOnce(
+        username: username,
+        password: password,
+        authSource: authSource,
+        onProgress: onProgress,
+      );
+      return;
     }
     try {
       await _connectWindowsOnce(
@@ -416,7 +360,7 @@ class CampusVpnLauncher {
       Object lastError = firstError;
       final retryCount = _isWintunCleanupFailure(firstError) ? 2 : 1;
       for (var retry = 0; retry < retryCount; retry++) {
-        onProgress?.call('正在清理上次加速器会话，请稍候…');
+        onProgress?.call('正在清理上次会话，请稍候…');
         try {
           await disconnect();
         } catch (_) {

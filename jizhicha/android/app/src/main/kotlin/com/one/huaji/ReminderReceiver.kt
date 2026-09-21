@@ -72,6 +72,27 @@ class ReminderReceiver : BroadcastReceiver() {
             .setContentTitle("上课提醒：" + name)
             .setContentText(contentText)
             .setAutoCancel(true)
+            // Lock-screen privacy: course, teacher and room stay on the
+            // unlocked device; the public (locked) version is generic.
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setPublicVersion(
+                if (android.os.Build.VERSION.SDK_INT >= 26) {
+                    Notification.Builder(context, channelId)
+                        .setSmallIcon(R.drawable.ic_stat_notification)
+                        .setContentTitle("稽之查")
+                        .setContentText("你有一条上课提醒")
+                        .setAutoCancel(true)
+                        .build()
+                } else {
+                    @Suppress("DEPRECATION")
+                    Notification.Builder(context)
+                        .setSmallIcon(R.drawable.ic_stat_notification)
+                        .setContentTitle("稽之查")
+                        .setContentText("你有一条上课提醒")
+                        .setAutoCancel(true)
+                        .build()
+                },
+            )
         if (pending != null) builder.setContentIntent(pending)
         manager.notify(1001, builder.build())
     }

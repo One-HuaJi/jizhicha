@@ -7,7 +7,7 @@
 //! network and does not need an Android `protect()` callback.
 
 use crate::error::{HuseVpnError, Result};
-use crate::nc::{build_nc_data_frame, parse_nc_data_frames};
+use crate::nc::{build_nc_data_frame, NcFrameAssembler};
 use crate::tls::RawTlsClient;
 use std::fs::File;
 use std::io;
@@ -56,9 +56,11 @@ pub async fn run_android_tunnel(tls: RawTlsClient, tun_fd: RawFd) -> Result<()> 
     };
 
     let downlink = async move {
+        // Reassemble NC frames that may be split across TLS record boundaries.
+        let mut assembler = NcFrameAssembler::new();
         loop {
             let record = tls_reader.read_record().await?;
-            for packet in parse_nc_data_frames(&record)? {
+            for packet in assembler.feed(&record)? {
                 // 下行同理：坏包丢弃，不中断整条隧道。
                 if validate_ip_packet(&packet).is_err() {
                     continue;

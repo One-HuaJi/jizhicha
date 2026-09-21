@@ -1,20 +1,28 @@
+# ARCHIVED SOURCE — not built, not packaged.
+#
+# The product embeds the VPN through Flutter FFI; this standalone Tauri shell is
+# kept only as source history and is excluded from the workspace in
+# `../../Cargo.toml`. Because it is excluded, it must NOT use `workspace = true`
+# inheritance (that cannot resolve without a workspace root), so the versions
+# below are pinned explicitly. If this crate is ever revived, re-add it to the
+# workspace `members` and switch these back to inheritance.
 [package]
 name = "huse-vpn-desktop"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-chrono = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
 huse-vpn-core = { path = "../../core" }
-reqwest = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tauri = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-zeroize = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "cookies"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = "1"
