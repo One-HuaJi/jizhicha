@@ -15,7 +15,11 @@ jobs:
         run: |
           set -o pipefail
           forbidden='^(release/|.*/HANDOFF\.md$|.*/PROGRESS\.md$|.*/docs/internal/|.*\.(apk|aab|zip|sha1|sha256|log|exe|msi|dll|so|pdb|docx|xlsx)$|.*/key\.properties$|.*\.(keystore|jks|key|pem)$)'
-          hits="$(git ls-files | grep -E "$forbidden" || true)"
+          # 必须入库的构建资产，显式放行（不要放宽上面的规则本身）：
+          #   - 综测导出模板：官方 .docx 骨架，元数据由下面的 DOCX 检查单独把关
+          #   - Wintun：Windows 端 VPN 的必需运行库，属于随包分发而非构建残留
+          allowed='^(jizhicha/assets/templates/[^/]+\.docx|jizhicha/windows/wintun/wintun\.dll)$'
+          hits="$(git ls-files | grep -E "$forbidden" | grep -vE "$allowed" || true)"
           if [ -n "$hits" ]; then
             echo "::error::The following files must not be committed to the public repo:"
             echo "$hits"
@@ -37,25 +41,51 @@ jobs:
       - name: Scan tracked text for personal identifiers
         run: |
           set -o pipefail
-          pattern='(2024[0-9]{8}|生教[0-9]{4}班)'
-          hits="$(git grep -nIE "$pattern" -- . ':(exclude).github/workflows/*' || true)"
+          fail=0
+
+          # 1) 已知的真实标识 —— 一旦出现必定是泄漏。
+          known='(***REMOVED-STUDENT-ID***|***REMOVED-STUDENT-ID***|***REMOVED-CLASS***|***REMOVED-NAME***|***REMOVED-NAME***)'
+          hits="$(git grep -nIE "$known" -- . ':(exclude).github/workflows/*' || true)"
           if [ -n "$hits" ]; then
-            echo "::error::Personal identifiers found in tracked files:"
+            echo "::error::Known real personal identifiers found:"
             echo "$hits"
-            exit 1
+            fail=1
           fi
+
+          # 2) 形如真实学号的 12 位数字，但排除已文档化的合成占位号段
+          #    2024000000xx（测试 fixture 使用）。这样以后即使有人粘进新的
+          #    真实学号也仍会被拦下，而不会误报合法占位数据。
+          ids="$(git grep -nIE '2024[0-9]{8}' -- . ':(exclude).github/workflows/*' \
+                 | grep -vE '2024000000[0-9]{2}' || true)"
+          if [ -n "$ids" ]; then
+            echo "::error::Student-ID-shaped values outside the 2024000000xx placeholder block:"
+            echo "$ids"
+            fail=1
+          fi
+
+          # 3) 真实班级名形态，排除已文档化的示例班（生教2401班）。
+          cls="$(git grep -nIE '生教[0-9]{4}班' -- . ':(exclude).github/workflows/*' \
+                 | grep -vE '生教2401班' || true)"
+          if [ -n "$cls" ]; then
+            echo "::error::Class-name-shaped values outside the documented example:"
+            echo "$cls"
+            fail=1
+          fi
+
+          [ "$fail" -eq 0 ] || exit 1
           echo "OK: no personal identifiers in tracked text."
       - name: Scan commit messages for personal identifiers
         run: |
           set -o pipefail
-          pattern='(2024[0-9]{8}|生教[0-9]{4}班)'
-          hits="$(git log --format='%h %s' | grep -E "$pattern" || true)"
+          # 提交信息只查已知真实标识：合法占位数据（2024000000xx）不应导致失败。
+          known='(***REMOVED-STUDENT-ID***|***REMOVED-STUDENT-ID***|***REMOVED-CLASS***)'
+          hits="$(git log --format='%h %s' | grep -E "$known" || true)"
           if [ -n "$hits" ]; then
-            echo "::error::Personal identifiers found in commit messages:"
+            echo "::error::Known real personal identifiers found in commit messages:"
             echo "$hits"
             exit 1
           fi
-          echo "OK: no personal identifiers in commit messages."
+          echo "OK: no known personal identifiers in commit messages."
       - name: Scan DOCX assets for author metadata
         run: |
           set -o pipefail

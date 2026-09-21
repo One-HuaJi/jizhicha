@@ -444,7 +444,9 @@ Future<ZongceDocxResult> buildZongceDocx(
     document,
     0,
     _pRuns([
-      const _Run('化生院学生综合测评加减分自评表  ', bold: true),
+      // 标题不带学院名：本表由学生自己填写后交给班主任/辅导员，
+      // 学院名由接收方按归档要求处理，表头保持通用。
+      const _Run('综合测评加减分自评表  ', bold: true),
       const _Run('（班级：'),
       _Run(cls.isEmpty ? '　　　　　' : cls, underline: true),
       const _Run('）'),

@@ -686,6 +686,29 @@ void main() {
       expect(doc, contains('2024xxxxxx'));
     });
 
+    test('标题不带学院名', () async {
+      // 表头由学生自己填写后交给班主任/辅导员，学院名由接收方按归档要求处理，
+      // 因此标题里不应再出现「化生院学生」这类学院前缀。
+      final r = await buildZongceDocx(filled(), templateBytes: tpl);
+      final doc = utf8.decode(unzip(r.bytes)['word/document.xml']!);
+      expect(doc, contains('综合测评加减分自评表'));
+      expect(
+        doc,
+        isNot(contains('化生院')),
+        reason: '标题里不应再出现学院名',
+      );
+    });
+
+    test('模板本身的标题也不带学院名（导出前直接打开也不该看到）', () {
+      final doc = utf8.decode(unzip(tpl)['word/document.xml']!);
+      expect(doc, contains('综合测评加减分自评表'));
+      expect(
+        doc,
+        isNot(contains('化生院')),
+        reason: 'assets 里的官方模板也必须同步去掉学院前缀',
+      );
+    });
+
     test('表头与项目名等模板原文保持不变（框架不动）', () async {
       final r = await buildZongceDocx(filled(), templateBytes: tpl);
       final doc = utf8.decode(unzip(r.bytes)['word/document.xml']!);
