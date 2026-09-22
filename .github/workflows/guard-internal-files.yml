@@ -44,12 +44,22 @@ jobs:
           fail=0
 
           # 1) 已知的真实标识 —— 一旦出现必定是泄漏。
-          known='(***REMOVED-STUDENT-ID***|***REMOVED-STUDENT-ID***|***REMOVED-CLASS***|***REMOVED-NAME***|***REMOVED-NAME***)'
-          hits="$(git grep -nIE "$known" -- . ':(exclude).github/workflows/*' || true)"
-          if [ -n "$hits" ]; then
-            echo "::error::Known real personal identifiers found:"
-            echo "$hits"
-            fail=1
+          #
+          # 🔴 这里**绝对不能**把真实值写进仓库：本工作流是**公开可见**的！
+          # 早先的版本把真实学号/班级名/姓名直接写成了正则字面量，结果
+          # **"用来防泄漏的守卫自己变成了泄漏源"**（已确认泄露，并已从历史中清除）。
+          # 现在改为从仓库 Secret `KNOWN_REAL_IDENTIFIERS` 读取（`|` 分隔的正则片段）。
+          # 未配置该 Secret 时**跳过**这一条，只靠下面 2)3) 的形态扫描 —— 宁可少拦，
+          # 也绝不把真实值放进公开仓库。
+          if [ -n "${KNOWN_REAL_IDENTIFIERS:-}" ]; then
+            hits="$(git grep -nIE "$KNOWN_REAL_IDENTIFIERS" -- . ':(exclude).github/workflows/*' || true)"
+            if [ -n "$hits" ]; then
+              echo "::error::Known real personal identifiers found:"
+              echo "$hits"
+              fail=1
+            fi
+          else
+            echo "::notice::KNOWN_REAL_IDENTIFIERS 未配置，跳过「已知标识硬拦」（形态扫描仍然生效）。"
           fi
 
           # 2) 形如真实学号的 12 位数字，但排除已文档化的合成占位号段
@@ -75,11 +85,18 @@ jobs:
           [ "$fail" -eq 0 ] || exit 1
           echo "OK: no personal identifiers in tracked text."
       - name: Scan commit messages for personal identifiers
+        env:
+          KNOWN_REAL_IDENTIFIERS: ${{ secrets.KNOWN_REAL_IDENTIFIERS }}
         run: |
           set -o pipefail
           # 提交信息只查已知真实标识：合法占位数据（2024000000xx）不应导致失败。
-          known='(***REMOVED-STUDENT-ID***|***REMOVED-STUDENT-ID***|***REMOVED-CLASS***)'
-          hits="$(git log --format='%h %s' | grep -E "$known" || true)"
+          # 同上前提：真实值**绝不能**写进这个公开文件，只能来自 Secret。
+          # 未配置时跳过（本仓库历史已确认不含真实标识，见 HANDOFF 的隐私留档）。
+          if [ -z "${KNOWN_REAL_IDENTIFIERS:-}" ]; then
+            echo "::notice::KNOWN_REAL_IDENTIFIERS 未配置，跳过提交信息硬拦。"
+            exit 0
+          fi
+          hits="$(git log --format='%h %s' | grep -E "$KNOWN_REAL_IDENTIFIERS" || true)"
           if [ -n "$hits" ]; then
             echo "::error::Known real personal identifiers found in commit messages:"
             echo "$hits"
@@ -130,3 +147,33 @@ jobs:
       - name: Cargo workspace metadata is locked
         working-directory: jizhicha/huse-vpn-next
         run: cargo metadata --locked --format-version 1 > /dev/null
+
+  # 4) Rust guard: rustfmt + clippy + 测试。clippy 以 `-D warnings` 运行，
+  #    因此任何新告警都会直接让 CI 失败（零告警门禁）。
+  #
+  # 为什么必须用 windows-latest 而不是 ubuntu-latest：
+  # `ffi` crate 通过 `#[path]` 引入了 `desktop/src-tauri/src/commands.rs`，
+  # 而该文件 `use huse_vpn_core::tunnel::...`；core 里的 `tunnel` 模块本身是
+  # `#[cfg(windows)]` 的。于是在 Linux 目标下 `ffi` 根本编译不出来 ——
+  # 这是**既有**问题，不是本 job 引入的。Windows 才是这套桌面 FFI 的真实
+  # 目标平台，所以 Rust 门禁跟着目标平台走。
+  #
+  # toolchain 与 jizhicha/huse-vpn-next/rust-toolchain.toml 固定的 1.98.1
+  # 保持一致，避免 CI 用另一版 Rust 校验出与发布工具链无关的差异。
+  guard-rust:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.98.1'
+          components: rustfmt, clippy
+      - name: rustfmt
+        working-directory: jizhicha/huse-vpn-next
+        run: cargo fmt --all -- --check
+      - name: clippy
+        working-directory: jizhicha/huse-vpn-next
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: tests
+        working-directory: jizhicha/huse-vpn-next
+        run: cargo test --workspace
