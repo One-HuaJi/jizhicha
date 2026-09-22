@@ -45,12 +45,10 @@ jobs:
 
           # 1) 已知的真实标识 —— 一旦出现必定是泄漏。
           #
-          # 🔴 这里**绝对不能**把真实值写进仓库：本工作流是**公开可见**的！
-          # 早先的版本把真实学号/班级名/姓名直接写成了正则字面量，结果
-          # **"用来防泄漏的守卫自己变成了泄漏源"**（已确认泄露；工作树中的值已清除，历史残留另行重写处理）。
-          # 现在改为从仓库 Secret `KNOWN_REAL_IDENTIFIERS` 读取（`|` 分隔的正则片段）。
-          # 未配置该 Secret 时**跳过**这一条，只靠下面 2)3) 的形态扫描 —— 宁可少拦，
-          # 也绝不把真实值放进公开仓库。
+          # 🔴 取值**绝对不能**写进仓库：本工作流是**公开可见**的。
+          # 它只能来自仓库 Secret `KNOWN_REAL_IDENTIFIERS`（`|` 分隔的正则片段）；
+          # 未配置该 Secret 时**跳过**这一条，只靠下面 2)3) 的形态扫描 ——
+          # 宁可少拦，也绝不把真实值放进公开仓库。
           if [ -n "${KNOWN_REAL_IDENTIFIERS:-}" ]; then
             hits="$(git grep -nIE "$KNOWN_REAL_IDENTIFIERS" -- . ':(exclude).github/workflows/*' || true)"
             if [ -n "$hits" ]; then
@@ -91,7 +89,7 @@ jobs:
           set -o pipefail
           # 提交信息只查已知真实标识：合法占位数据（2024000000xx）不应导致失败。
           # 同上前提：真实值**绝不能**写进这个公开文件，只能来自 Secret。
-          # 未配置时跳过（本仓库历史已确认不含真实标识，见 HANDOFF 的隐私留档）。
+          # 未配置时跳过（该值只应存在于 Secret 中）。
           if [ -z "${KNOWN_REAL_IDENTIFIERS:-}" ]; then
             echo "::notice::KNOWN_REAL_IDENTIFIERS 未配置，跳过提交信息硬拦。"
             exit 0
