@@ -8,6 +8,7 @@ import 'auth_pages.dart';
 import 'campus_environment.dart';
 import 'campus_sync_helpers.dart';
 import 'common.dart';
+import 'education_auto_login.dart';
 import 'offline_sync.dart';
 import 'schedule_cache_store.dart';
 import 'sync_cooldown.dart';
@@ -37,6 +38,10 @@ class _GradesPageState extends State<GradesPage>
   bool _hasSavedSnapshot = false;
   String? _selectedGradeUpdateTerm;
   String? _selectedGradeTerm;
+  /// 自动认证教务系统是否正在进行。`_loading` 要等认证成功之后才置位，所以
+  /// 自动认证这段时间必须另有一个标记来挡连点，否则两次并发登录会连着打
+  /// 学校网关（风控风险）。见 education_auto_login.dart。
+  bool _educationAutoLoginBusy = false;
   // 折叠状态：默认两个分组都展开；点击分组标题可切换
   bool _showDone = true;
   bool _showRetry = true;
@@ -46,7 +51,8 @@ class _GradesPageState extends State<GradesPage>
     super.initState();
     appSettingsRevision.addListener(_reloadDisplaySettings);
     campusEnvironment.addListener(_refreshCampusEnvironment);
-    dataSyncCooldown.addListener(_refreshSyncCooldown);
+    // 冷却倒计时不再由整页监听：只有「更新按钮 + 冷却指示器」那一小块重建，
+    // 见 SyncCooldownIndicator 与下面包住按钮的 ListenableBuilder。
     _loadLocal();
   }
 
@@ -54,7 +60,6 @@ class _GradesPageState extends State<GradesPage>
   void dispose() {
     appSettingsRevision.removeListener(_reloadDisplaySettings);
     campusEnvironment.removeListener(_refreshCampusEnvironment);
-    dataSyncCooldown.removeListener(_refreshSyncCooldown);
     super.dispose();
   }
 
@@ -62,13 +67,9 @@ class _GradesPageState extends State<GradesPage>
     if (mounted) setState(() {});
     if (mounted && campusEnvironment.consumeDropDetected()) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('校园加速器已断开，请重新连接')),
+        const SnackBar(content: Text('校园网已断开，请重新连接')),
       );
     }
-  }
-
-  void _refreshSyncCooldown() {
-    if (mounted) setState(() {});
   }
 
   Future<void> _openAcceleratorSetup() async {
@@ -82,7 +83,8 @@ class _GradesPageState extends State<GradesPage>
 
 
   /// 手动刷新成绩默认只请求最新学期；可切换为指定学期或全部已知学期。
-  /// 校园内网和当前教务会话都有效时直接请求，不重复打开认证页。
+  /// 校园内网和当前教务会话都有效时直接请求，不重复打开认证页；会话失效时
+  /// 先试一次静默的自动认证（需求 3），只有确实做不到才跳手动认证页。
   Future<void> _openGradeUpdate() async {
     if (_loading) return;
     if (dataSyncCooldown.isCooling(SyncResource.grade)) {
@@ -93,7 +95,37 @@ class _GradesPageState extends State<GradesPage>
     final fetchAll = selected == _allGradeTermsValue;
     final term = fetchAll || selected == null ? null : selected;
     final scope = fetchAll ? GradeSyncScope.all : GradeSyncScope.latest;
-    if (await canReuseEducationSession()) {
+    final scopeNotice = fetchAll
+        ? '本次只更新全部已知学期成绩，不会重新抓取课表'
+        : term == null
+        ? '本次只更新最新学期成绩，不会重新抓取课表'
+        : '本次只更新 $term 成绩，不会重新抓取课表';
+
+    // 需求 3：先复用教务会话；会话没了就先试静默自动认证，成功则用户完全
+    // 无感地继续同步。自动认证要花几秒，而这段时间 `_loading` 还没置位，
+    // 必须先自己挡一次连点（否则会并发登录，学校网关有风控）。
+    if (_educationAutoLoginBusy) return;
+    _educationAutoLoginBusy = true;
+    var sessionReady = false;
+    String? autoLoginNotice;
+    try {
+      sessionReady = await canReuseEducationSession();
+      if (!sessionReady) {
+        final result = await tryAutoEducationLogin(studentId: widget.studentId);
+        switch (result) {
+          case AutoLoginSuccess():
+            sessionReady = true;
+          case AutoLoginFailure(:final message):
+            autoLoginNotice = message;
+        }
+      }
+    } finally {
+      _educationAutoLoginBusy = false;
+    }
+
+    if (sessionReady) {
+      // 自动认证比原来多花几秒，用户可能已经离开这一页；离开后不能 setState。
+      if (!mounted) return;
       setState(() {
         _loading = true;
         _error = null;
@@ -133,11 +165,10 @@ class _GradesPageState extends State<GradesPage>
           gradeSyncScope: scope,
           syncSchedules: false,
           gradeTerm: term,
-          initialNotice: fetchAll
-              ? '本次只更新全部已知学期成绩，不会重新抓取课表'
-              : term == null
-              ? '本次只更新最新学期成绩，不会重新抓取课表'
-              : '本次只更新 $term 成绩，不会重新抓取课表',
+          // 自动认证的失败原因放在最前面：用户最需要知道"为什么还要手动登录"。
+          initialNotice: autoLoginNotice == null
+              ? scopeNotice
+              : '$autoLoginNotice；$scopeNotice',
         ),
       ),
     );
@@ -210,6 +241,12 @@ class _GradesPageState extends State<GradesPage>
   }
 
   PreferredSizeWidget _buildAppBar() {
+    // ⚠️ 展示层"已连接"判据：online（最强）**或**仅 acceleratorUp（隧道已建立、
+    // 校园网还在确认）。它与 `_handleCampusAcceleratorAction` 里的门禁**用的是
+    // 同一套**判据（那边是 `online != true && acceleratorUp != true` 才去认证页），
+    // 所以不会出现「按钮写着登出、点下去却跳认证页」。
+    final connected =
+        campusEnvironment.online == true || campusEnvironment.acceleratorUp;
     return AppBar(
       title: const Text('本地成绩'),
       actions: [
@@ -233,20 +270,15 @@ class _GradesPageState extends State<GradesPage>
                     dimension: 16,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : Icon(
-                    campusEnvironment.online == true
-                        ? Icons.logout
-                        : Icons.vpn_lock,
-                    size: 18,
-                  ),
+                : Icon(connected ? Icons.logout : Icons.vpn_lock, size: 18),
             label: Text(
               campusEnvironment.reconnecting
                   ? '重连中'
                   : campusEnvironment.actionLoading
                   ? '正在登出…'
-                  : campusEnvironment.online == true
-                  ? '登出加速器'
-                  : '连接校园加速器',
+                  : connected
+                  ? '登出校园加速器'
+                  : '连接校园网',
             ),
           ),
       ],
@@ -308,13 +340,18 @@ class _GradesPageState extends State<GradesPage>
                 ),
               ),
               const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed:
-                    _loading || dataSyncCooldown.isCooling(SyncResource.grade)
-                    ? null
-                    : _openGradeUpdate,
-                icon: const Icon(Icons.cloud_download, size: 18),
-                label: const Text('更新成绩'),
+              // 冷却状态只影响这个按钮的可用性，用 ListenableBuilder 局部重建，
+              // 避免冷却倒计时每秒 setState 触发整页（含成绩归档）重建。
+              ListenableBuilder(
+                listenable: dataSyncCooldown,
+                builder: (context, _) => OutlinedButton.icon(
+                  onPressed:
+                      _loading || dataSyncCooldown.isCooling(SyncResource.grade)
+                      ? null
+                      : _openGradeUpdate,
+                  icon: const Icon(Icons.cloud_download, size: 18),
+                  label: const Text('更新成绩'),
+                ),
               ),
             ],
           ),
@@ -428,6 +465,51 @@ class _GradesPageState extends State<GradesPage>
     list.sort((a, b) => _termSortKey(b.term).compareTo(_termSortKey(a.term)));
   }
 
+  // ==================== 成绩归档派生缓存 ====================
+  // 归档（按五字段合并 + 取最高分）+ 分组（已完成 / 补考重修）+ 按学年排序，
+  // 旧实现每次 build 都全量重跑——包括只切换"已完成/补考"折叠开关的 setState。
+  //
+  // 缓存失效条件（只有下面 3 项变化才重算）：
+  //   1) _grades 整体被替换（重新同步 / 读到本地缓存）；
+  //   2) 生效的学期筛选值 —— 由 _selectedGradeTerm 与 gradeTermFilterEnabled
+  //      共同决定，尚未筛选时两页都是 null，结果一致所以可共用同一份缓存；
+  //   3) gradeSortByYear —— 是否按学年从新到旧排序。
+  // 折叠开关、冷却倒计时等 setState 都直接复用缓存。
+  // 刻意用「可空字段 + 显式比较」而不是 late final：那种写法第一次算完就永不
+  // 刷新，重新同步或切换学期后会显示旧成绩。
+  List<Map<String, String>>? _archiveSource;
+  String? _archiveTerm;
+  bool? _archiveSortByYear;
+  List<_GradeArchive> _archiveAll = const [];
+  List<_GradeArchive> _archiveDone = const [];
+  List<_GradeArchive> _archiveRetry = const [];
+
+  void _ensureArchiveCache(String? selectedTerm, bool sortByYear) {
+    if (identical(_archiveSource, _grades) &&
+        _archiveTerm == selectedTerm &&
+        _archiveSortByYear == sortByYear) {
+      return;
+    }
+    final gradesForDisplay = selectedTerm == null
+        ? _grades
+        : _grades
+              .where((grade) => (grade['term'] ?? '').trim() == selectedTerm)
+              .toList(growable: false);
+    final archived = _archiveGrades(gradesForDisplay);
+    final done = archived.where((a) => !a.isFail).toList();
+    final retry = archived.where((a) => a.isFail).toList();
+    if (sortByYear) {
+      _sortByTermDesc(done);
+      _sortByTermDesc(retry);
+    }
+    _archiveSource = _grades;
+    _archiveTerm = selectedTerm;
+    _archiveSortByYear = sortByYear;
+    _archiveAll = archived;
+    _archiveDone = done;
+    _archiveRetry = retry;
+  }
+
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
@@ -473,7 +555,7 @@ class _GradesPageState extends State<GradesPage>
             Expanded(
               child: Center(
                 child: Text(
-                  _hasSavedSnapshot ? '本地成绩为空' : '暂无本地成绩，请连接校园加速器后认证并保存',
+                  _hasSavedSnapshot ? '本地成绩为空' : '暂无本地成绩，请连接校园网并认证后保存',
                   style: TextStyle(color: colorScheme.onSurfaceVariant),
                 ),
               ),
@@ -486,18 +568,11 @@ class _GradesPageState extends State<GradesPage>
     final selectedTerm = settings.gradeTermFilterEnabled
         ? _selectedGradeTerm
         : null;
-    final gradesForDisplay = selectedTerm == null
-        ? _grades
-        : _grades
-              .where((grade) => (grade['term'] ?? '').trim() == selectedTerm)
-              .toList(growable: false);
-    final archived = _archiveGrades(gradesForDisplay);
-    final done = archived.where((a) => !a.isFail).toList();
-    final retry = archived.where((a) => a.isFail).toList();
-    if (settings.gradeSortByYear) {
-      _sortByTermDesc(done);
-      _sortByTermDesc(retry);
-    }
+    // 归档 / 分组 / 排序走缓存，见 _ensureArchiveCache。
+    _ensureArchiveCache(selectedTerm, settings.gradeSortByYear);
+    final archived = _archiveAll;
+    final done = _archiveDone;
+    final retry = _archiveRetry;
 
     return Scaffold(
       appBar: _buildAppBar(),

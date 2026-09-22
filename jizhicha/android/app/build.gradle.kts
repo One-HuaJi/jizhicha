@@ -99,6 +99,36 @@ android {
                 signingConfig = signingConfigs.getByName("debug")
             }
             // 其余情况：保持未签名。真正打包 release 时由下面校验报错。
+
+            // ==================== R8 混淆 + 资源压缩 ====================
+            //
+            // 背景：在这之前 release {} 只配了签名，从未设置 isMinifyEnabled，
+            // 因此仓库里的 proguard-rules.pro 一直是**死配置**——规则文件从未被
+            // 引用，release 包实际上没有经过任何混淆/裁剪。下面三行才是真正的接线。
+            //
+            // ⚠️ 因果准确性（重要，勿再被交接文档误导）：项目文档曾把一次 Android
+            // OCR 闪退归因于「proguard 规则缺失」，但真实原因是 OCR 会话被改成
+            // **单线程（intraOpNumThreads=1）并关闭 CPU arena**，从而避开并发建会话
+            // 时的原生竞态与内存峰值——修好它的时候 R8 根本没生效（isMinifyEnabled
+            // 未开启、规则文件未被引用），所以那次修复不是 proguard 的功劳，也不能
+            // 反过来当作「proguard 已经过验证」的证据。
+            //
+            // ⚠️ 本次接线会彻底改变 release 包的类名/方法名，凡是被反射、JNI、
+            // 清单按名实例化的路径都可能直接崩。因此接线后**必须重新回归 release
+            // 包的 OCR（flutter_onnxruntime + libonnxruntime.so）与 VPN
+            // （CampusVpnService + libhuse_vpn_mobile_ffi.so）两条链路**，
+            // debug 包与历史包通过都不构成 release 包的验证。
+            isMinifyEnabled = true
+            // 资源压缩：删除 R8 判定为未被引用的 res 资源。必须与 isMinifyEnabled
+            // 同时开启（它依赖 R8 的用法分析结果），单独开启无效。
+            isShrinkResources = true
+            proguardFiles(
+                // optimize 版默认规则：在基础 keep 规则之上多一轮代码优化，
+                // 也是 Flutter/AGP 官方推荐的 release 组合。
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                // 应用自己的 keep 规则，见 android/app/proguard-rules.pro 的逐条说明。
+                "proguard-rules.pro",
+            )
         }
     }
 

@@ -15,7 +15,8 @@ use std::ffi::c_void;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::RawFd;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -58,6 +59,107 @@ const REQUIRED_TARGETS: [Ipv4Addr; 4] = [
 /// terminal, user-visible failure instead of an indefinitely pending future.
 const SETUP_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 取消任务时等待旧任务真正收尾的上限。
+///
+/// `.abort()` 只是**异步请求**取消：被取消的任务要再被 poll 一次才会释放 TLS
+/// 会话、TUN 等资源（对已经挂起在 await 上的任务就是微秒级）。这里在启动新任务
+/// 之前对旧 handle 做一次有界等待，让"取消 → 启动新任务"之间不再重叠。
+///
+/// 等待发生在 JNI 线程上（`nativeDisconnect` / `nativeStartTunnel` 可能由 Kotlin
+/// 主线程调用），因此上限必须很小：单槽位 250ms，`stop_all` 最多三个槽位，最坏
+/// 约 750ms，而常态是立即返回。超时不影响正确性 —— 代次校验会丢弃任何迟到写入。
+const CANCEL_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// 心跳正常间隔：网关会话有 15 分钟时限，60 秒续期一次留足余量。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 心跳失败退避阶梯：10s → 20s → 30s 封顶，与桌面侧保持同一序列。
+const HEARTBEAT_BACKOFF_STEPS: [u64; 3] = [10, 20, 30];
+
+/// 心跳降级态阶段名。Kotlin/Dart 侧按这个字符串判断"可恢复的不稳定"
+/// （CampusVpnService 见到它就只更新通知、不拆隧道），不能改名。
+const HEARTBEAT_ERROR_STAGE: &str = "heartbeat_error";
+
+/// 心跳失败后的下一次等待间隔：首次失败 10s，之后 20s、30s 封顶。
+fn heartbeat_backoff(consecutive_failures: u32) -> Duration {
+    let last = HEARTBEAT_BACKOFF_STEPS.len() as u32 - 1;
+    let index = consecutive_failures.saturating_sub(1).min(last) as usize;
+    Duration::from_secs(HEARTBEAT_BACKOFF_STEPS[index])
+}
+
+/// 心跳循环每轮等待多久：健康时 60s，失败后走退避阶梯。
+fn heartbeat_delay(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        HEARTBEAT_INTERVAL
+    } else {
+        heartbeat_backoff(consecutive_failures)
+    }
+}
+
+/// 心跳是否还应该继续运行（缺陷 2 的纯判定）。
+///
+/// 隧道任务已退出（`tunnel_alive == false`），或会话已被更新的
+/// prepare/start_tunnel/disconnect 取代（代次不再匹配）时，心跳必须自行退出：
+/// 隧道都不在了，续期既无意义，还会把 `tunnel_stopped` 覆盖回 `connected`，
+/// 让 Dart 侧以为"已连接"而实际没有隧道。
+///
+/// ⚠️ 本 crate 整体是 `#![cfg(target_os = "android")]`，宿主机编不出任何内容，
+/// 因此本文件里这几个纯逻辑函数无法在宿主机测试；等价的宿主机测试在
+/// `desktop/src-tauri/src/commands.rs` 的 `tests` 模块（由 `ffi/src/lib.rs`
+/// 经 `#[path]` 引入后运行）。两边必须保持同一实现。
+fn heartbeat_should_continue(generation_is_current: bool, tunnel_alive: bool) -> bool {
+    generation_is_current && tunnel_alive
+}
+
+/// 心跳在"续期恢复"时是否允许改写 stage。
+///
+/// 只认我们自己写下的阶段（正常态 `connected` 与心跳降级态
+/// `heartbeat_error`）；`tunnel_stopped` / `idle` / 各类 `*_error` 都是别处给出
+/// 的终态，绝不能被心跳改写回去。
+fn heartbeat_may_restore_stage(stage: &str) -> bool {
+    stage == "connected" || stage == HEARTBEAT_ERROR_STAGE
+}
+
+/// 会话代次（缺陷 1）。
+///
+/// 每次 prepare/start_tunnel/disconnect 真正开始推进时 `begin()` 递增一次。
+/// 后台任务（准备、隧道、心跳）启动时记下自己的代次，**任何一次 status 写入
+/// 之前**都先复核该代次是否仍是当前值；不匹配说明会话已被更新的流程取代 ——
+/// 丢弃这次写入并退出。
+///
+/// 旧实现取消时只 `.abort()` 就立刻启动新任务。abort 只是异步请求取消：被取消
+/// 的任务要再被 poll 一次才真正结束，在那一瞬间它仍可能把新会话的 status 覆盖
+/// 成旧值（表现：UI 显示"已连接"但隧道已换，或状态在旧值/新值之间跳）。代次
+/// 校验让旧任务永远无法污染新会话状态。
+#[derive(Debug)]
+struct Generation(AtomicU64);
+
+impl Generation {
+    fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// 开启一个会话，返回属于它的代次（严格递增）。
+    fn begin(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == generation
+    }
+}
+
+/// 取状态锁并容忍中毒：持锁线程 panic 过不代表数据已损坏。
+fn lock_status(status: &Mutex<MobileStatus>) -> MutexGuard<'_, MobileStatus> {
+    status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_task(slot: &Mutex<Option<JoinHandle<()>>>) -> MutexGuard<'_, Option<JoinHandle<()>>> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct PendingSession {
     tls: Option<RawTlsClient>,
     reply: NcAuthReply,
@@ -67,6 +169,10 @@ struct PendingSession {
 
 struct MobileState {
     status: Mutex<MobileStatus>,
+    /// 会话代次：见 `Generation`。
+    generation: Generation,
+    /// 隧道任务是否仍在运行。隧道退出时置 false，心跳循环据此自行退出。
+    tunnel_alive: AtomicBool,
     operation: Mutex<Option<JoinHandle<()>>>,
     tunnel: Mutex<Option<JoinHandle<()>>>,
     heartbeat: Mutex<Option<JoinHandle<()>>>,
@@ -77,6 +183,8 @@ impl MobileState {
     fn new() -> Self {
         Self {
             status: Mutex::new(MobileStatus::default()),
+            generation: Generation::new(),
+            tunnel_alive: AtomicBool::new(false),
             operation: Mutex::new(None),
             tunnel: Mutex::new(None),
             heartbeat: Mutex::new(None),
@@ -135,20 +243,29 @@ impl Default for MobileStatus {
     }
 }
 
-fn cancel_task(slot: &Mutex<Option<JoinHandle<()>>>) {
-    if let Some(task) = slot
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
+/// 取消一个任务槽位，并对旧 handle 做一次**有界**等待。
+///
+/// 取消不能只是 `.abort()`：那只是异步请求，被取消的任务要再被 poll 一次才会
+/// 真正收尾。这里等到它结束（或超时）再返回，让调用方可以立刻安全地启动新
+/// 任务。`block_on` 要求在运行时之外调用 —— 这些函数只从 JNI 导出进入，都在
+/// Kotlin 的 worker 线程上，满足该前提。
+fn cancel_task(host: &'static MobileHost, slot: &Mutex<Option<JoinHandle<()>>>) {
+    let task = lock_task(slot).take();
+    if let Some(task) = task {
         task.abort();
+        host.runtime.block_on(async {
+            let _ = tokio::time::timeout(CANCEL_JOIN_TIMEOUT, task).await;
+        });
     }
 }
 
-fn stop_all(host: &MobileHost) {
-    cancel_task(&host.state.operation);
-    cancel_task(&host.state.tunnel);
-    cancel_task(&host.state.heartbeat);
+fn stop_all(host: &'static MobileHost) {
+    // 先宣告隧道已死：即使后面的 abort/等待还没跑完，运行中的心跳下一轮也会
+    // 自行退出，不会继续续期或把 tunnel_stopped 覆盖回 connected。
+    host.state.tunnel_alive.store(false, Ordering::SeqCst);
+    cancel_task(host, &host.state.operation);
+    cancel_task(host, &host.state.tunnel);
+    cancel_task(host, &host.state.heartbeat);
     host.state
         .session
         .lock()
@@ -156,41 +273,71 @@ fn stop_all(host: &MobileHost) {
         .take();
 }
 
-fn set_stage(state: &MobileState, stage: &str, message: &str) {
-    let mut status = state
-        .status
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    status.stage = stage.to_string();
-    status.message = message.to_string();
-    status.error = None;
-    // A new stage belongs to a new attempt: do not carry a previous attempt's
-    // non-fatal warning into a later, unrelated stage.
-    status.warning = None;
+/// 后台任务持有的会话写入句柄：把「代次校验」和「status 写入」绑在一起，让
+/// "写入前先确认自己仍是当前会话"成为唯一入口，而不是指望每个调用点自觉。
+#[derive(Clone)]
+struct SessionWriter {
+    state: Arc<MobileState>,
+    id: u64,
 }
 
-fn fail(state: &MobileState, username: String, stage: &str, error: impl Into<String>) {
-    let mut status = state
-        .status
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    status.connected = false;
-    status.stage = stage.to_string();
-    status.message = "连接未完成".into();
-    status.username = Some(username);
-    status.error = Some(error.into());
+impl SessionWriter {
+    fn new(state: Arc<MobileState>, id: u64) -> Self {
+        Self { state, id }
+    }
+
+    /// 自己是否仍属于当前会话。
+    fn is_current(&self) -> bool {
+        self.state.generation.is_current(self.id)
+    }
+
+    /// 代次校验通过才写入；过期写入被静默丢弃并返回 false。
+    ///
+    /// 校验与写入必须在同一把锁下完成：若"先校验、后取锁"，`begin()` 就能在
+    /// 两者之间插入，旧任务仍可抢在新会话之后写入（TOCTOU）。
+    fn write(&self, update: impl FnOnce(&mut MobileStatus)) -> bool {
+        let mut status = lock_status(&self.state.status);
+        if !self.is_current() {
+            return false;
+        }
+        update(&mut status);
+        true
+    }
+
+    fn set_stage(&self, stage: &str, message: &str) -> bool {
+        self.write(|status| {
+            status.stage = stage.to_string();
+            status.message = message.to_string();
+            status.error = None;
+            // A new stage belongs to a new attempt: do not carry a previous
+            // attempt's non-fatal warning into a later, unrelated stage.
+            status.warning = None;
+        })
+    }
+
+    fn fail(&self, username: &str, stage: &str, error: impl Into<String>) -> bool {
+        self.write(|status| {
+            status.connected = false;
+            status.stage = stage.to_string();
+            status.message = "连接未完成".into();
+            status.username = Some(username.to_string());
+            status.error = Some(error.into());
+        })
+    }
 }
 
-fn spawn_prepare(host: &'static MobileHost, username: String, password: String, source: String) {
+fn spawn_prepare(
+    host: &'static MobileHost,
+    username: String,
+    password: String,
+    source: String,
+    generation: u64,
+) {
     let state = host.state.clone();
     let task = host.runtime.handle().spawn(async move {
-        prepare_inner(username, password, source, state).await;
+        prepare_inner(username, password, source, state, generation).await;
     });
-    *host
-        .state
-        .operation
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task);
+    *lock_task(&host.state.operation) = Some(task);
 }
 
 async fn prepare_inner(
@@ -198,21 +345,18 @@ async fn prepare_inner(
     password: String,
     source: String,
     state: Arc<MobileState>,
+    generation: u64,
 ) {
+    let session = SessionWriter::new(state.clone(), generation);
     let address: SocketAddr = match SERVER.parse() {
         Ok(address) => address,
         Err(error) => {
-            fail(
-                &state,
-                username,
-                "sac_error",
-                format!("Gateway 地址无效: {error}"),
-            );
+            session.fail(&username, "sac_error", format!("Gateway 地址无效: {error}"));
             return;
         }
     };
 
-    set_stage(&state, "sac", "正在通过学校加速器网关进行原生认证");
+    session.set_stage("sac", "正在通过学校加速器网关进行原生认证");
     let sac_client = SacClient::new(address);
     let password = Zeroizing::new(password);
     // Every setup step needs its own deadline: without one, a half-open Gateway
@@ -228,12 +372,7 @@ async fn prepare_inner(
         Ok(value) => value,
         Err(_) => {
             drop(password);
-            fail(
-                &state,
-                username,
-                "sac_error",
-                "Gateway authentication timed out",
-            );
+            session.fail(&username, "sac_error", "Gateway authentication timed out");
             return;
         }
     };
@@ -241,75 +380,61 @@ async fn prepare_inner(
     let (sac_login, diagnostics) = match login {
         Ok(value) => value,
         Err(error) => {
-            fail(&state, username, "sac_error", error.to_string());
+            session.fail(&username, "sac_error", error.to_string());
             return;
         }
     };
-    state
-        .status
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .sac = Some(diagnostics);
+    session.write(|status| status.sac = Some(diagnostics));
 
     let ticket = sac_login.ticket;
-    set_stage(
-        &state,
-        "session",
-        "正在向网关发送 GET_USERDATA 建立登录会话",
-    );
+    session.set_stage("session", "正在向网关发送 GET_USERDATA 建立登录会话");
     let hardware_addresses = local_hardware_addresses();
     let userdata = sac_client.get_userdata(&ticket, &hardware_addresses).await;
     let (request_len, response_len, result) = match userdata {
         Ok(value) => value,
         Err(error) => {
-            fail(&state, username, "session_error", error.to_string());
+            session.fail(&username, "session_error", error.to_string());
             return;
         }
     };
-    {
-        let mut status = state
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    session.write(|status| {
         if let Some(sac) = status.sac.as_mut() {
             sac.get_userdata_request_len = Some(request_len);
             sac.get_userdata_response_len = Some(response_len);
             sac.get_userdata_result = Some(result);
         }
-    }
+    });
     if result != 0 {
-        fail(
-            &state,
-            username,
+        session.fail(
+            &username,
             "session_error",
             format!("Gateway GET_USERDATA rejected session setup with status 0x{result:08x}"),
         );
         return;
     }
 
-    set_stage(&state, "tls", "正在建立网关 TLS 数据通道");
-    let mut tls = match tokio::time::timeout(SETUP_STEP_TIMEOUT, RawTlsClient::connect(address))
-        .await
-    {
-        Ok(Ok(value)) => value,
-        Ok(Err(error)) => {
-            fail(&state, username, "tls_error", error.to_string());
-            return;
-        }
-        Err(_) => {
-            fail(&state, username, "tls_error", "Gateway TLS handshake timed out");
-            return;
-        }
-    };
-    set_stage(&state, "nc_auth", "正在使用 NC Ticket 请求虚拟 IP");
+    session.set_stage("tls", "正在建立网关 TLS 数据通道");
+    let mut tls =
+        match tokio::time::timeout(SETUP_STEP_TIMEOUT, RawTlsClient::connect(address)).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                session.fail(&username, "tls_error", error.to_string());
+                return;
+            }
+            Err(_) => {
+                session.fail(&username, "tls_error", "Gateway TLS handshake timed out");
+                return;
+            }
+        };
+    session.set_stage("nc_auth", "正在使用 NC Ticket 请求虚拟 IP");
     match tokio::time::timeout(SETUP_STEP_TIMEOUT, tls.send_nc_auth(&ticket, &username)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            fail(&state, username, "nc_error", error.to_string());
+            session.fail(&username, "nc_error", error.to_string());
             return;
         }
         Err(_) => {
-            fail(&state, username, "nc_error", "NC auth request timed out");
+            session.fail(&username, "nc_error", "NC auth request timed out");
             return;
         }
     }
@@ -319,35 +444,37 @@ async fn prepare_inner(
         // work), but silently logging hid a possible "connected but no traffic"
         // state — record it as a surfaced warning instead.
         eprintln!("HUSE mobile VPN session notification failed: {error}");
-        let mut status = state
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        status.warning = Some(format!(
-            "Gateway session notification failed; forwarding may be unavailable: {error}"
-        ));
+        session.write(|status| {
+            status.warning = Some(format!(
+                "Gateway session notification failed; forwarding may be unavailable: {error}"
+            ));
+        });
     }
     let reply = match tokio::time::timeout(SETUP_STEP_TIMEOUT, tls.read_nc_auth_reply()).await {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
-            fail(&state, username, "nc_error", error.to_string());
+            session.fail(&username, "nc_error", error.to_string());
             return;
         }
         Err(_) => {
-            fail(&state, username, "nc_error", "NC auth reply timed out");
+            session.fail(&username, "nc_error", "NC auth reply timed out");
             return;
         }
     };
     if reply.virtual_ip.parse::<Ipv4Addr>().is_err() {
-        fail(
-            &state,
-            username,
+        session.fail(
+            &username,
             "nc_error",
             "Gateway returned an invalid virtual IPv4 address",
         );
         return;
     }
 
+    // 会话已被更新的 prepare/disconnect 取代：绝不为一个已作废的尝试安装
+    // pending 会话（否则旧的 TLS 会话可能被新流程拿去建隧道）。
+    if !session.is_current() {
+        return;
+    }
     let routes = route_prefixes(&reply);
     let virtual_ip = reply.virtual_ip.clone();
     *state
@@ -359,18 +486,16 @@ async fn prepare_inner(
         ticket,
         username: username.clone(),
     });
-    let mut status = state
-        .status
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    status.connected = false;
-    status.stage = "awaiting_tun".into();
-    status.message = "学校加速器认证完成，正在请求 Android 系统网络授权".into();
-    status.username = Some(username);
-    status.virtual_ip = Some(virtual_ip);
-    status.routes = routes;
-    status.required_route_count = REQUIRED_TARGETS.len();
-    status.error = None;
+    session.write(|status| {
+        status.connected = false;
+        status.stage = "awaiting_tun".into();
+        status.message = "学校加速器认证完成，正在请求 Android 系统网络授权".into();
+        status.username = Some(username);
+        status.virtual_ip = Some(virtual_ip);
+        status.routes = routes;
+        status.required_route_count = REQUIRED_TARGETS.len();
+        status.error = None;
+    });
 }
 
 fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
@@ -389,31 +514,47 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
     let Some(tls) = pending.tls.take() else {
         return -3;
     };
+    // 先停掉可能仍在运行的旧隧道/心跳：它们的 handle 若被直接覆盖就再也没人
+    // 管，旧隧道会继续持有 TUN 与路由，并继续往新会话的状态里写东西。
+    host.state.tunnel_alive.store(false, Ordering::SeqCst);
+    cancel_task(host, &host.state.tunnel);
+    cancel_task(host, &host.state.heartbeat);
+    // 新会话：代次递增，上一代任务的写入从此刻起被丢弃。
+    let generation = host.state.generation.begin();
     let reply = pending.reply;
     let ticket = pending.ticket;
     let username = pending.username;
     let routes = route_prefixes(&reply);
     let virtual_ip = reply.virtual_ip.clone();
     let state = host.state.clone();
+    let tunnel_session = SessionWriter::new(state.clone(), generation);
 
+    // 隧道即将运行：心跳的存活判定从此刻起有效（必须在 spawn 之前置位，否则
+    // 立刻失败的隧道任务可能先把它置回 false，被这里覆盖成"仍然存活"）。
+    host.state.tunnel_alive.store(true, Ordering::SeqCst);
     let tunnel_task = host.runtime.handle().spawn(async move {
         let result = run_android_tunnel(tls, tun_fd).await;
-        let mut status = state
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        status.connected = false;
-        status.stage = "tunnel_stopped".into();
-        status.error = Some(match result {
-            Ok(()) => "Android 加速器隧道已停止".into(),
+        // 隧道结束：先让存活判定说真话，再写终态（写入仍受代次校验保护）。
+        state.tunnel_alive.store(false, Ordering::SeqCst);
+        let error = match result {
+            Ok(()) => "Android 加速器隧道已停止".to_string(),
             Err(error) => error.to_string(),
+        };
+        tunnel_session.write(|status| {
+            status.connected = false;
+            status.stage = "tunnel_stopped".into();
+            status.error = Some(error);
         });
+        // 主动取消心跳（缺陷 2）：隧道都没了还继续续期，会把 tunnel_stopped
+        // 覆盖回 connected，Dart 侧就会以为"已连接"而实际没有隧道。
+        let heartbeat = lock_task(&state.heartbeat).take();
+        if let Some(heartbeat) = heartbeat {
+            heartbeat.abort();
+            let _ = heartbeat.await;
+        }
     });
-    *host
-        .state
-        .tunnel
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tunnel_task);
+    // 记下隧道 handle：后续的 prepare/disconnect 才能取消它并等待收尾。
+    *lock_task(&host.state.tunnel) = Some(tunnel_task);
 
     let heartbeat_state = host.state.clone();
     let heartbeat = host.runtime.handle().spawn(async move {
@@ -428,28 +569,33 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
         // 现在：失败不再退出循环，而是记录 `heartbeat_error` 让 Dart 侧能
         // **立刻**看到并触发重认证；同时继续按退避重试，万一只是瞬时抖动，
         // 续期成功就把状态恢复成正常，不需要任何重连。
+        let heartbeat_session = SessionWriter::new(heartbeat_state.clone(), generation);
         let mut consecutive_failures: u32 = 0;
         loop {
-            // 正常 60 秒一次；连续失败时退避到最多 30 秒，尽快恢复续期。
-            let interval = if consecutive_failures == 0 {
-                std::time::Duration::from_secs(60)
-            } else {
-                std::time::Duration::from_secs(
-                    (10 * consecutive_failures.min(3) as u64).max(5),
-                )
-            };
-            tokio::time::sleep(interval).await;
+            // 正常 60 秒一次；连续失败时按 10s → 20s → 30s 退避，尽快恢复续期。
+            tokio::time::sleep(heartbeat_delay(consecutive_failures)).await;
+
+            // 每轮复核隧道是否还活着（缺陷 2）：隧道任务已退出，或会话已被
+            // 更新的 prepare/start_tunnel/disconnect 取代，就自行退出，绝不
+            // 继续为一个已经消失的隧道续期。
+            if !heartbeat_should_continue(
+                heartbeat_session.is_current(),
+                heartbeat_state.tunnel_alive.load(Ordering::SeqCst),
+            ) {
+                break;
+            }
 
             match client.heartbeat(&ticket).await {
                 Ok(()) => {
                     if consecutive_failures > 0 {
-                        // 续期恢复：把状态改回正常，消除误导性的错误提示。
-                        let mut status = heartbeat_state
-                            .status
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        status.stage = "connected".into();
-                        status.error = None;
+                        // 续期恢复：只在阶段仍是我们写下的降级态时改回正常，
+                        // tunnel_stopped 等终态绝不能被心跳改写。
+                        heartbeat_session.write(|status| {
+                            if heartbeat_may_restore_stage(&status.stage) {
+                                status.stage = "connected".into();
+                                status.error = None;
+                            }
+                        });
                         eprintln!(
                             "HUSE VPN heartbeat recovered after {consecutive_failures} failures"
                         );
@@ -457,56 +603,49 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
                     consecutive_failures = 0;
                 }
                 Err(error) => {
-                    consecutive_failures += 1;
-                    let mut status = heartbeat_state
-                        .status
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    // 只有仍标记为连接中时才写错误，避免覆盖 tunnel_stopped
-                    // 等更准确的原因。
-                    if status.connected || status.stage == "connected" {
-                        status.stage = "heartbeat_error".into();
-                        status.error = Some(error.to_string());
-                    }
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    heartbeat_session.write(|status| {
+                        // 只有仍标记为连接中时才写错误，避免覆盖 tunnel_stopped
+                        // 等更准确的原因。
+                        if status.connected || heartbeat_may_restore_stage(&status.stage) {
+                            status.stage = HEARTBEAT_ERROR_STAGE.into();
+                            status.error = Some(error.to_string());
+                        }
+                    });
+                    eprintln!(
+                        "HUSE VPN heartbeat failed ({consecutive_failures} consecutive), retrying in {:?}",
+                        heartbeat_backoff(consecutive_failures)
+                    );
                 }
             }
         }
     });
-    *host
-        .state
-        .heartbeat
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(heartbeat);
+    *lock_task(&host.state.heartbeat) = Some(heartbeat);
 
     let (sac, warning) = {
-        let status = host
-            .state
-            .status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let status = lock_status(&host.state.status);
         // Preserve a non-fatal warning raised during setup (e.g. the Gateway
         // session notification failed): it must survive the transition to
         // connected, otherwise "connected but forwarding may be unavailable"
         // is silently indistinguishable from a healthy tunnel.
         (status.sac.clone(), status.warning.clone())
     };
-    *host
-        .state
-        .status
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = MobileStatus {
-        connected: true,
-        stage: "connected".into(),
-        message: "校园内网隧道已建立".into(),
-        username: Some(username),
-        virtual_ip: Some(virtual_ip),
-        connected_since: Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
-        routes,
-        required_route_count: REQUIRED_TARGETS.len(),
-        sac,
-        error: None,
-        warning,
-    };
+    // 代次校验通过才写：若并发的 prepare 已经开启新会话，这次写入必须被丢弃。
+    SessionWriter::new(host.state.clone(), generation).write(|status| {
+        *status = MobileStatus {
+            connected: true,
+            stage: "connected".into(),
+            message: "校园内网隧道已建立".into(),
+            username: Some(username),
+            virtual_ip: Some(virtual_ip),
+            connected_since: Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+            routes,
+            required_route_count: REQUIRED_TARGETS.len(),
+            sac,
+            error: None,
+            warning,
+        };
+    });
     0
 }
 
@@ -601,19 +740,20 @@ pub extern "system" fn Java_com_one_huaji_CampusVpnService_nativePrepare(
             };
             let source = read_jstring(&mut env, auth_source).unwrap_or_else(|| "SAM-all".into());
             let host = instance();
+            // 新会话：代次先递增，上一会话遗留的后台任务从此刻起再也写不进
+            // 状态；随后再取消它们（abort + 有界等待收尾），两道保险。
+            let generation = host.state.generation.begin();
             stop_all(host);
-            *host
-                .state
-                .status
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = MobileStatus {
-                connected: false,
-                stage: "starting".into(),
-                message: "正在启动 Android 校园加速器".into(),
-                username: Some(username.clone()),
-                ..MobileStatus::default()
-            };
-            spawn_prepare(host, username, password, source);
+            SessionWriter::new(host.state.clone(), generation).write(|status| {
+                *status = MobileStatus {
+                    connected: false,
+                    stage: "starting".into(),
+                    message: "正在启动 Android 校园加速器".into(),
+                    username: Some(username.clone()),
+                    ..MobileStatus::default()
+                };
+            });
+            spawn_prepare(host, username, password, source, generation);
             0
         },
     )
@@ -663,12 +803,12 @@ pub extern "system" fn Java_com_one_huaji_CampusVpnService_nativeDisconnect(
         || FFI_PANIC_CODE,
         || {
             let host = instance();
+            // 递增代次后停止一切：即便某个任务没能在有界等待内收尾，它的写入
+            // 也已经作废，不会把默认状态覆盖成旧会话的 connected。
+            let generation = host.state.generation.begin();
             stop_all(host);
-            *host
-                .state
-                .status
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = MobileStatus::default();
+            SessionWriter::new(host.state.clone(), generation)
+                .write(|status| *status = MobileStatus::default());
             0
         },
     )

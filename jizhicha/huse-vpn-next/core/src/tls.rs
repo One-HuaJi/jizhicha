@@ -95,13 +95,37 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
     r
 }
 
+/// [`derive_keys`] 的返回值。
+///
+/// 改用命名字段是为了消除裸五元组 + 位置解构带来的静默错序风险：密码学代码里
+/// 把 client/server 或 key/mac 的位置写反不会编译报错，只会让握手全错。
+///
+/// ⚠️ 字段名与 key block 切分偏移的对应关系（**唯一依据是下面 `derive_keys`
+/// 内部的 `kb[..]` 切片**，不是本结构体的字段声明顺序）：
+///   * `client_mac`    = key block[0..20]
+///   * `server_mac`    = key block[20..40]
+///   * `client_key`    = key block[40..56]
+///   * `server_key`    = key block[56..72]
+///   * `master_secret` = PRF(pre_master_secret, "master secret", client_random + server_random)
+///
+/// 注意 RFC 5246 §6.3 规定 key block 里 **MAC secret 在前、写入密钥在后**，
+/// 所以"客户端在前"的命名顺序与 key block 的物理顺序并不一致。
+/// `core/src/tls.rs` 底部的 `prf_matches_python` 测试逐字节断言了上述映射。
+struct DerivedKeys {
+    client_key: [u8; 16],
+    server_key: [u8; 16],
+    client_mac: [u8; 20],
+    server_mac: [u8; 20],
+    master_secret: [u8; 48],
+}
+
 fn derive_keys(
     pre: &[u8; 48],
     cr: &[u8; 32],
     sr: &[u8; 32],
     ems: bool,
     hs_bytes: &[u8],
-) -> ([u8; 16], [u8; 16], [u8; 20], [u8; 20], [u8; 48]) {
+) -> DerivedKeys {
     let ms = if ems {
         let h = Sha256::digest(hs_bytes);
         let mut seed = b"extended master secret".to_vec();
@@ -132,7 +156,14 @@ fn derive_keys(
     sk.copy_from_slice(&kb[p..p + 16]);
     let mut ms_arr = [0u8; 48];
     ms_arr.copy_from_slice(&ms);
-    (ck, sk, cm, sm, ms_arr)
+    // 字段取值顺序与旧版裸元组 `(ck, sk, cm, sm, ms_arr)` 完全一致。
+    DerivedKeys {
+        client_key: ck,
+        server_key: sk,
+        client_mac: cm,
+        server_mac: sm,
+        master_secret: ms_arr,
+    }
 }
 
 pub struct RawTlsClient {
@@ -187,12 +218,16 @@ impl RawTlsClient {
         hs.extend_from_slice(&cke);
         wr(&mut s, 0x16, &cke).await?;
 
-        let (client_key, server_key, client_mac, server_mac, master_secret) =
-            derive_keys(&pre48, &cr, &sr, ems, &hs);
-        let client_finished = finished_verify_data(&master_secret, b"client finished", &hs);
+        let keys = derive_keys(&pre48, &cr, &sr, ems, &hs);
+        let client_finished = finished_verify_data(&keys.master_secret, b"client finished", &hs);
         let client_finished_message = bs(0x14, &client_finished);
-        let client_finished_record =
-            encrypt_record(0x16, &client_key, &client_mac, 0, &client_finished_message);
+        let client_finished_record = encrypt_record(
+            0x16,
+            &keys.client_key,
+            &keys.client_mac,
+            0,
+            &client_finished_message,
+        );
         wr(&mut s, 0x14, &[0x01]).await?;
         s.write_all(&client_finished_record)
             .await
@@ -213,11 +248,16 @@ impl RawTlsClient {
                 hex::encode(server_body)
             )));
         }
-        let server_finished =
-            decrypt_record(server_type, &server_body, &server_key, &server_mac, 0)?;
+        let server_finished = decrypt_record(
+            server_type,
+            &server_body,
+            &keys.server_key,
+            &keys.server_mac,
+            0,
+        )?;
         let expected = bs(
             0x14,
-            &finished_verify_data(&master_secret, b"server finished", &hs),
+            &finished_verify_data(&keys.master_secret, b"server finished", &hs),
         );
         if server_type != 0x16 || server_finished != expected {
             return Err(HuseVpnError::Tls(
@@ -226,10 +266,10 @@ impl RawTlsClient {
         }
         Ok(RawTlsClient {
             stream: s,
-            client_key,
-            client_mac,
-            server_key,
-            server_mac,
+            client_key: keys.client_key,
+            client_mac: keys.client_mac,
+            server_key: keys.server_key,
+            server_mac: keys.server_mac,
             // TLS Finished is the first protected client record and uses seq=0.
             // Application data therefore begins at seq=1.
             send_seq: 1,
@@ -320,8 +360,13 @@ impl RawTlsReader {
 
 impl RawTlsWriter {
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
-        let (records, used) =
-            encrypt_fragments(0x17, &self.client_key, &self.client_mac, self.send_seq, data);
+        let (records, used) = encrypt_fragments(
+            0x17,
+            &self.client_key,
+            &self.client_mac,
+            self.send_seq,
+            data,
+        );
         self.send_seq += used;
         self.stream
             .write_all(&records)
@@ -366,12 +411,18 @@ fn encrypt_fragments(
             1,
         );
     }
-    let mut out = Vec::with_capacity(plaintext.len() + (plaintext.len() / MAX_TLS_PLAINTEXT + 1) * 64);
-    let mut seq = sequence;
+    let mut out =
+        Vec::with_capacity(plaintext.len() + (plaintext.len() / MAX_TLS_PLAINTEXT + 1) * 64);
     let mut used = 0u64;
-    for chunk in plaintext.chunks(MAX_TLS_PLAINTEXT) {
-        out.extend_from_slice(&encrypt_record(content_type, key, mac_secret, seq, chunk));
-        seq += 1;
+    // 用 enumerate 取代手写计数器：`sequence + offset` 与旧版 `seq` 完全等价。
+    for (offset, chunk) in plaintext.chunks(MAX_TLS_PLAINTEXT).enumerate() {
+        out.extend_from_slice(&encrypt_record(
+            content_type,
+            key,
+            mac_secret,
+            sequence + offset as u64,
+            chunk,
+        ));
         used += 1;
     }
     (out, used)
@@ -401,6 +452,59 @@ fn encrypt_record(
     record
 }
 
+/// 常量时间字节比较：用于校验 MAC，避免"逐字节比较 + 提前 return"把
+/// 正确前缀的长度通过耗时泄露给攻击者。
+///
+/// 实现要点：
+/// - 先把**长度差**计入 diff（长度不等时 diff 必非 0），不提前 return；
+/// - 再按两者较短长度逐字节异或累加到 diff，同样不提前 return；
+/// - 最后只做一次 `diff == 0` 判断。
+///
+/// 长度不等时读到的内容不影响结论（diff 已由长度差确定），因此不泄露信息。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        diff |= (a[i] ^ b[i]) as usize;
+    }
+    diff == 0
+}
+
+/// 独立校验并剥离 TLS 1.2 CBC 的 padding（RFC 5246 §6.2.3.2）。
+///
+/// 编码方式与 [`AesCbc::enc`] 一致：最后一个字节是 `N-1`，表示共有 `N` 个
+/// padding 字节，且这 `N` 个字节**每一个都等于 `N-1`**。
+///
+/// 这里是必须通过的一步：padding 非法（长度越界、字节不一致、没有 padding
+/// 字节）一律返回 `Err`，绝不把"含 padding 的明文"当成明文继续往下走。
+/// 调用方必须在本函数成功之后再计算/校验 MAC，二者不混在一起。
+fn strip_tls_padding(buf: &mut Vec<u8>) -> Result<()> {
+    // 空缓冲意味着连 padding 长度字节都没有，即"padding 长度为 0"，非法。
+    let pad_byte = match buf.last() {
+        Some(&b) => b,
+        None => {
+            return Err(HuseVpnError::Tls(
+                "TLS record padding length is zero".into(),
+            ))
+        }
+    };
+    // 线上编码是 N-1，所以真实 padding 长度是 pad_byte + 1。
+    let pad_len = pad_byte as usize + 1;
+    // pad_byte + 1 恒 >= 1，故 `pad_len == 0` 在非空缓冲下不会成立；这里仍然
+    // 显式写出来作为纵深防御（TLS 记录必须至少带 1 个 padding 字节）。
+    if pad_len == 0 || pad_len > 16 || pad_len > buf.len() {
+        return Err(HuseVpnError::Tls(format!(
+            "invalid TLS record padding length {pad_len}"
+        )));
+    }
+    // 每一个 padding 字节都必须等于 pad_byte，不允许"部分正确"的填充。
+    if !buf[buf.len() - pad_len..].iter().all(|&b| b == pad_byte) {
+        return Err(HuseVpnError::Tls("invalid TLS record padding bytes".into()));
+    }
+    buf.truncate(buf.len() - pad_len);
+    Ok(())
+}
+
 fn decrypt_record(
     content_type: u8,
     body: &[u8],
@@ -408,22 +512,31 @@ fn decrypt_record(
     mac_secret: &[u8; 20],
     sequence: u64,
 ) -> Result<Vec<u8>> {
-    if body.len() < 32 || (body.len() - 16) % 16 != 0 {
+    // `!(x % 16 == 0)` 写作 `!x.is_multiple_of(16)`，比较结果与语义完全一致。
+    if body.len() < 32 || !(body.len() - 16).is_multiple_of(16) {
         return Err(HuseVpnError::Tls(
             "invalid AES-CBC TLS record length".into(),
         ));
     }
     let iv: [u8; 16] = body[..16].try_into().expect("explicit IV length");
-    let decrypted = AesCbc::new(key).dec(&iv, &body[16..]);
+    let mut decrypted = AesCbc::new(key).dec(&iv, &body[16..]);
     if decrypted.len() < 20 {
         return Err(HuseVpnError::Tls(
             "TLS record shorter than HMAC-SHA1".into(),
         ));
     }
+    // 第一步：独立且必须通过的 padding 校验。
+    strip_tls_padding(&mut decrypted)?;
+    if decrypted.len() < 20 {
+        return Err(HuseVpnError::Tls(
+            "TLS record shorter than HMAC-SHA1".into(),
+        ));
+    }
+    // 第二步：在剥掉 padding 之后才对明文算 MAC，并用常量时间比较。
     let split = decrypted.len() - 20;
     let (plaintext, received_mac) = decrypted.split_at(split);
     let expected_mac = record_mac(mac_secret, sequence, content_type, plaintext);
-    if received_mac != expected_mac {
+    if !constant_time_eq(received_mac, &expected_mac) {
         return Err(HuseVpnError::Tls(
             "TLS record MAC verification failed".into(),
         ));
@@ -663,8 +776,9 @@ fn parse_rsa(der: &[u8]) -> Result<RsaPublicKey> {
 
 /// 手动 RSA PKCS1v15 加密，使用 BigUint 直接计算 m^e mod n
 fn rsa_pkcs1_encrypt_manual(pubkey: &RsaPublicKey, plaintext: &[u8]) -> Vec<u8> {
-    let k = (pubkey.n().bits() as usize + 7) / 8; // modulus 字节数
-                                                  // PKCS1v15 padding: 00 || 02 || PS || 00 || D
+    // modulus 字节数：`(bits + 7) / 8` 即 `bits.div_ceil(8)`。
+    let k = pubkey.n().bits().div_ceil(8);
+    // PKCS1v15 padding: 00 || 02 || PS || 00 || D
     let ps_len = k - 3 - plaintext.len();
     let mut padded = vec![0x00u8, 0x02u8];
     // 填充非零随机字节
@@ -727,7 +841,7 @@ impl AesCbc {
         // byte is N-1 (RFC 5246 §6.2.3.2). At least one padding byte is present.
         let pad_bytes = 16 - (pl.len() % 16);
         let mut p = pl.to_vec();
-        p.extend(std::iter::repeat((pad_bytes - 1) as u8).take(pad_bytes));
+        p.extend(std::iter::repeat_n((pad_bytes - 1) as u8, pad_bytes));
         let mut pr = *iv;
         let mut o = iv.to_vec();
         for b in p.chunks_mut(16) {
@@ -742,6 +856,13 @@ impl AesCbc {
         }
         o
     }
+    /// 纯 AES-128-CBC 解密：只做分组解密与 IV 链，**不碰 padding**，
+    /// 返回值里仍然带着填充字节。
+    ///
+    /// 之前这里会在"padding 看起来合法"时顺手截断、非法时静默保留原样，
+    /// 于是非法 padding 会被当成明文送去算 MAC。现在 padding 校验被拆成
+    /// 独立的一步 [`strip_tls_padding`]，调用方必须先做完它并通过，才能
+    /// 使用这里的返回值。
     fn dec(&self, iv: &[u8; 16], ct: &[u8]) -> Vec<u8> {
         use aes::cipher::{BlockDecrypt, KeyInit};
         let c = aes::Aes128::new_from_slice(&self.k).unwrap();
@@ -756,15 +877,6 @@ impl AesCbc {
             }
             o.extend_from_slice(&a);
             pr = *b.try_into().unwrap_or(&[0u8; 16]);
-        }
-        if let Some(&pad) = o.last() {
-            let pad_bytes = pad as usize + 1;
-            if pad_bytes <= 16
-                && pad_bytes <= o.len()
-                && o[o.len() - pad_bytes..].iter().all(|&b| b == pad)
-            {
-                o.truncate(o.len() - pad_bytes);
-            }
         }
         o
     }
@@ -794,8 +906,9 @@ mod tests {
         let pre: [u8; 48] = {
             let mut p = [0u8; 48];
             p[..2].copy_from_slice(&[0x03, 0x03]);
-            for i in 2..48 {
-                p[i] = b'A';
+            // 等价于 `for i in 2..48 { p[i] = b'A' }`，只是不再手工索引。
+            for b in p.iter_mut().skip(2) {
+                *b = b'A';
             }
             p
         };
@@ -822,13 +935,12 @@ mod tests {
         let cm = &kb[0..20];
         let ck = &kb[40..56];
 
-        let (derived_ck, derived_sk, derived_cm, derived_sm, derived_ms) =
-            derive_keys(&pre, &cr, &sr, false, hs_data);
-        assert_eq!(&derived_ms[..], &ms[..]);
-        assert_eq!(&derived_cm[..], &kb[0..20]);
-        assert_eq!(&derived_sm[..], &kb[20..40]);
-        assert_eq!(&derived_ck[..], &kb[40..56]);
-        assert_eq!(&derived_sk[..], &kb[56..72]);
+        let derived = derive_keys(&pre, &cr, &sr, false, hs_data);
+        assert_eq!(&derived.master_secret[..], &ms[..]);
+        assert_eq!(&derived.client_mac[..], &kb[0..20]);
+        assert_eq!(&derived.server_mac[..], &kb[20..40]);
+        assert_eq!(&derived.client_key[..], &kb[40..56]);
+        assert_eq!(&derived.server_key[..], &kb[56..72]);
 
         // verify_data
         let hh = Sha256::digest(hs_data);
@@ -866,9 +978,8 @@ mod tests {
         while offset < records.len() {
             let content_type = records[offset];
             let version = &records[offset + 1..offset + 3];
-            let declared = u16::from_be_bytes(
-                records[offset + 3..offset + 5].try_into().unwrap(),
-            ) as usize;
+            let declared =
+                u16::from_be_bytes(records[offset + 3..offset + 5].try_into().unwrap()) as usize;
             assert_eq!(content_type, 0x17);
             assert_eq!(version, &V12);
             assert!(
@@ -961,6 +1072,185 @@ mod tests {
             decrypt_record(second_type, second_body, &key, &mac_secret, 1).is_ok(),
             "第二条 record 必须使用序号 1"
         );
+    }
+
+    // === CBC padding / MAC 加固测试 ===
+    // 全部使用合成向量（合成密钥、合成明文），不含任何真实凭据。
+
+    /// 测试用原始 AES-128-CBC 加密：分组对齐、**不做任何 padding 处理**，
+    /// 这样测试才能自己拼出 padding 畸形的 record。
+    fn raw_cbc_encrypt(key: &[u8; 16], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        assert_eq!(data.len() % 16, 0, "测试向量必须分组对齐");
+        let c = aes::Aes128::new_from_slice(key).unwrap();
+        let mut pr = *iv;
+        let mut out = iv.to_vec();
+        for chunk in data.chunks(16) {
+            let mut blk = [0u8; 16];
+            blk.copy_from_slice(chunk);
+            for (x, y) in blk.iter_mut().zip(pr.iter()) {
+                *x ^= y;
+            }
+            let mut a = blk;
+            c.encrypt_block((&mut a).into());
+            out.extend_from_slice(&a);
+            pr = a;
+        }
+        out
+    }
+
+    /// 按 RFC 5246 §6.2.3.2 生成**合法** padding：`N` 个字节，每个都等于 `N-1`。
+    /// `prefix_len` 是 padding 之前的长度（明文 + HMAC）。
+    fn legal_tls_padding(prefix_len: usize) -> Vec<u8> {
+        let pad_len = 16 - (prefix_len % 16);
+        vec![(pad_len - 1) as u8; pad_len]
+    }
+
+    /// 把 `plaintext || HMAC || padding` 拼成一条 record 的 body（IV || 密文）。
+    fn craft_body(key: &[u8; 16], iv: &[u8; 16], fragment: &[u8]) -> Vec<u8> {
+        raw_cbc_encrypt(key, iv, fragment)
+    }
+
+    /// 缺陷 1 回归：padding 非法时必须由**独立的 padding 校验**拒绝，
+    /// 而不是靠 MAC 顺带失败，更不能把带 padding 的明文当明文放行。
+    #[test]
+    fn invalid_cbc_padding_is_rejected() {
+        let key = [0x11u8; 16];
+        let mac_secret = [0x12u8; 20];
+        let iv = [0x13u8; 16];
+        let seq = 3u64;
+        let plaintext = b"synthetic padding probe".to_vec();
+        let mac = record_mac(&mac_secret, seq, 0x17, &plaintext);
+
+        // 用给定 padding 字节构造 body；MAC 只覆盖 plaintext（与线上格式一致）。
+        let mk = |pad: &[u8]| {
+            let mut f = plaintext.clone();
+            f.extend_from_slice(&mac);
+            f.extend_from_slice(pad);
+            craft_body(&key, &iv, &f)
+        };
+
+        // (1) padding 字节不一致：5 个填充字节里改坏一个。
+        let mut inconsistent = legal_tls_padding(plaintext.len() + 20);
+        assert_eq!(inconsistent, vec![4u8; 5], "合成向量自检：应为 5 个 0x04");
+        inconsistent[1] = 0x00;
+        let bad = mk(&inconsistent);
+        let msg = format!(
+            "{}",
+            decrypt_record(0x17, &bad, &key, &mac_secret, seq).unwrap_err()
+        );
+        assert!(
+            msg.contains("padding"),
+            "padding 字节不一致必须被独立的 padding 校验拒绝，实际错误: {msg}"
+        );
+
+        // (2) padding 长度 > 16：末尾字节 0xff 表示 256 字节填充，越界。
+        let mut too_long = legal_tls_padding(plaintext.len() + 20);
+        *too_long.last_mut().unwrap() = 0xff;
+        let bad = mk(&too_long);
+        let msg = format!(
+            "{}",
+            decrypt_record(0x17, &bad, &key, &mac_secret, seq).unwrap_err()
+        );
+        assert!(
+            msg.contains("padding"),
+            "padding 长度 > 16 必须被拒绝，实际错误: {msg}"
+        );
+
+        // (3) padding 长度为 0：没有任何 padding 字节。
+        //     注意 RFC 5246 的线上编码是 `N-1`，非空缓冲里 N 恒 >= 1，所以
+        //     "一个填充字节都没有"只在解密路径入口（空缓冲）上可能出现，
+        //     这里直接打 padding 校验入口。反过来，一个字节 0x00 的填充是
+        //     合法编码（N=1），见 legal_cbc_padding_still_decrypts。
+        let mut none = Vec::new();
+        let msg = format!("{}", strip_tls_padding(&mut none).unwrap_err());
+        assert!(
+            msg.contains("padding"),
+            "padding 长度为 0 必须被拒绝，实际错误: {msg}"
+        );
+        assert!(none.is_empty(), "拒绝后不得留下任何中间状态");
+    }
+
+    /// 缺陷 1 的正向对照：合法 padding 仍能正常解出明文，包括两个边界
+    /// （N = 1 的 0x00 填充、N = 16 的最大填充）。
+    #[test]
+    fn legal_cbc_padding_still_decrypts() {
+        let key = [0x31u8; 16];
+        let mac_secret = [0x32u8; 20];
+        // 11 字节 -> 明文+MAC = 31 -> 单字节 0x00 填充
+        // 12 字节 -> 明文+MAC = 32 -> 16 字节 0x0f 填充
+        // 23 字节 -> 明文+MAC = 43 -> 5 字节 0x04 填充
+        for plaintext in [
+            b"synthetic-1".to_vec(),
+            b"synthetic-12".to_vec(),
+            b"synthetic padding probe!".to_vec(),
+        ] {
+            let record = encrypt_record(0x17, &key, &mac_secret, 9, &plaintext);
+            let out = decrypt_record(0x17, &record[5..], &key, &mac_secret, 9)
+                .expect("合法 padding 的记录必须能解开");
+            assert_eq!(out, plaintext, "合法 padding 路径不得影响明文");
+        }
+    }
+
+    /// 缺陷 2 回归：只篡改 MAC 的一个字节（padding 完全合法），必须被拒绝，
+    /// 且走的是 MAC 校验分支；顺带确认同一明文用正确 MAC 仍能通过。
+    #[test]
+    fn tampered_mac_is_rejected() {
+        let key = [0x21u8; 16];
+        let mac_secret = [0x22u8; 20];
+        let iv = [0x23u8; 16];
+        let seq = 11u64;
+        let plaintext = b"synthetic mac probe".to_vec();
+        let mut mac = record_mac(&mac_secret, seq, 0x17, &plaintext);
+        mac[7] ^= 0x01;
+        let mut fragment = plaintext.clone();
+        fragment.extend_from_slice(&mac);
+        fragment.extend_from_slice(&legal_tls_padding(plaintext.len() + 20));
+        let body = craft_body(&key, &iv, &fragment);
+
+        let msg = format!(
+            "{}",
+            decrypt_record(0x17, &body, &key, &mac_secret, seq).unwrap_err()
+        );
+        assert!(
+            msg.contains("MAC"),
+            "篡改 MAC 必须被 MAC 校验拒绝，实际错误: {msg}"
+        );
+
+        let good = encrypt_record(0x17, &key, &mac_secret, seq, &plaintext);
+        assert_eq!(
+            decrypt_record(0x17, &good[5..], &key, &mac_secret, seq).unwrap(),
+            plaintext,
+            "未篡改的记录必须仍然通过"
+        );
+    }
+
+    /// 缺陷 2：常量时间比较函数本身的单元测试。
+    #[test]
+    fn constant_time_eq_handles_equal_diff_and_length_mismatch() {
+        // 相等
+        assert!(constant_time_eq(
+            b"synthetic-mac-bytes",
+            b"synthetic-mac-bytes"
+        ));
+        assert!(constant_time_eq(&[], &[]));
+        // 长度不同（含一边为空、以及长公共前缀）
+        assert!(!constant_time_eq(
+            b"synthetic-mac-bytes",
+            b"synthetic-mac-byte"
+        ));
+        assert!(!constant_time_eq(&[], b"synthetic-mac-bytes"));
+        assert!(!constant_time_eq(b"synthetic-mac-bytes", &[]));
+        assert!(!constant_time_eq(&[0xab; 20], &[0xab; 21]));
+        // 单字节不同（首字节、末字节各一例）
+        assert!(!constant_time_eq(
+            b"synthetic-mac-bytes",
+            b"Xynthetic-mac-bytes"
+        ));
+        assert!(!constant_time_eq(
+            b"synthetic-mac-bytes",
+            b"synthetic-mac-byteX"
+        ));
     }
 
     #[test]

@@ -141,7 +141,7 @@ async fn run_target_tunnel_inner(
             // Packet telemetry contains real source/destination addresses
             // (including internal campus destinations). Keep it strictly
             // opt-in so release builds cannot leak network topology.
-            if packet_trace_enabled() && (packet_count <= 24 || packet_count % 100 == 0) {
+            if packet_trace_enabled() && (packet_count <= 24 || packet_count.is_multiple_of(100)) {
                 eprintln!(
                     "HUSE VPN uplink packet: count={}, ip_len={}, nc_frame_len={}, {}",
                     packet_count,

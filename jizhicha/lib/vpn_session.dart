@@ -95,7 +95,7 @@ extension VpnFailureText on VpnFailure {
         return '学校网关拒绝了认证。请先确认密码是身份证后六位；'
             '若确认无误仍失败，通常是学号尚未在教务系统录入或开通，请联系辅导员处理';
       case VpnFailure.gatewayTimeout:
-        return '学校加速器网关响应超时，请稍候重试';
+        return '学校网关响应超时，请稍候重试';
       case VpnFailure.tunnelStopped:
         return '校园网连接已断开，请重新连接';
       case VpnFailure.adapterBusy:
@@ -109,7 +109,7 @@ extension VpnFailureText on VpnFailure {
       case VpnFailure.permissionDenied:
         return '请在 Android 系统网络授权对话框中允许稽之查，然后再次点击连接';
       case VpnFailure.unknown:
-        return '加速器连接失败，请重试';
+        return '校园网连接失败，请重试';
     }
   }
 
@@ -325,7 +325,7 @@ class VpnSession extends ChangeNotifier {
     String authSource = 'SAM-all',
   }) async {
     if (_phase == VpnPhase.preparing) return false;
-    _set(VpnPhase.preparing, progress: '正在启动校园加速器…');
+    _set(VpnPhase.preparing, progress: '正在连接校园网…');
     try {
       await _launcher.connect(
         username: username,
@@ -339,7 +339,7 @@ class VpnSession extends ChangeNotifier {
       _setVirtualIp(await _readVirtualIp());
 
       // 探测只用来"提升"状态，不用来"否决"连接。
-      _set(VpnPhase.tunnelUp, progress: '正在验证校园内网连通性…');
+      _set(VpnPhase.tunnelUp, progress: '正在验证校园网连通性…');
       final reachable = await _probeWithRetry();
       _set(reachable ? VpnPhase.online : VpnPhase.tunnelUp);
       return true;
@@ -359,6 +359,22 @@ class VpnSession extends ChangeNotifier {
     }
     _clearTunnelIdentity();
     _set(VpnPhase.idle);
+  }
+
+  /// 静默连接的看门狗出口：把状态机从 [VpnPhase.preparing] 里强行拉出来。
+  ///
+  /// 只在"原生调用挂死不返回、连接已经明显超时"时由
+  /// [CampusEnvironmentController] 调用。没有这个出口的话 `busy` 会永远为真
+  /// —— UI 永远显示"检测中 / 重连中"、连接按钮永远禁用，正是本次要避免的
+  /// 那类"卡死"（历史事故：Android 侧的重连循环把人卡死在"正在连接"）。
+  ///
+  /// 注意它**不**取消底层那次认证（Dart 的 Future 无法取消）。那次调用若
+  /// 之后真的成功，会把状态改回 tunnelUp / online —— 那正是我们要的结果；
+  /// 若失败也会如实落到 failed，不会留下假状态。
+  void abortHangingConnect() {
+    if (_phase != VpnPhase.preparing) return;
+    _clearTunnelIdentity();
+    _set(VpnPhase.failed, failure: VpnFailure.gatewayTimeout);
   }
 
   /// 重新探测当前链路是否仍然可用，用于健康检查。
