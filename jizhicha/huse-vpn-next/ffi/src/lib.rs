@@ -1,9 +1,11 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{CStr, CString};
+use std::future::Future;
 use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -18,10 +20,25 @@ const FFI_PANIC_CODE: i32 = -3;
 /// 状态 JSON 的兜底串。不含 NUL 字节，`CString::new` 在此不可能失败。
 const FALLBACK_STATUS_JSON: &str = "{\"connected\":false,\"stage\":\"ffi_error\"}";
 
+/// 等待被取消的操作真正收尾的上限。
+///
+/// `JoinHandle::abort` 只发出取消请求，任务要再被 poll 一次才会释放路由、代理
+/// 状态和 Wintun 句柄；这里等它结束，避免与下一次连接重叠。等待必须有上限：
+/// 旧任务可能卡在不可中断的系统调用里（例如安装网关路由的 netsh 子进程），
+/// 不能把 Dart 侧调用线程永久挂住。超时后旧任务可能仍在运行，但
+/// `vpn_commands` 里的会话锁与代次校验保证它既不会与新流程并行改状态，也无法
+/// 污染新会话的 status。
+const OPERATION_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct FfiRuntime {
     runtime: Runtime,
     state: vpn_commands::VpnState,
     operation: Mutex<Option<JoinHandle<()>>>,
+    /// 串行化「取消旧操作 → 启动新操作」这一整段（缺陷 4）。
+    ///
+    /// 若两个并发调用各自「取走槽位 → spawn」，它们可能都取到 `None`，于是各自
+    /// spawn：旧任务谁也没取消，继续和新任务并行运行并覆盖状态。
+    session: Mutex<()>,
 }
 
 static INSTANCE: OnceLock<FfiRuntime> = OnceLock::new();
@@ -65,6 +82,7 @@ fn instance() -> &'static FfiRuntime {
         runtime: Runtime::new().expect("HUSE VPN FFI runtime initialization failed"),
         state: vpn_commands::VpnState::new(),
         operation: Mutex::new(None),
+        session: Mutex::new(()),
     })
 }
 
@@ -89,8 +107,9 @@ fn cancel_operation(host: &FfiRuntime) {
         // more before its cleanup guards (routes, proxy state and Wintun
         // handles) are dropped. Wait here so a new connect/disconnect cannot
         // overlap the previous operation and leave a stale adapter session.
+        // 等待有上限，理由见 `OPERATION_CANCEL_TIMEOUT`。
         host.runtime.block_on(async {
-            let _ = operation.await;
+            let _ = tokio::time::timeout(OPERATION_CANCEL_TIMEOUT, operation).await;
         });
     }
 }
@@ -101,6 +120,29 @@ fn spawn_operation(
 ) {
     let task = host.runtime.handle().spawn(operation);
     *lock_or_recover(&host.operation) = Some(task);
+}
+
+/// 取消旧操作，然后（在同一临界区内）启动新操作（缺陷 4 的串行化）。
+///
+/// 「取走旧 handle → abort → 有界等待 → 写入新 handle」四步必须原子完成；
+/// 否则两个并发的 connect/disconnect 调用可能都取到 `None`，于是各自 spawn，
+/// 旧任务被漏掉继续运行。会话级状态污染由 `vpn_commands` 的代次校验兜底，
+/// 这里保证的是「同一时刻只有一个操作在推进」。
+///
+/// `build` 在旧操作取消之后、新操作 spawn 之前被调用：`huse_vpn_connect` 用它
+/// 同步写下 "starting"，保持与旧版本一致的可观测顺序（导出返回时状态已经是
+/// starting，而不是等新任务被调度后才更新）。
+///
+/// 锁在 `block_on` 期间一直持有，因此其它 FFI 调用会排队而不是与之交错；被等待
+/// 的任务不会回调任何 FFI 导出，因此不存在自锁。
+fn replace_operation<F, Fut>(host: &'static FfiRuntime, build: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let _session = lock_or_recover(&host.session);
+    cancel_operation(host);
+    spawn_operation(host, build());
 }
 
 /// Start the VPN asynchronously. The Flutter UI reads progress from
@@ -122,12 +164,19 @@ pub extern "C" fn huse_vpn_connect(
             };
             let auth_source = read_optional(auth_source);
             let host = instance();
-            cancel_operation(host);
-            vpn_commands::prepare_connect(&host.state, &username);
-            spawn_operation(host, async move {
-                let _ =
-                    vpn_commands::connect_vpn_inner(username, password, auth_source, &host.state)
-                        .await;
+            replace_operation(host, || {
+                // 顺序保持 cancel → prepare → connect：旧的连接流程已在
+                // `replace_operation` 里取消并（有界地）等待收尾。
+                vpn_commands::prepare_connect(&host.state, &username);
+                async move {
+                    let _ = vpn_commands::connect_vpn_inner(
+                        username,
+                        password,
+                        auth_source,
+                        &host.state,
+                    )
+                    .await;
+                }
             });
             0
         },
@@ -141,8 +190,7 @@ pub extern "C" fn huse_vpn_disconnect() -> i32 {
         || FFI_PANIC_CODE,
         || {
             let host = instance();
-            cancel_operation(host);
-            spawn_operation(host, async move {
+            replace_operation(host, || async move {
                 let _ = vpn_commands::disconnect_vpn_inner(&host.state).await;
             });
             0
@@ -205,6 +253,9 @@ pub unsafe extern "C" fn huse_vpn_shutdown() {
             let Some(host) = INSTANCE.get() else {
                 return;
             };
+            // 与 connect/disconnect 共用同一把串行锁：关闭不会和正在推进的连接
+            // 流程交错执行。
+            let _session = lock_or_recover(&host.session);
             cancel_operation(host);
             host.runtime
                 .block_on(vpn_commands::disconnect_vpn_inner(&host.state))

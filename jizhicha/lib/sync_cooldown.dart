@@ -62,8 +62,11 @@ class DataSyncCooldownController extends ChangeNotifier {
 final dataSyncCooldown = DataSyncCooldownController();
 
 /// 显示课表/成绩本次同步的 10 秒冷却状态。
-/// 页面本身监听 [dataSyncCooldown]，因此倒计时会在不重新进入页面的情况下
-/// 每秒刷新；没有冷却时不占用额外的布局空间。
+///
+/// 指示器**自己**监听 [dataSyncCooldown]（内部 [ListenableBuilder]），所以倒计时
+/// 一秒一次的刷新只会重建这一个小部件。此前是两页的 State 监听冷却并 `setState`，
+/// 每次同步后 10 秒内整张课表（含按周筛选、parseWeekSpans、冲突聚类）会被重建 10 遍。
+/// 没有冷却时不占用额外的布局空间。
 class SyncCooldownIndicator extends StatelessWidget {
   final SyncResource resource;
 
@@ -71,6 +74,13 @@ class SyncCooldownIndicator extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: dataSyncCooldown,
+      builder: (context, _) => _buildIndicator(context),
+    );
+  }
+
+  Widget _buildIndicator(BuildContext context) {
     final remaining = dataSyncCooldown.remaining(resource);
     if (remaining <= Duration.zero) return const SizedBox.shrink();
     final seconds = remaining.inSeconds.ceil();

@@ -116,6 +116,10 @@ class AppColors {
   // 浅色模式主色板（米黄/暖咖）
   static const cream = Color(0xFFFAF9F6);
   static const creamDark = Color(0xFFF1F0EC);
+  // 补全 Material 3 的容器层级（此前只定义了 surfaceContainerHighest）。
+  // 按 M3 语义，浅色下 containerLowest 比 surface 更亮、containerLow 比 surface 略暗。
+  static const creamLight = Color(0xFFFFFEFB);
+  static const creamTint = Color(0xFFF5F4F0);
   static const beige = Color(0xFFE6E1D8);
   static const beigeMedium = Color(0xFFCEC7BA);
   static const warmBrown = Color(0xFF5A5348);
@@ -134,6 +138,9 @@ class AppColors {
   static const darkBg = Color(0xFF1E1A16);
   static const darkSurface = Color(0xFF2A2520);
   static const darkSurfaceVariant = Color(0xFF3A332B);
+  // 与浅色侧对应：补全 M3 容器层级。深色下 containerLowest 比 surface 更暗。
+  static const darkSurfaceDeep = Color(0xFF171411);
+  static const darkSurfaceTint = Color(0xFF241F1A);
   static const darkText = Color(0xFFF2E8D5);
   static const darkTextMuted = Color(0xFFB8A98F);
   static const darkDivider = Color(0xFF4A433A);
@@ -318,6 +325,12 @@ abstract class AppTheme {
       onTertiaryContainer: Color(0xFF3D4F3D),
       surface: AppColors.cream,
       onSurface: AppColors.espresso,
+      // ⚠️ 这两个角色**必须显式给值**。Flutter SDK 里它们是可空的，getter 会兜底成
+      // `?? surface`（color_scheme.dart:1248 / 1254），主题不定义就等于"和页面背景
+      // 同色" —— 全项目有 6 处引用它们（课表隔行底色、几个卡片/工具条容器），
+      // 不定义时那些容器是平的、隔行底色也完全看不出来。
+      surfaceContainerLowest: AppColors.creamLight,
+      surfaceContainerLow: AppColors.creamTint,
       surfaceContainerHighest: AppColors.creamDark,
       onSurfaceVariant: AppColors.softBrown,
       outline: AppColors.beigeMedium,
@@ -356,6 +369,8 @@ abstract class AppTheme {
       onTertiaryContainer: Color(0xFFD8E8D4),
       surface: AppColors.darkBg,
       onSurface: AppColors.darkText,
+      surfaceContainerLowest: AppColors.darkSurfaceDeep,
+      surfaceContainerLow: AppColors.darkSurfaceTint,
       surfaceContainerHighest: AppColors.darkSurface,
       onSurfaceVariant: AppColors.darkTextMuted,
       outline: AppColors.darkDivider,

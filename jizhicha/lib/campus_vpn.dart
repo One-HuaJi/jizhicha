@@ -48,7 +48,7 @@ class _EmbeddedVpnBindings {
     if (_library != null) return;
     if (Platform.isAndroid) return;
     if (!Platform.isWindows) {
-      throw '内置校园加速器当前仅支持 Windows，手机端需要接入系统网络隧道实现';
+      throw '内置校园加速器当前仅支持 Windows；当前平台暂不支持校园网连接功能';
     }
     final libraryPath = File(
       '${File(Platform.resolvedExecutable).parent.path}${Platform.pathSeparator}huse_vpn_ffi.dll',
@@ -91,9 +91,9 @@ class _EmbeddedVpnBindings {
 
   Future<Map<String, dynamic>> androidStatus() async {
     final value = await _androidChannel.invokeMethod<String>('status');
-    if (value == null || value.isEmpty) throw '加速器未返回状态信息，请重试';
+    if (value == null || value.isEmpty) throw '校园加速器未返回状态信息，请重试';
     final decoded = jsonDecode(value);
-    if (decoded is! Map<String, dynamic>) throw '加速器状态异常，请重试';
+    if (decoded is! Map<String, dynamic>) throw '校园加速器状态异常，请重试';
     return decoded;
   }
 
@@ -125,9 +125,9 @@ class _EmbeddedVpnBindings {
     ensureLoaded();
     final pointer = _status!();
     try {
-      if (pointer.address == 0) throw '加速器未返回状态信息，请重试';
+      if (pointer.address == 0) throw '校园加速器未返回状态信息，请重试';
       final decoded = jsonDecode(pointer.toDartString());
-      if (decoded is! Map<String, dynamic>) throw '加速器状态异常，请重试';
+      if (decoded is! Map<String, dynamic>) throw '校园加速器状态异常，请重试';
       return decoded;
     } finally {
       _freeString!(pointer);
@@ -197,7 +197,7 @@ class CampusVpnLauncher {
         passwordPointer,
         sourcePointer,
       );
-      if (result != 0) throw '加速器启动参数无效，请重试';
+      if (result != 0) throw '校园加速器启动参数无效，请重试';
       final deadline = DateTime.now().add(const Duration(seconds: 60));
       Object? lastError;
       while (DateTime.now().isBefore(deadline)) {
@@ -223,7 +223,7 @@ class CampusVpnLauncher {
           if (virtualIp == null || virtualIp.isEmpty) {
             // ⚠️ 与 Android 分支同文案，且是 `classifyVpnError` 的匹配键
             // （见 vpn_session.dart 的 '尚未获取到校园网地址'）。
-            throw '加速器已连接，但尚未获取到校园网地址，请重试';
+            throw '校园网已连接，但尚未获取到校园网地址，请重试';
           }
           onSourceAddressChanged?.call(virtualIp);
           return;
@@ -240,7 +240,7 @@ class CampusVpnLauncher {
         }
       }
       // 不把内部阶段名（sac/session/tls/nc_auth）显示给用户：看不懂也没法行动。
-      throw lastError ?? '校园加速器连接超时，请重试';
+      throw lastError ?? '校园网连接超时，请重试';
     } finally {
       ffi_utils.calloc.free(userPointer);
       ffi_utils.calloc.free(passwordPointer);
@@ -274,10 +274,16 @@ class CampusVpnLauncher {
       if (message != null && message.isNotEmpty) {
         onProgress?.call(message);
       } else {
-        // No native message means the service has not produced a status yet.
-        // Surface the raw payload so a stalled connect is diagnosable from the
-        // screen (MIUI suppresses app Log output in release builds).
-        onProgress?.call('原生状态：${jsonEncode(status)}');
+        // 原生还没产出 message：把状态的**脱敏摘要**当作进度显示，
+        // 让"卡在连接中"在屏幕上可诊断（MIUI 会吞掉 release 包的日志输出，
+        // 所以只能靠屏幕）。
+        //
+        // 🔴 必须脱敏：这段文案会经 `onProgress` 直接渲染到**屏幕**上
+        // （`vpn_setup_page.dart` / `campus_navigator_page.dart`），
+        // 而原始 status 里带 `username`（真实学号）与 `virtual_ip`
+        // （本次会话的校园网地址）—— 那是用户可见内容，会被截图或旁人看到。
+        // 字段白名单与 Kotlin 侧 `redactStatus()` 保持一致。
+        onProgress?.call('原生状态：${_redactStatusForDisplay(status)}');
       }
       if (status['connected'] == true) {
         // 隧道刚标记 connected 时，原生层有时还没把虚拟 IP 填进 status。
@@ -299,7 +305,7 @@ class CampusVpnLauncher {
           // ⚠️ 这段文字同时是 `classifyVpnError` 的匹配键（见 vpn_session.dart
           // 的 '尚未获取到校园网地址'）。改文案必须同步改分类器，否则会
           // 静默退化成 unknown。
-          throw '加速器已连接，但尚未获取到校园网地址，请重试';
+          throw '校园网已连接，但尚未获取到校园网地址，请重试';
         }
         onSourceAddressChanged?.call(virtualIp);
         return;
@@ -313,7 +319,7 @@ class CampusVpnLauncher {
         }
       }
     }
-    throw lastError ?? '校园加速器连接超时';
+    throw lastError ?? '校园网连接超时';
   }
 
   Future<void> connect({
@@ -360,7 +366,7 @@ class CampusVpnLauncher {
       Object lastError = firstError;
       final retryCount = _isWintunCleanupFailure(firstError) ? 2 : 1;
       for (var retry = 0; retry < retryCount; retry++) {
-        onProgress?.call('正在清理上次会话，请稍候…');
+        onProgress?.call('正在清理上次连接，请稍候…');
         try {
           await disconnect();
         } catch (_) {
@@ -480,4 +486,23 @@ class CampusVpnLauncher {
     }
     return false;
   }
+}
+
+/// 把原生 status 压成**可安全显示在屏幕上**的摘要。
+///
+/// 🔴 为什么必须脱敏：这个字符串会由调用方通过 `onProgress` 直接渲染到
+/// **屏幕**上（`vpn_setup_page.dart` / `campus_navigator_page.dart`），
+/// 而原生 status 里带 `username`（真实学号）与 `virtual_ip`（本次会话的
+/// 校园网地址）。那是**用户可见内容**，会被截图或被旁人看到 —— 不能因为
+/// 要在屏幕上做诊断，就把隐私显示出来。
+///
+/// 字段白名单与 Kotlin 侧 `redactStatus()` 保持一致：只留排查"卡在哪一步"
+/// 真正需要的 connected / stage / error / warning。
+String _redactStatusForDisplay(Map<String, dynamic> status) {
+  const keep = <String>['connected', 'stage', 'error', 'warning'];
+  final safe = <String, dynamic>{};
+  for (final key in keep) {
+    if (status.containsKey(key)) safe[key] = status[key];
+  }
+  return jsonEncode(safe);
 }

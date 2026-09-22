@@ -3,6 +3,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'app_mode.dart';
 import 'auth_pages.dart';
+import 'campus_environment.dart';
 import 'campus_vpn.dart';
 import 'common.dart';
 import 'home_page.dart';
@@ -82,6 +83,15 @@ class _CampusNavigatorPageState extends State<CampusNavigatorPage> {
     if (_disconnecting) return;
     setState(() => _disconnecting = true);
     try {
+      // ⚠️ 顺序很重要：**先**显式声明"用户不要校园网了"（落盘持久化意图），
+      // 再拆隧道。否则控制器会以为用户仍想保持连接，过几秒把他静默连回来
+      // —— 变成一个人为按不掉的开关。
+      //
+      // 这里刻意继续用 `CampusVpnLauncher().logout()`，而不是图省事改成
+      // `campusEnvironment.logout()`：前者在 Windows 上还会额外做一次
+      // 「网关旧会话清理」（同账号静默认证一次再断开，让学校网关淘汰旧会话），
+      // 后者只做 `session.disconnect()`，少了这一步，而且 busy 时会直接 return。
+      await campusEnvironment.clearKeepAliveIntent();
       await CampusVpnLauncher().logout();
       await JwxtClient().resetSession();
       if (!mounted) return;
@@ -151,7 +161,7 @@ class _CampusNavigatorPageState extends State<CampusNavigatorPage> {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              '校园加速器已连接',
+                              '校园网已连接',
                               style: TextStyle(
                                 color: colorScheme.onSurface,
                                 fontSize: 19,
@@ -194,7 +204,7 @@ class _CampusNavigatorPageState extends State<CampusNavigatorPage> {
                 OutlinedButton.icon(
                   onPressed: _disconnecting ? null : _disconnect,
                   icon: const Icon(Icons.power_settings_new),
-                  label: const Text('断开加速器'),
+                  label: const Text('断开校园加速器'),
                 ),
               ],
             ),

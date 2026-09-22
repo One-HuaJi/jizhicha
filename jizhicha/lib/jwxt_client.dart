@@ -547,7 +547,7 @@ class JwxtClient {
               DioException(
                 requestOptions: e.requestOptions,
                 type: e.type,
-                error: '无法连接校园内网，请确认已连接校园加速器后重试',
+                error: '无法连接校园网，请确认已连接校园加速器后重试',
                 stackTrace: e.stackTrace,
               ),
             );
@@ -1407,13 +1407,21 @@ String? extractTableById(String html, String id) {
   return html.substring(start, end);
 }
 
+// —— 周次解析用到的正则 ——
+// 这几个函数（[_cleanWeeks] / [parseWeekSpans] / [weekInWeeks]）处在课表渲染的
+// 热路径上：渲染一节表格会对每门课调用多次，冲突判定还会两两比较。原来每个函数
+// 内部都现写 `RegExp(...)`，等于每次调用都重新编译一遍同样的模式；提成顶层 final
+// 后只编译一次。RegExp 编译结果是无状态可复用的，共享不会串数据。
+final _weekNonDigitCommaDash = RegExp(r'[^\d,\-]');
+final _weekBracketAnnotation = RegExp(r'\[[^\]]*\]');
+
 /// 从课表的周次字段（如 "1-10(周)" / "11-12(周)[01-02节]" / "1-4,9-12(周)" / "5(周)"）
 /// 解析出**所有**区间段（支持逗号分隔的多段），忽略 [01-02节] 这类节次标记。
 /// 形如 "1-4,9-12(周)" 会返回 [{1..4},{9..12}]；无法识别则返回空列表。
 /// 所有需要判断"某课程在第几周有课"的地方（筛选 / 高亮 / 冲突判定）都必须用它，
 /// 避免只看首段导致"第11周仍显示1-10周课程""漏报多段冲突"等口径不一致的 bug。
 List<Map<String, int>> parseWeekSpans(String weeks) {
-  final clean = _cleanWeeks(weeks).replaceAll(RegExp(r'[^\d,\-]'), '');
+  final clean = _cleanWeeks(weeks).replaceAll(_weekNonDigitCommaDash, '');
   final result = <Map<String, int>>[];
   for (final part in clean.split(',')) {
     final t = part.trim();
@@ -1604,11 +1612,11 @@ String _extractWeeks(String block) {
 
 /// 去掉周次里的节次标注，如 "1-10(周)[01-02节]" -> "1-10(周)"，便于做匹配键。
 String _cleanWeeks(String weeks) =>
-    weeks.replaceAll(RegExp(r'\[[^\]]*\]'), '').trim();
+    weeks.replaceAll(_weekBracketAnnotation, '').trim();
 
 /// 判断某周是否落在课程周次区间内（支持逗号分隔的多段，如 "1-4,6-12(周)"）。
 bool weekInWeeks(String weeks, int week) {
-  final clean = _cleanWeeks(weeks).replaceAll(RegExp(r'[^\d,\-]'), '');
+  final clean = _cleanWeeks(weeks).replaceAll(_weekNonDigitCommaDash, '');
   for (final part in clean.split(',')) {
     final t = part.trim();
     if (t.isEmpty) continue;

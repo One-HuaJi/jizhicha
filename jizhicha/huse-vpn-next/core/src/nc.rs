@@ -116,9 +116,7 @@ const MAX_ASSEMBLY_BUFFER: usize = 256 * 1024;
 
 impl NcFrameAssembler {
     pub fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-        }
+        Self { buffer: Vec::new() }
     }
 
     /// Feed one decrypted TLS application record; return every complete packet.
@@ -429,8 +427,14 @@ mod tests {
         let frame = build_nc_data_frame(&[0x45, 1, 2, 3, 4, 5, 6, 7]).unwrap();
         let (head, tail) = frame.split_at(6);
         let mut assembler = NcFrameAssembler::new();
-        assert!(assembler.feed(head).unwrap().is_empty(), "未完整时不应产出包");
-        assert_eq!(assembler.feed(tail).unwrap(), [vec![0x45, 1, 2, 3, 4, 5, 6, 7]]);
+        assert!(
+            assembler.feed(head).unwrap().is_empty(),
+            "未完整时不应产出包"
+        );
+        assert_eq!(
+            assembler.feed(tail).unwrap(),
+            [vec![0x45, 1, 2, 3, 4, 5, 6, 7]]
+        );
     }
 
     #[test]
