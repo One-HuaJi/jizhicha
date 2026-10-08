@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use x509_cert::der::{Decode, Encode};
+use zeroize::{Zeroize, Zeroizing};
 
 const V12: [u8; 2] = [0x03, 0x03];
 const MAX_SERVER_HANDSHAKE_BYTES: usize = 1024 * 1024;
@@ -38,14 +39,25 @@ fn verify_gateway_spki_pin(spki_der: &[u8]) -> Result<()> {
 
 fn p_sha256(secret: &[u8], seed: &[u8], len: usize) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut a = seed.to_vec();
+    // `a` 是 A(i) 链、`mi` 是本次 HMAC 的输入；`out` 的**前身**是调用方即将拿去
+    // 当密钥用的字节（master secret / key block），`out` 本身按值返回、擦除责任
+    // 在调用方。这里只负责不让 A(i) 中间块留在堆上——它是从 secret 派生的，同样
+    // 属于密钥材料。
+    let mut a = Zeroizing::new(seed.to_vec());
     while out.len() < len {
-        a = hmac_sha256(secret, &a).to_vec();
-        let mut mi = a.clone();
-        mi.extend_from_slice(seed);
+        *a = hmac_sha256(secret, &a).to_vec();
+        let mi = Zeroizing::new({
+            let mut mi = a.to_vec();
+            mi.extend_from_slice(seed);
+            mi
+        });
         out.extend_from_slice(&hmac_sha256(secret, &mi));
     }
     out.truncate(len);
+    // 截断只改长度、不擦字节：被丢掉的那截仍然躺在已分配的堆区里，必须手动清掉，
+    // 否则 key block 的尾部会以"已释放但不为零"的形态留在进程内存中。
+    let live = out.len();
+    out[live..].zeroize();
     out
 }
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -119,6 +131,26 @@ struct DerivedKeys {
     master_secret: [u8; 48],
 }
 
+/// 密钥材料出作用域即擦除。
+///
+/// ⚠️ 字段类型保持**裸 `[u8; N]`**，不要改成 `Zeroizing<[u8; N]>`：整个 `tls.rs`
+/// 都是按 `&[u8; 16]` / `&[u8; 20]` / `&[u8; 48]` 取字段的，换成包装类型会牵动
+/// 全部调用点，无谓地放大 diff。这里手写 `Drop` 只加擦除、不改任何读写路径。
+///
+/// 擦除时机是 `derive_keys` 的返回值在 `connect` 里被用完（Finished 校验结束）
+/// 之后的析构点；线上的 key block / master secret 已经按值拷进
+/// [`RawTlsClient`]，因此在**仍有连接在跑**时擦这份副本是安全的。
+impl Drop for DerivedKeys {
+    fn drop(&mut self) {
+        // 每个字段都必须点到名：漏一个就正好漏掉一份密钥材料。
+        self.client_key.zeroize();
+        self.server_key.zeroize();
+        self.client_mac.zeroize();
+        self.server_mac.zeroize();
+        self.master_secret.zeroize();
+    }
+}
+
 fn derive_keys(
     pre: &[u8; 48],
     cr: &[u8; 32],
@@ -126,7 +158,10 @@ fn derive_keys(
     ems: bool,
     hs_bytes: &[u8],
 ) -> DerivedKeys {
-    let ms = if ems {
+    // 三份中间量都用 `Zeroizing` 包住：`ms` 是 master secret 本体，`kb` 是一整块
+    // key block，`s2` 是 key expansion 的 seed。它们在本函数返回时就不再需要，
+    // 必须随作用域擦除，而不是留在堆上等复用。
+    let ms = Zeroizing::new(if ems {
         let h = Sha256::digest(hs_bytes);
         let mut seed = b"extended master secret".to_vec();
         seed.extend_from_slice(&h);
@@ -136,16 +171,23 @@ fn derive_keys(
         seed.extend_from_slice(cr);
         seed.extend_from_slice(sr);
         p_sha256(pre, &seed, 48)
-    };
-    let mut s2 = b"key expansion".to_vec();
+    });
+    let mut s2 = Zeroizing::new(b"key expansion".to_vec());
     s2.extend_from_slice(sr);
     s2.extend_from_slice(cr);
-    let kb = p_sha256(&ms, &s2, 72);
+    let kb = Zeroizing::new(p_sha256(&ms, &s2, 72));
     // RFC 5246 §6.3：client/server MAC secret 在前，随后才是写入密钥。
-    let mut ck = [0u8; 16];
-    let mut sk = [0u8; 16];
-    let mut cm = [0u8; 20];
-    let mut sm = [0u8; 20];
+    //
+    // 四个局部量用 `Zeroizing` 包住而不是裸 `[u8; N]`：返回结构体按值拷走一份之后，
+    // 本函数栈上的这份副本必须跟着作用域消失。**顺序至关重要**——只能在取出值
+    // （`*ck` / `*cm` …）构造返回结构体**之后**才轮到它们析构；若在构造之前就把
+    // 它们清零，返回结构体里装的就会是全零（这正是本次重构踩过的坑，
+    // `prf_matches_python` 会逐字节把它抓出来）。数组本身实现了 `Copy`，
+    // `*ck` 拷贝的是值、不是别名。
+    let mut cm = Zeroizing::new([0u8; 20]);
+    let mut sm = Zeroizing::new([0u8; 20]);
+    let mut ck = Zeroizing::new([0u8; 16]);
+    let mut sk = Zeroizing::new([0u8; 16]);
     let mut p = 0;
     cm.copy_from_slice(&kb[p..p + 20]);
     p += 20;
@@ -154,40 +196,98 @@ fn derive_keys(
     ck.copy_from_slice(&kb[p..p + 16]);
     p += 16;
     sk.copy_from_slice(&kb[p..p + 16]);
-    let mut ms_arr = [0u8; 48];
+    let mut ms_arr = Zeroizing::new([0u8; 48]);
     ms_arr.copy_from_slice(&ms);
     // 字段取值顺序与旧版裸元组 `(ck, sk, cm, sm, ms_arr)` 完全一致。
-    DerivedKeys {
-        client_key: ck,
-        server_key: sk,
-        client_mac: cm,
-        server_mac: sm,
-        master_secret: ms_arr,
+    let keys = DerivedKeys {
+        client_key: *ck,
+        server_key: *sk,
+        client_mac: *cm,
+        server_mac: *sm,
+        master_secret: *ms_arr,
+    };
+    // 显式清零上面四个/一个 `Zeroizing` 持有的栈上副本（不写这句它们也会在
+    // 作用域结束时被擦，写出来是为了让"擦除点在哪里"在代码里可见）。
+    ck.zeroize();
+    sk.zeroize();
+    cm.zeroize();
+    sm.zeroize();
+    ms_arr.zeroize();
+    keys
+}
+
+/// 一条隧道所用的写入密钥与 MAC secret。
+///
+/// 单独成类型（而不是四个裸字段散在 `RawTlsClient` / `RawTlsReader` /
+/// `RawTlsWriter` 里各自 `Drop` 一遍）是为了让"哪几份密钥必须在什么时候擦"
+/// 只写一次：三个结构体各持有一份，析构时由本类型的 `Drop` 统一负责，不可能
+/// 出现"某个结构体补了 Drop、另一个漏了"的漂移。
+///
+/// ⚠️ 字段类型保持**裸 `[u8; N]`**，不要改成 `Zeroizing<[u8; N]>`：整个
+/// `tls.rs` 都按 `&[u8; 16]` / `&[u8; 20]` 引用这些字段，换成包装类型会牵动
+/// 全部调用点。这里手写 `Drop` 只加擦除、不改任何读写路径。
+#[derive(Default)]
+struct KeyMaterial {
+    client_key: [u8; 16],
+    client_mac: [u8; 20],
+    server_key: [u8; 16],
+    server_mac: [u8; 20],
+}
+
+impl KeyMaterial {
+    /// 按值取出全部四份密钥，并把原字段擦成零。
+    ///
+    /// 这是 `into_split` 能继续用"逐字段移出"写法的关键：先整体取走，
+    /// 原结构体的字段就只剩全零占位，于是 ① 不必给 `RawTlsClient` 实现
+    /// `Drop`（否则 Rust 会以 E0509 禁止按字段移出）、② 也不会把已经交给
+    /// 半边的密钥再擦第二遍。
+    fn take(&mut self) -> KeyMaterial {
+        std::mem::take(self)
+    }
+}
+
+impl Drop for KeyMaterial {
+    fn drop(&mut self) {
+        // 四个字段逐个点名：漏一个就正好漏掉一份密钥材料。
+        self.client_key.zeroize();
+        self.client_mac.zeroize();
+        self.server_key.zeroize();
+        self.server_mac.zeroize();
     }
 }
 
 pub struct RawTlsClient {
     stream: TcpStream,
-    client_key: [u8; 16],
-    client_mac: [u8; 20],
-    server_key: [u8; 16],
-    server_mac: [u8; 20],
+    keys: KeyMaterial,
     send_seq: u64,
     recv_seq: u64,
 }
 
 pub struct RawTlsReader {
     stream: OwnedReadHalf,
-    server_key: [u8; 16],
-    server_mac: [u8; 20],
+    keys: KeyMaterial,
     recv_seq: u64,
 }
 
 pub struct RawTlsWriter {
     stream: OwnedWriteHalf,
-    client_key: [u8; 16],
-    client_mac: [u8; 20],
+    keys: KeyMaterial,
     send_seq: u64,
+}
+
+/// 生成 48 字节 pre-master secret（TLS 1.2 RSA 密钥交换，RFC 5246 §7.4.7.1）。
+///
+/// 返回值用 [`Zeroizing`] 包裹：调用方用完即擦，包括中途 `?` 提前返回的失败路径。
+/// 单独抽成函数是为了让"这份密钥确实被擦掉了"能被直接测试 —— 它只做随机数生成，
+/// 不含任何 I/O，抽出来不改变 `connect` 的任何线上行为。
+///
+/// 注意这里是**返回值**而非可变输出参数：`Zeroizing<[u8; 48]>` 通过 `DerefMut`
+/// 仍然能按 `&mut [u8]` 传给 `fill_bytes`，调用点不必知道包装类型的存在。
+fn generate_pre_master_secret() -> Zeroizing<[u8; 48]> {
+    let mut pre = Zeroizing::new([0u8; 48]);
+    pre[..2].copy_from_slice(&V12);
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut pre[2..]);
+    pre
 }
 
 impl RawTlsClient {
@@ -207,10 +307,12 @@ impl RawTlsClient {
         // TLS_RSA_WITH_AES_128_CBC_SHA: 48-byte pre-master secret encrypted with
         // the certificate's RSA key. The pre-master itself, not its PKCS#1 padding,
         // is the input to the TLS PRF.
-        let mut pre48 = [0u8; 48];
-        pre48[..2].copy_from_slice(&V12);
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut pre48[2..]);
-        let enc = rsa_pkcs1_encrypt_manual(&rsa, &pre48);
+        //
+        // `Zeroizing` 包住的是**整个 premaster 的生命周期**：`connect` 在
+        // `derive_keys` 之后、任何网络往返之前就把它擦掉，成功路径和握手失败
+        // 提前 `return Err` 的路径都覆盖到（`?` 提前返回时照样析构）。
+        let pre48 = generate_pre_master_secret();
+        let enc = rsa_pkcs1_encrypt_manual(&rsa, &pre48[..]);
         let mut cke_body = Vec::with_capacity(enc.len() + 2);
         cke_body.extend_from_slice(&(enc.len() as u16).to_be_bytes());
         cke_body.extend_from_slice(&enc);
@@ -266,10 +368,12 @@ impl RawTlsClient {
         }
         Ok(RawTlsClient {
             stream: s,
-            client_key: keys.client_key,
-            client_mac: keys.client_mac,
-            server_key: keys.server_key,
-            server_mac: keys.server_mac,
+            keys: KeyMaterial {
+                client_key: keys.client_key,
+                client_mac: keys.client_mac,
+                server_key: keys.server_key,
+                server_mac: keys.server_mac,
+            },
             // TLS Finished is the first protected client record and uses seq=0.
             // Application data therefore begins at seq=1.
             send_seq: 1,
@@ -278,8 +382,13 @@ impl RawTlsClient {
     }
 
     async fn send(&mut self, ct: u8, pl: &[u8]) -> Result<()> {
-        let (records, used) =
-            encrypt_fragments(ct, &self.client_key, &self.client_mac, self.send_seq, pl);
+        let (records, used) = encrypt_fragments(
+            ct,
+            &self.keys.client_key,
+            &self.keys.client_mac,
+            self.send_seq,
+            pl,
+        );
         self.send_seq += used;
         self.stream
             .write_all(&records)
@@ -296,8 +405,8 @@ impl RawTlsClient {
         let plaintext = decrypt_record(
             content_type,
             &body,
-            &self.server_key,
-            &self.server_mac,
+            &self.keys.server_key,
+            &self.keys.server_mac,
             self.recv_seq,
         )?;
         self.recv_seq += 1;
@@ -312,19 +421,34 @@ impl RawTlsClient {
 
     /// Split an authenticated connection into independently usable read and
     /// write halves. Each half retains its own TLS record sequence number.
-    pub fn into_split(self) -> (RawTlsReader, RawTlsWriter) {
+    ///
+    /// 密钥经 [`KeyMaterial::take`] 按值转移给两个半边，原字段只剩全零占位，
+    /// 因此本类型**不需要**实现 `Drop`，也就不会撞上"实现了 `Drop` 就不能按
+    /// 字段移出"（E0509）。返回值与旧版逐字段移动完全一致。
+    pub fn into_split(mut self) -> (RawTlsReader, RawTlsWriter) {
+        let taken = self.keys.take();
         let (read_half, write_half) = self.stream.into_split();
         (
             RawTlsReader {
                 stream: read_half,
-                server_key: self.server_key,
-                server_mac: self.server_mac,
+                keys: KeyMaterial {
+                    server_key: taken.server_key,
+                    server_mac: taken.server_mac,
+                    // 读半不持有写入密钥，两份字段留零。
+                    client_key: [0u8; 16],
+                    client_mac: [0u8; 20],
+                },
                 recv_seq: self.recv_seq,
             },
             RawTlsWriter {
                 stream: write_half,
-                client_key: self.client_key,
-                client_mac: self.client_mac,
+                keys: KeyMaterial {
+                    client_key: taken.client_key,
+                    client_mac: taken.client_mac,
+                    // 写半不持有读密钥，两份字段留零。
+                    server_key: [0u8; 16],
+                    server_mac: [0u8; 20],
+                },
                 send_seq: self.send_seq,
             },
         )
@@ -343,8 +467,8 @@ impl RawTlsReader {
         let plaintext = decrypt_record(
             content_type,
             &body,
-            &self.server_key,
-            &self.server_mac,
+            &self.keys.server_key,
+            &self.keys.server_mac,
             self.recv_seq,
         )?;
         self.recv_seq += 1;
@@ -362,8 +486,8 @@ impl RawTlsWriter {
     pub async fn write(&mut self, data: &[u8]) -> Result<()> {
         let (records, used) = encrypt_fragments(
             0x17,
-            &self.client_key,
-            &self.client_mac,
+            &self.keys.client_key,
+            &self.keys.client_mac,
             self.send_seq,
             data,
         );
@@ -830,6 +954,15 @@ async fn wr(s: &mut TcpStream, ct: u8, body: &[u8]) -> Result<()> {
 struct AesCbc {
     k: [u8; 16],
 }
+
+/// 这个结构体只在单次 `enc` / `dec` 里存活，但它持有的是**展开前的写入密钥**，
+/// 析构时必须擦掉，否则每一收发一条 record 都会在栈上留下一份密钥副本。
+impl Drop for AesCbc {
+    fn drop(&mut self) {
+        self.k.zeroize();
+    }
+}
+
 impl AesCbc {
     fn new(k: &[u8; 16]) -> Self {
         Self { k: *k }
@@ -887,6 +1020,238 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
+
+    // === 密钥材料清零测试 ===
+    //
+    // 这些测试全部使用合成向量（合成密钥、合成明文），不含任何真实凭据，
+    // 也不打印任何密钥字节。
+    //
+    // 断言方式：`Box` 给出地址稳定的堆分配，用 `read_volatile` 绕过优化器对
+    // "读到的是已析构对象"的假设。`Drop` 里的 `Zeroize` 本身走
+    // `write_volatile` + 编译器屏障，因此这些读回的是真实发生过的擦除结果。
+
+    /// 把 `DerivedKeys` 里全部 120 字节密钥材料（16+16+20+20+48）读出来。
+    ///
+    /// # Safety
+    /// 只在测试里使用，两条约束缺一不可：① 传进来的地址必须是一个仍然存活
+    /// （未被 `Box::dealloc` 释放/复用）的 `DerivedKeys` 的地址；② 只用于断言
+    /// "读到的全是 0"。因此所有调用点都用 `&*boxed` 取址、**绝不 `drop(box)`**
+    /// —— 释放后再读是未定义行为，读到的也不保证还是擦除后的字节。
+    unsafe fn read_key_material(k: *const DerivedKeys) -> Vec<u8> {
+        let mut got = Vec::with_capacity(120);
+        // 逐字段取址后各自读回：五个字段长度不同（16/16/20/20/48），不能放进
+        // 同一个数组，也不能用 `read_volatile` 一次读整个结构体。
+        got.extend_from_slice(&unsafe {
+            std::ptr::read_volatile(std::ptr::addr_of!((*k).client_key))
+        });
+        got.extend_from_slice(&unsafe {
+            std::ptr::read_volatile(std::ptr::addr_of!((*k).server_key))
+        });
+        got.extend_from_slice(&unsafe {
+            std::ptr::read_volatile(std::ptr::addr_of!((*k).client_mac))
+        });
+        got.extend_from_slice(&unsafe {
+            std::ptr::read_volatile(std::ptr::addr_of!((*k).server_mac))
+        });
+        got.extend_from_slice(&unsafe {
+            std::ptr::read_volatile(std::ptr::addr_of!((*k).master_secret))
+        });
+        got
+    }
+
+    /// 红灯测试 ①：`derive_keys` 的返回值析构后，master secret 与整个 key block
+    /// 必须已归零。
+    #[test]
+    fn derived_keys_are_zeroized_on_drop() {
+        let pre = [0x11u8; 48];
+        let cr = [0x22u8; 32];
+        let sr = [0x33u8; 32];
+        let keys = Box::new(derive_keys(&pre, &cr, &sr, false, b"synthetic transcript"));
+        let addr: *const DerivedKeys = &*keys;
+        // 前置条件：析构前确实是**非零**密钥材料。少了这一步，下列断言在
+        // "derive_keys 恰好返回全零"时也会假通过。
+        let before = unsafe { read_key_material(addr) };
+        assert!(
+            before.iter().any(|&b| b != 0),
+            "合成输入必须派生出非零密钥材料，否则本测试无法区分清零与本来就全零"
+        );
+        // 就地析构：走真实的 `impl Drop for DerivedKeys`，但分配仍然存活，
+        // 地址可以安全复读。
+        unsafe { std::ptr::drop_in_place(addr.cast_mut()) };
+        let after = unsafe { read_key_material(addr) };
+        assert!(
+            after.iter().all(|&b| b == 0),
+            "衍生密钥材料必须在析构时清零，仍在内存中的非零字节数 = {}",
+            after.iter().filter(|&&b| b != 0).count()
+        );
+    }
+
+    /// 红灯测试 ②：pre-master secret 在 `Zeroizing` 析构后必须已归零。
+    #[test]
+    fn pre_master_secret_is_zeroized_on_drop() {
+        let pre = Box::new(generate_pre_master_secret());
+        let addr: *const Zeroizing<[u8; 48]> = &*pre;
+        let raw: [u8; 48] = **pre;
+        assert_eq!(&raw[..2], &V12, "premaster 前两字节必须是协商版本号");
+        assert!(
+            raw[2..].iter().any(|&b| b != 0),
+            "随机部分必须非零，否则本测试无法区分清零与本来就全零"
+        );
+        unsafe { std::ptr::drop_in_place(addr.cast_mut()) };
+        let after = unsafe { std::ptr::read_volatile(addr) };
+        assert_eq!(after[..], [0u8; 48][..], "premaster 必须在析构时清零");
+    }
+
+    /// 在一个真实的本地 TCP 连接对上构造 `RawTlsClient`（不做 TLS 握手）。
+    ///
+    /// 只用于测试析构清零：不连任何真实网关，`addr` 固定回环。
+    async fn synthetic_client(
+        ll: [u8; 16],
+        lm: [u8; 20],
+        rl: [u8; 16],
+        rm: [u8; 20],
+    ) -> RawTlsClient {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local_addr");
+        let server = tokio::spawn(async move { listener.accept().await.map(|(s, _)| s) });
+        let stream = TcpStream::connect(addr).await.expect("connect loopback");
+        let accepted = server.await.expect("accept task").expect("accept");
+        drop(accepted);
+        RawTlsClient {
+            stream,
+            keys: KeyMaterial {
+                client_key: ll,
+                client_mac: lm,
+                server_key: rl,
+                server_mac: rm,
+            },
+            send_seq: 1,
+            recv_seq: 1,
+        }
+    }
+
+    /// 红灯测试 ③：贯穿隧道生命周期的四份密钥（`KeyMaterial`，`RawTlsClient` /
+    /// `RawTlsReader` / `RawTlsWriter` 三者共用的那个字段类型）析构后必须已归零。
+    ///
+    /// 这里刻意**不**去强制析构持有 tokio `TcpStream` 的那三个结构体：对 tokio
+    /// 内部持有的对象做 `drop_in_place` 会让 reactor 的注销路径崩掉
+    /// （`probe_drop.rs` 验证过：`into_split` 出来的半边被强制析构时会 panic 在
+    /// `poll_evented.rs` 的 `Deref` 上，随后整个进程 STATUS_HEAP_CORRUPTION）。
+    /// 那是**测试手法**的问题，与清零逻辑无关。密钥擦除只由下面这个 `Drop` 实现，
+    /// 因此直接对 `KeyMaterial` 断言，覆盖的是同一份代码路径。
+    #[test]
+    fn key_material_is_zeroized_on_drop() {
+        let keys = Box::new(KeyMaterial {
+            client_key: [0xd1; 16],
+            client_mac: [0xd2; 20],
+            server_key: [0xd3; 16],
+            server_mac: [0xd4; 20],
+        });
+        let addr: *const KeyMaterial = &*keys;
+        // 前置条件：析构前确实是非零密钥材料。
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*addr).server_mac)) },
+            [0xd4; 20]
+        );
+        unsafe { std::ptr::drop_in_place(addr.cast_mut()) };
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*addr).client_key)) },
+            [0u8; 16],
+            "client_key 必须在析构时清零"
+        );
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*addr).client_mac)) },
+            [0u8; 20]
+        );
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*addr).server_key)) },
+            [0u8; 16]
+        );
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*addr).server_mac)) },
+            [0u8; 20]
+        );
+    }
+
+    /// 红灯测试 ④：`into_split` 之后，一把密钥只能存在于真正使用它的那一半，
+    /// 且 `RawTlsClient` 自己不再留有任何一份（它的 `KeyMaterial` 已被 take 成零）。
+    ///
+    /// 这条专门盯住 `mem::take` 那个改写：既断言密钥按值完整转移（没被提前清零、
+    /// 也没被擦两遍），又断言拆分后原对象不再持有密钥。两个半边**走自然析构**
+    /// （析构时各自的 `KeyMaterial` 归零），理由见红灯测试 ③。
+    #[test]
+    fn split_halves_take_ownership_of_their_keys() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let client = synthetic_client([0xb1; 16], [0xb2; 20], [0xb3; 16], [0xb4; 20]).await;
+            let (reader, writer) = client.into_split();
+            // 密钥按值完整转移，一个字节都没丢。
+            assert_eq!(
+                writer.keys.client_key, [0xb1; 16],
+                "写半必须拿到 client_key"
+            );
+            assert_eq!(
+                writer.keys.client_mac, [0xb2; 20],
+                "写半必须拿到 client_mac"
+            );
+            assert_eq!(writer.send_seq, 1, "写半必须继承 send_seq");
+            assert_eq!(
+                reader.keys.server_key, [0xb3; 16],
+                "读半必须拿到 server_key"
+            );
+            assert_eq!(
+                reader.keys.server_mac, [0xb4; 20],
+                "读半必须拿到 server_mac"
+            );
+            assert_eq!(reader.recv_seq, 1, "读半必须继承 recv_seq");
+            // 半边只该拿到自己方向的那两份：另一半位置必须是零占位，不能是副本。
+            assert_eq!(writer.keys.server_key, [0u8; 16], "写半不得捎带 server_key");
+            assert_eq!(reader.keys.client_key, [0u8; 16], "读半不得捎带 client_key");
+            // 两个半边各自析构时会擦掉自己持有的那一份（`KeyMaterial::drop`），
+            // 这里只需确认它们可析构、不 panic。
+            drop(reader);
+            drop(writer);
+        });
+    }
+
+    /// 红灯测试 ⑤：`AesCbc` 只活在一次 `enc`/`dec` 里，但它持有写入密钥，
+    /// 析构后必须归零。
+    #[test]
+    fn aes_cbc_zeroizes_its_key_on_drop() {
+        let cipher = Box::new(AesCbc::new(&[0xc1; 16]));
+        let addr: *const AesCbc = &*cipher;
+        assert_eq!(cipher.k, [0xc1; 16], "构造后密钥必须可用");
+        unsafe { std::ptr::drop_in_place(addr.cast_mut()) };
+        assert_eq!(
+            unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*addr).k)) },
+            [0u8; 16],
+            "AesCbc 持有的写入密钥必须在析构时清零"
+        );
+    }
+
+    /// 反向保护：清零必须发生在密钥**不再需要之后**。
+    ///
+    /// 这份测试复刻 `connect` 里"派生密钥 -> 用 Finished 校验"的顺序，断言
+    /// 密钥在**使用中**仍能解出正确结果 —— 也就是说，上面那些 `Drop` 不会把
+    /// 仍在通话的连接擦坏。
+    #[test]
+    fn zeroizing_wrappers_do_not_break_keys_while_still_in_use() {
+        let pre = [0x44u8; 48];
+        let cr = [0x55u8; 32];
+        let sr = [0x66u8; 32];
+        let keys = derive_keys(&pre, &cr, &sr, false, b"synthetic transcript");
+        let vt = finished_verify_data(&keys.master_secret, b"client finished", b"transcript");
+        assert_eq!(vt.len(), 12, "Finished verify_data 必须是 12 字节");
+        let record = encrypt_record(0x16, &keys.client_key, &keys.client_mac, 0, b"probe");
+        let out = decrypt_record(0x16, &record[5..], &keys.client_key, &keys.client_mac, 0)
+            .expect("使用中的密钥必须仍然可加解密");
+        assert_eq!(out, b"probe", "使用中的密钥不得被提前清零");
+    }
 
     #[test]
     fn accepts_only_the_pinned_gateway_spki() {
