@@ -222,7 +222,7 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
   String? _dayDateLabel(DateTime? startDate, int offsetDays) {
     if (startDate == null) return null;
     final d = startDate.add(Duration(days: offsetDays));
-    return d.month.toString() + '/' + d.day.toString();
+    return '${d.month}/${d.day}';
   }
 
   Widget _buildTimeCell(String time, [double? cellHeight, bool isNarrow = false]) {
@@ -641,7 +641,7 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
             Padding(
               padding: EdgeInsets.only(top: pure ? 1 : 2),
               child: Text(
-                '$room',
+                room,
                 softWrap: !pure,
                 maxLines: pure ? 1 : null,
                 overflow: pure ? TextOverflow.ellipsis : null,

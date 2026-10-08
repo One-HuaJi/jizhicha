@@ -1,6 +1,5 @@
 import 'dart:async' show Timer;
 
-import 'package:flutter/foundation.dart' show ChangeNotifier;
 import 'package:flutter/material.dart';
 
 // ==================== 同步冷却（手动课表/成绩共用） ====================

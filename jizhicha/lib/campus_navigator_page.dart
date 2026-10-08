@@ -281,7 +281,7 @@ class _CampusLinkCard extends StatelessWidget {
 class ErrorBox extends StatelessWidget {
   final String message;
 
-  const ErrorBox({required this.message});
+  const ErrorBox({super.key, required this.message});
 
   @override
   Widget build(BuildContext context) {

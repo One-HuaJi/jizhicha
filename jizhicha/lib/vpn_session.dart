@@ -215,11 +215,8 @@ class _LauncherAdapter implements CampusVpnLauncherAdapter {
 
 /// 加速器会话状态机。
 class VpnSession extends ChangeNotifier {
-  VpnSession({
-    required CampusProbe probe,
-    CampusVpnLauncherAdapter? launcher,
-  })  : _probe = probe,
-        _launcher = launcher ?? _LauncherAdapter(CampusVpnLauncher());
+  VpnSession({required this._probe, CampusVpnLauncherAdapter? launcher})
+    : _launcher = launcher ?? _LauncherAdapter(CampusVpnLauncher());
 
   final CampusProbe _probe;
   final CampusVpnLauncherAdapter _launcher;

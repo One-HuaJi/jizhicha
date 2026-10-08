@@ -1,6 +1,7 @@
 // ==================== Embedded Campus Accelerator ====================
 /// The accelerator is part of this Flutter application through Dart FFI.
 /// No standalone accelerator executable or local control API is used.
+library;
 
 import 'dart:convert';
 import 'dart:ffi' as ffi;
