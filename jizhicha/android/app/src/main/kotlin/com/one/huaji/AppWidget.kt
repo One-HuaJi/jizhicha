@@ -7,11 +7,14 @@ import android.appwidget.AppWidgetProvider
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.os.Build
+import android.util.Log
 import android.widget.RemoteViews
 import org.json.JSONObject
 import java.io.File
 import java.util.Calendar
+import java.util.concurrent.TimeUnit
 
 /// 桌面小组件：显示「下一节课」（时间 / 课程名 / 老师 / 教室），并调度上课提醒闹钟。
 /// 数据来自 Flutter 侧写入的 widget_schedule.json（位于应用文档目录）。
@@ -50,6 +53,30 @@ class AppWidget : AppWidgetProvider() {
         /// 未授权精确闹钟时 setWindow 的容许窗口（毫秒）。
         private const val INEXACT_WINDOW_MS = 120_000L
 
+        /// 作息季节：5 月 1 日–9 月 30 日为夏季，其余日期为春秋冬季。
+        /// 与 Dart 侧 `ScheduleTimeTable.resolveMode`（`month >= 5 && month <= 9`）一致。
+        ///
+        /// ⚠️ 这里只是**选列规则**，不是第二份作息表：具体的 22 个时刻唯一定义在
+        /// Dart 侧 `lib/schedule_time.dart` 的 `ScheduleTimeTable`，由 Flutter 转录进
+        /// widget_schedule.json 的 `times` 字段。Kotlin 侧永远不硬编码 HH:mm。
+        private const val SEASON_SPRING_AUTUMN_WINTER = "springAutumnWinter"
+        private const val SEASON_SUMMER = "summer"
+
+        /// 小组件 JSON 里 `scheduleTimeMode` / `times` 的字段名。
+        private const val FIELD_SCHEDULE_TIME_MODE = "scheduleTimeMode"
+        private const val FIELD_TIMES = "times"
+        private const val FIELD_SEMESTER_START_DATE = "semesterStartDate"
+
+        /// 「自动」模式：`times` 里的两列由**设备当天日期**决定用哪一列。
+        /// 与 Dart 侧 `ScheduleTimeMode.automatic.storageValue` 一致。
+        private const val MODE_AUTOMATIC = "automatic"
+
+        private const val TAG = "AppWidget"
+
+        /// release 版本不打任何调试日志（app 模块不生成 BuildConfig，
+        /// 所以用 ApplicationInfo.FLAG_DEBUGGABLE 判断，与 CampusVpnService 同一套模式）。
+        private var debugLogging = false
+
         /// 保留原签名：自行读盘后转调带参重载。
         fun updateWidget(context: Context, manager: AppWidgetManager, widgetId: Int) {
             updateWidget(context, manager, widgetId, readJson(context), readSettings(context))
@@ -84,7 +111,20 @@ class AppWidget : AppWidgetProvider() {
             val views = RemoteViews(context.packageName, R.layout.appwidget)
             val showTeacherRoom = settings.optBoolean("showTeacherRoom", true)
 
-            val week = json?.optInt("week", 0) ?: 0
+            // 同一个 Calendar 贯穿本次刷新：周次、季节列、下一节课的排序基准都用它，
+            // 避免跨午夜/跨季节边界时三个判断各自取到不同的一天。
+            val now = Calendar.getInstance()
+            debugLogging =
+                (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+            // 周次不再直接读 `week` 快照：App 多周不打开时它会停在旧值，
+            // weekValue 优先用落盘的 semesterStartDate 按当天日期现算。
+            val week = json?.let { weekValue(it, now) } ?: 0
+            if (debugLogging) {
+                // 只打"解析出的选择"，不打任何课程内容/学生信息。
+                val mode = json?.optString(FIELD_SCHEDULE_TIME_MODE, MODE_AUTOMATIC)
+                    ?: MODE_AUTOMATIC
+                Log.d(TAG, "update: mode=$mode season=${seasonFor(mode, now)} week=$week")
+            }
             when {
                 json == null -> {
                     views.setTextViewText(R.id.widget_title, "暂无课表")
@@ -105,7 +145,9 @@ class AppWidget : AppWidgetProvider() {
                     views.setTextViewText(R.id.widget_detail, "")
                 }
                 else -> {
-                    val next = findNextClass(json)
+                    // json 在此分支必非空；用局部变量让编译器完成智能转换。
+                    val data = json
+                    val next = findNextClass(data, now)
                     if (next == null) {
                         views.setTextViewText(R.id.widget_title, "近期没有课")
                         views.setTextViewText(R.id.widget_time, "--:--")
@@ -159,7 +201,9 @@ class AppWidget : AppWidgetProvider() {
                     cancelReminder(context)
                     return
                 }
-                val week = json.optInt("week", 0)
+                // 周次同样不能只信快照：App 多周不打开时 `week` 会停在旧值。
+                // weekValue 优先用落盘的 semesterStartDate 按当天日期现算。
+                val week = weekValue(json, Calendar.getInstance())
                 if (week < 1 || week > MAX_WEEK) {
                     cancelReminder(context)
                     return
@@ -274,11 +318,18 @@ class AppWidget : AppWidgetProvider() {
 
         internal data class Course(
             val day: Int,
+            /// 本节课**按当天日期解析后**的开始时刻。
+            ///
+            /// 不叫快照：`parseCourses` 已经按 `scheduleTimeMode` + 设备当天日期选过季了，
+            /// 因此下游的渲染（`widget_time`）与提醒（`reminderTriggerAt` 解析 "HH:mm"）
+            /// 自动都拿到正确季节的时刻，不需要各自再判一次季节。
             val start: String,
             val name: String,
             val teacher: String,
             val room: String,
             val weeks: List<Int>,
+            /// 本节课按当天日期解析后的结束时刻（旧版只读 `start`，这里补齐）。
+            val endText: String = "",
         )
 
         internal data class ReminderTarget(
@@ -287,7 +338,18 @@ class AppWidget : AppWidgetProvider() {
         )
 
         /// 解析全部课程（不做周次过滤），由调用方按各自口径筛选。
-        internal fun parseCourses(json: JSONObject): List<Course> {
+        ///
+        /// 时刻在这里一次性按「模式 + 当天日期」解析完毕：
+        /// - 固定模式取用户选定那一列（快照即用户意图，不会过期）；
+        /// - `automatic` 取当天月份对应的那一列 —— App 几周不打开也能自愈；
+        /// - 旧 JSON 没有 `times` 时回退 `start`/`end` 快照（向后兼容，不空白）。
+        ///
+        /// [now] 与 [mode] 只在测试里注入，生产路径读系统时钟与 JSON 里的模式字段。
+        internal fun parseCourses(
+            json: JSONObject,
+            now: Calendar = Calendar.getInstance(),
+            mode: String = json.optString(FIELD_SCHEDULE_TIME_MODE, MODE_AUTOMATIC),
+        ): List<Course> {
             val courses = json.optJSONArray("courses") ?: return emptyList()
             val all = ArrayList<Course>(courses.length())
             for (i in 0 until courses.length()) {
@@ -299,19 +361,110 @@ class AppWidget : AppWidgetProvider() {
                         weekList.add(weeksArr.optInt(j, -1))
                     }
                 }
+                val columns = parseTimeColumns(obj)
+                val season = seasonFor(mode, now)
+                val start = columns?.get(season)?.get("start")
+                    ?: obj.optString("start", "")
+                val end = columns?.get(season)?.get("end")
+                    ?: obj.optString("end", "")
                 all.add(
                     Course(
                         day = obj.optInt("day", 0),
-                        start = obj.optString("start", ""),
+                        start = start,
                         name = obj.optString("name", ""),
                         teacher = obj.optString("teacher", ""),
                         room = obj.optString("room", ""),
                         weeks = weekList,
+                        endText = end,
                     ),
                 )
             }
             return all
         }
+
+        /// 读取课程对象里的双季节时刻表；字段缺失/形状不对一律返回 null。
+        ///
+        /// 返回 null 等价于"按旧协议走"：渲染与提醒都用 `start` 快照。**旧版 app 写的
+        /// JSON 走的正是这条路径**，因此不会崩、也不会显示空白。
+        private fun parseTimeColumns(obj: JSONObject): Map<String, Map<String, String>>? {
+            val times = obj.optJSONObject(FIELD_TIMES) ?: return null
+            val result = HashMap<String, Map<String, String>>(2)
+            for (season in listOf(SEASON_SPRING_AUTUMN_WINTER, SEASON_SUMMER)) {
+                val column = times.optJSONObject(season) ?: continue
+                val start = column.optString("start", "")
+                val end = column.optString("end", "")
+                if (start.isEmpty() || end.isEmpty()) continue
+                result[season] = mapOf("start" to start, "end" to end)
+            }
+            return result.ifEmpty { null }
+        }
+
+        /// 按 `scheduleTimeMode` 与**设备当天日期**决定用哪一列时刻。
+        ///
+        /// - 固定模式（`springAutumnWinter` / `summer`）：永远用用户选定的那一列，
+        ///   这是用户显式表达的意图，必须尊重（真机上实测就是固定春秋冬季）。
+        /// - 自动模式（`automatic`，也是缺失/写坏时的兜底）：按当天月份在春秋冬季 /
+        ///   夏季之间切换 —— 这正是修掉"跨季节后小组件仍显示旧季节时刻"的关键。
+        internal fun seasonFor(mode: String, now: Calendar): String = when (mode) {
+            SEASON_SPRING_AUTUMN_WINTER -> SEASON_SPRING_AUTUMN_WINTER
+            SEASON_SUMMER -> SEASON_SUMMER
+            else -> seasonForMonth(now)
+        }
+
+        /// 当天月份决定季节：5–9 月夏季，其余春秋冬季。
+        /// 与 Dart 侧 `ScheduleTimeTable.resolveMode`（`month >= 5 && month <= 9`）一致。
+        internal fun seasonForMonth(now: Calendar): String =
+            if (now.get(Calendar.MONTH) in 4..8) SEASON_SUMMER else SEASON_SPRING_AUTUMN_WINTER
+
+        /// 当前周次：**优先按落盘的 `semesterStartDate` + 当天日期现算**。
+        ///
+        /// 旧协议只落盘 `week` 快照，App 多周不打开就会一直显示旧的「第 N 周」，
+        /// 且 30 分钟轮询也纠正不了。新版 JSON 带 `semesterStartDate`，Kotlin 侧
+        /// 现算即可自愈。算法逐条抄自 Dart 侧 `AcademicCalendar.weekNumberFor`。
+        internal fun weekValue(json: JSONObject, today: Calendar): Int {
+            val start = parseSemesterStart(json)
+                ?: return json.optInt("week", 0)
+            return weekNumberFor(start, today)
+        }
+
+        /// 周次算法（与 Dart `AcademicCalendar.weekNumberFor` 逐条一致）：
+        /// 第一周从开学日当天算起；早于开学日返回 0（小组件据此显示「还没开学」）；
+        /// 超过 MAX_WEEK 显示「本学期已结束」。Dart 侧 `DateTime.difference(...).inDays`
+        /// 对带时间戳的 `now` 向零截断，这里把 `now` 归零到当天 00:00 后取整天数，
+        /// 语义等价且不受本地时区偏移（如 +08:00，会少算 8 小时的余数）影响。
+        internal fun weekNumberFor(start: Calendar, now: Calendar): Int {
+            val startDay = startOfDay(start)
+            val nowDay = startOfDay(now)
+            if (nowDay < startDay) return 0
+            val days = TimeUnit.MILLISECONDS.toDays(nowDay - startDay)
+            return (days / 7).toInt() + 1
+        }
+
+        /// 解析 `semesterStartDate`（`yyyy-MM-dd`）。缺失/非法返回 null → 回退 `week` 快照。
+        private fun parseSemesterStart(json: JSONObject): Calendar? {
+            val raw = json.optString(FIELD_SEMESTER_START_DATE, "")
+            if (raw.length < 10) return null
+            val year = raw.substring(0, 4).toIntOrNull() ?: return null
+            val month = raw.substring(5, 7).toIntOrNull() ?: return null
+            val day = raw.substring(8, 10).toIntOrNull() ?: return null
+            if (month !in 1..12 || day !in 1..31) return null
+            return try {
+                (Calendar.getInstance()).apply {
+                    clear()
+                    set(year, month - 1, day, 0, 0, 0)
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        private fun startOfDay(source: Calendar): Long =
+            (source.clone() as Calendar).apply {
+                set(Calendar.HOUR_OF_DAY, 0)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
 
         /// 课程是否在 [targetWeek] 这周上。
         /// weeks 为空表示 Dart 侧未能解析出周次，按「每周都有」处理：宁可多显示一节
@@ -322,34 +475,39 @@ class AppWidget : AppWidgetProvider() {
 
         /// 跨周换算：7 天前瞻窗口会落到下一周（例如周日看明天周一），此时必须用
         /// week+1 过滤单双周课程，否则周日晚会把下周一不该上的课当成「下一节课」。
-        private fun weekForOffset(week: Int, dayOffset: Int): Int {
-            return weekForOffsetAt(todayIso(), week, dayOffset)
-        }
-
-        /// 可注入「今天」的跨周换算（行为与 `weekForOffset` 完全一致，仅供测试）。
+        ///
+        /// 「今天」由调用方传入（原先是内部读 `todayIso()` 的私有重载；本次改造把
+        /// 调用方统一成持有同一个 `Calendar` 的 `findNextClass` / `nextReminderTargetAt`，
+        /// 于是那个私有重载变成死代码，已删除）。
         internal fun weekForOffsetAt(today: Int, week: Int, dayOffset: Int): Int {
             return if (today + dayOffset <= 7) week else week + 1
         }
 
         /// 显示用：未来 7 天内（含今天剩余）最近的一节课。
-        private fun findNextClass(json: JSONObject): Course? {
-            val now = Calendar.getInstance()
+        ///
+        /// [now] 由调用方传入同一次刷新共用的 Calendar（周次/季节/排序同一基准）。
+        private fun findNextClass(json: JSONObject, now: Calendar): Course? {
             val nowMinutes =
                 now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE)
-            return findNextClassAt(json, todayIso(), nowMinutes)
+            return findNextClassAt(json, todayIso(), nowMinutes, now)
         }
 
-        /// 可注入「今天」与「当日分钟数」的下一节课查询（仅供测试复用）。
+        /// 可注入「今天」「当日分钟数」与「当天日期」的下一节课查询（仅供测试复用）。
+        ///
+        /// [now] 同时决定季节列与周次现算基准，生产路径传系统时钟。
         internal fun findNextClassAt(
             json: JSONObject,
             today: Int,
             nowMinutes: Int,
+            now: Calendar = Calendar.getInstance(),
         ): Course? {
-            val week = json.optInt("week", 0)
+            // 周次不能只信快照：App 多周不打开时 `week` 会停在旧值，
+            // weekValue 优先用落盘的 semesterStartDate 按当天日期现算。
+            val week = weekValue(json, now)
 
             var best: Course? = null
             var bestOffset = Int.MAX_VALUE
-            for (course in parseCourses(json)) {
+            for (course in parseCourses(json, now)) {
                 if (course.day <= 0 || course.start.isEmpty()) continue
                 val startMinutes = parseMinutes(course.start) ?: continue
                 val dayOffset = (course.day - today + 7) % 7
@@ -384,6 +542,10 @@ class AppWidget : AppWidgetProvider() {
         }
 
         /// 可注入时钟的提醒目标查询（仅供测试复用；生产路径只传系统时钟）。
+        ///
+        /// [base] 同时是三处判断的同一基准：季节列的日期、`weekValue` 的"今天"、
+        /// `reminderTriggerAt` 解析 `course.start`（已按季节解析过）的日期。
+        /// 用同一个 Calendar 保证跨午夜/跨季节时三者不会各自取到不同的一天。
         internal fun nextReminderTargetAt(
             json: JSONObject,
             week: Int,
@@ -393,7 +555,9 @@ class AppWidget : AppWidgetProvider() {
             base: Calendar,
         ): ReminderTarget? {
             var best: ReminderTarget? = null
-            for (course in parseCourses(json)) {
+            // 按 base 的日期选季节：提醒走的必须与渲染完全同一套解析，
+            // 否则跨季节时"显示夏季时刻、闹钟按春秋冬季响"。
+            for (course in parseCourses(json, base)) {
                 if (course.day <= 0 || course.start.isEmpty()) continue
                 val dayOffset = (course.day - today + 7) % 7
                 val targetWeek = weekForOffsetAt(today, week, dayOffset)
