@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'fitness_store.dart';
+
 // ==================== 体测成绩计算器 ====================
 // 依据《国家学生体质健康标准（2014年修订）》大学生评分标准。
 // 单项权重：BMI 15% / 肺活量 15% / 50米 20% / 坐位体前屈 10% /
@@ -720,6 +722,13 @@ class _FitnessPageState extends State<FitnessPage> {
       if (sc == null) return null;
       sum += sc * it.weight;
     }
+    // 自动保存最新计算出的体测总成绩
+    FitnessStore.saveLatestRecord(FitnessRecord(
+      totalScore: sum,
+      isMale: _male,
+      gradeLevel: _gradeLevel,
+      calculatedAt: DateTime.now(),
+    ));
     return sum;
   }
 
@@ -871,9 +880,6 @@ class _FitnessPageState extends State<FitnessPage> {
         return StatefulBuilder(
           builder: (ctx, setDialogState) {
             final it = items[selected];
-            final table =
-                (it.higher ? fitHigher : fitLower)['$_prefix${it.key}'] ??
-                const <List<double>>[];
             return AlertDialog(
               title: const Text('体测评分标准'),
               content: SizedBox(

@@ -16,6 +16,7 @@
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -503,8 +504,12 @@ Future<ZongceDocxResult> buildZongceDocx(
   for (final e in parts.entries) {
     out.addFile(ArchiveFile(e.key, e.value.length, e.value));
   }
+  // ZipEncoder 压缩消耗 CPU，通过 Isolate.run 移入后台线程执行，避免阻塞 UI
+  final encodedBytes = await Isolate.run(() {
+    return Uint8List.fromList(ZipEncoder().encode(out));
+  });
   return ZongceDocxResult(
-    Uint8List.fromList(ZipEncoder().encode(out)),
+    encodedBytes,
     imageCount,
   );
 }

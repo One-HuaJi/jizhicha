@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:io' show ContentType, HttpClient, InternetAddress, Socket;
+import 'dart:io' show HttpClient, InternetAddress, Socket;
 import 'dart:typed_data';
 
 import 'package:cookie_jar/cookie_jar.dart';
@@ -102,8 +102,21 @@ String? educationPasswordValidationError({
   return null;
 }
 
+final _whitespaceRegex = RegExp(r'\s+');
+final _alertRegex = RegExp(
+  r'''alert\s*\(\s*['"]([^'"]+)['"]\s*\)''',
+  caseSensitive: false,
+);
+final _pwdChangeSuccessRegex = RegExp(
+  r'(密码\s*(?:修改|设置|更新|保存|重置)\s*成功|'
+  r'(?:修改|设置|更新|保存)\s*(?:新)?密码\s*成功|'
+  r'(?:修改|设置|更新|保存|提交|操作)\s*成功)',
+);
+final _pwdChangeFailureRegex =
+    RegExp(r'(失败|错误|不正确|不能为空|请输入完整|未成功|无效|拒绝|不符合)');
+
 String _compactHtmlText(String value) =>
-    value.replaceAll(RegExp(r'\s+'), ' ').trim();
+    value.replaceAll(_whitespaceRegex, ' ').trim();
 
 String? extractJwxtAlertMessage(String html) {
   final messages = _extractJwxtAlertMessages(html);
@@ -115,10 +128,9 @@ String? extractJwxtAlertMessage(String html) {
 }
 
 List<String> _extractJwxtAlertMessages(String html) {
-  final messages = RegExp(
-    r'''alert\s*\(\s*['"]([^'"]+)['"]\s*\)''',
-    caseSensitive: false,
-  ).allMatches(html).map((match) => _compactHtmlText(match.group(1) ?? ''));
+  final messages = _alertRegex
+      .allMatches(html)
+      .map((match) => _compactHtmlText(match.group(1) ?? ''));
   return messages
       .where((message) => message.isNotEmpty)
       .toList(growable: false);
@@ -126,16 +138,12 @@ List<String> _extractJwxtAlertMessages(String html) {
 
 bool _isPasswordChangeSuccessMessage(String value) {
   final normalized = _compactHtmlText(value);
-  return RegExp(
-    r'(密码\s*(?:修改|设置|更新|保存|重置)\s*成功|'
-    r'(?:修改|设置|更新|保存)\s*(?:新)?密码\s*成功|'
-    r'(?:修改|设置|更新|保存|提交|操作)\s*成功)',
-  ).hasMatch(normalized);
+  return _pwdChangeSuccessRegex.hasMatch(normalized);
 }
 
 bool _isPasswordChangeFailureMessage(String value) {
   final normalized = _compactHtmlText(value);
-  return RegExp(r'(失败|错误|不正确|不能为空|请输入完整|未成功|无效|拒绝|不符合)').hasMatch(normalized);
+  return _pwdChangeFailureRegex.hasMatch(normalized);
 }
 
 EducationPasswordChangeResult parseEducationPasswordChangeResponse({
@@ -1577,8 +1585,22 @@ List<Map<String, String>> parseScheduleHtml(String html) {
 
 /// 按课程分隔线（连续 5 个以上短横）切分同一单元格内的多门课程。
 /// 强智系统用 `----------------------` 之类分隔，故用正则而非固定字符串。
+final _courseBlockSplitRegex = RegExp(r'-{5,}');
+final _teacherFontRegex = RegExp(
+  r"<font[^>]*title=[\x27\x22]教师[\x27\x22][^>]*>(.*?)</font>",
+  caseSensitive: false,
+);
+final _roomFontRegex = RegExp(
+  r"<font[^>]*title=[\x27\x22]教室[\x27\x22][^>]*>(.*?)</font>",
+  caseSensitive: false,
+);
+final _weeksFontRegex = RegExp(
+  r"<font[^>]*title=[\x27\x22]周次\(节次\)[\x27\x22][^>]*>(.*?)</font>",
+  caseSensitive: false,
+);
+
 List<String> _splitCourseBlocks(String html) => html
-    .split(RegExp(r'-{5,}'))
+    .split(_courseBlockSplitRegex)
     .map((b) => b.trim())
     .where((b) => b.isNotEmpty)
     .toList();
@@ -1587,26 +1609,17 @@ String _extractTeacher(String block) {
   // 真实 HTML 用单引号：title='教师'；这里兼容单/双引号。
   // 真实 HTML 用单引号 title='教师'；用十六进制转义 \x27(单引号) \x22(双引号) 兼容两种引号，
   // 避免把引号直接写进原始字符串导致 Dart 字符串提前结束。
-  final m = RegExp(
-    r"<font[^>]*title=[\x27\x22]教师[\x27\x22][^>]*>(.*?)</font>",
-    caseSensitive: false,
-  ).firstMatch(block);
+  final m = _teacherFontRegex.firstMatch(block);
   return m?.group(1)?.trim() ?? '';
 }
 
 String _extractRoom(String block) {
-  final m = RegExp(
-    r"<font[^>]*title=[\x27\x22]教室[\x27\x22][^>]*>(.*?)</font>",
-    caseSensitive: false,
-  ).firstMatch(block);
+  final m = _roomFontRegex.firstMatch(block);
   return m?.group(1)?.trim() ?? '';
 }
 
 String _extractWeeks(String block) {
-  final m = RegExp(
-    r"<font[^>]*title=[\x27\x22]周次\(节次\)[\x27\x22][^>]*>(.*?)</font>",
-    caseSensitive: false,
-  ).firstMatch(block);
+  final m = _weeksFontRegex.firstMatch(block);
   return m?.group(1)?.trim() ?? '';
 }
 

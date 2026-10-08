@@ -28,6 +28,8 @@ import '../schedule_time.dart';
 import '../sync_cooldown.dart';
 import '../ui_constants.dart';
 import '../widget_schedule_store.dart';
+import '../zongce_share.dart';
+import 'schedule_ics.dart';
 
 part 'schedule_data.dart';
 part 'schedule_diagnostics.dart';

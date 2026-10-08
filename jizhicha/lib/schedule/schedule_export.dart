@@ -1,7 +1,7 @@
 // 课表页职责：课表导出（JPG/PNG/HTML）、导出目录与 JPG 后台编码。
 part of 'schedule_page.dart';
 
-enum _ScheduleExportFormat { jpg, png, html }
+enum _ScheduleExportFormat { jpg, png, html, ics }
 
 mixin _ScheduleExportSection on _SchedulePageDataSection {
   Future<void> _chooseScheduleExport() async {
@@ -25,6 +25,14 @@ mixin _ScheduleExportSection on _SchedulePageDataSection {
               leading: Icon(Icons.image),
               title: Text('PNG'),
               subtitle: Text('无损图片，保留当前窗口尺寸'),
+            ),
+          ),
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(context, _ScheduleExportFormat.ics),
+            child: const ListTile(
+              leading: Icon(Icons.calendar_month, color: Colors.blue),
+              title: Text('日历文件 (.ics)'),
+              subtitle: Text('可直接导入系统日历（小米/华为/苹果等）生成全学期上课日程'),
             ),
           ),
           SimpleDialogOption(
@@ -68,7 +76,7 @@ mixin _ScheduleExportSection on _SchedulePageDataSection {
     final h = two(now.hour);
     final mi = two(now.minute);
     final s = two(now.second);
-    return '$y$mo$d' + '_' + '$h$mi$s';
+    return '$y$mo${d}_$h$mi$s';
   }
 
   /// 导出课表：Windows 存到 exe 同级 screen/ 目录；Android 存到系统相册；
@@ -79,20 +87,52 @@ mixin _ScheduleExportSection on _SchedulePageDataSection {
     try {
       final stamp = _scheduleFileStamp();
       final term = _selectedTerm;
-      final baseName = 'jizhicha_schedule_' + term + '_' + stamp;
+      final baseName = 'jizhicha_schedule_${term}_$stamp';
       final extension = switch (format) {
         _ScheduleExportFormat.jpg => 'jpg',
         _ScheduleExportFormat.png => 'png',
         _ScheduleExportFormat.html => 'html',
+        _ScheduleExportFormat.ics => 'ics',
       };
-      final fileName = baseName + '.' + extension;
+      final fileName = '$baseName.$extension';
 
       if (format == _ScheduleExportFormat.html) {
         final dir = await _scheduleExportDirectory();
         final file = File(dir.path + Platform.pathSeparator + fileName);
         await file.writeAsString(_lastRawHtml, flush: true);
-        messenger.showSnackBar(SnackBar(content: Text('已导出：' + file.path)));
+        messenger.showSnackBar(SnackBar(content: Text('已导出：${file.path}')));
         return;
+      }
+
+      if (format == _ScheduleExportFormat.ics) {
+        if (_courses.isEmpty) throw '当前学期没有可导出的课程';
+        final icsContent = generateScheduleIcs(
+          courses: _courses,
+          term: term,
+          mode: _s.scheduleTimeMode,
+        );
+        if (Platform.isAndroid) {
+          final cache = await getTemporaryDirectory();
+          final dir = Directory('${cache.path}${Platform.pathSeparator}exports');
+          if (!await dir.exists()) await dir.create(recursive: true);
+          final file = File('${dir.path}${Platform.pathSeparator}$fileName');
+          await file.writeAsString(icsContent, flush: true);
+          await shareFile(
+            path: file.path,
+            mimeType: 'text/calendar',
+            subject: '课表日历 ($term)',
+          );
+          messenger.showSnackBar(
+            const SnackBar(content: Text('日历文件已生成，请选择日历应用打开导入')),
+          );
+          return;
+        } else {
+          final dir = await _scheduleExportDirectory();
+          final file = File(dir.path + Platform.pathSeparator + fileName);
+          await file.writeAsString(icsContent, flush: true);
+          messenger.showSnackBar(SnackBar(content: Text('已导出日历文件：${file.path}')));
+          return;
+        }
       }
 
       if (_courses.isEmpty) throw '当前学期没有可导出的课程';
@@ -130,7 +170,7 @@ mixin _ScheduleExportSection on _SchedulePageDataSection {
           final dir = await _scheduleExportDirectory();
           final file = File(dir.path + Platform.pathSeparator + fileName);
           await file.writeAsBytes(bytes, flush: true);
-          messenger.showSnackBar(SnackBar(content: Text('已导出：' + file.path)));
+          messenger.showSnackBar(SnackBar(content: Text('已导出：${file.path}')));
         }
       } finally {
         image.dispose();

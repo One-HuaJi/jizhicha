@@ -12,6 +12,7 @@
 // 所以本模块只负责**给出候选 + 默认勾选建议 + 标注可疑项**，最终由用户复核确认。
 
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -440,6 +441,22 @@ int _colOf(String ref) {
   return col - 1;
 }
 
+/// 预编译常用 XML 正则，避免在嵌套循环中反复编译
+final _siRegex = RegExp(r'<si>(.*?)</si>', dotAll: true);
+final _tTagRegex = RegExp(r'<t[^>]*>(.*?)</t>', dotAll: true);
+final _sheetRidRegex = RegExp(r'<sheet[^>]*r:id="([^"]+)"');
+final _dotSlashRegex = RegExp(r'^\./');
+final _rowRegex = RegExp(r'<row[^>]*>(.*?)</row>', dotAll: true);
+final _cTagRegex = RegExp(r'<c ([^>]*?)/?>(?:(.*?)</c>)?', dotAll: true);
+final _rAttrRegex = RegExp(r'r="([A-Za-z]+\d+)"');
+final _tAttrRegex = RegExp(r't="([^"]+)"');
+final _vTagRegex = RegExp(r'<v>(.*?)</v>', dotAll: true);
+
+/// 异步后台解析 xlsx 的第一个工作表为二维字符串表（移至后台 Isolate 防止卡顿）。
+Future<List<List<String>>> parseXlsxGridAsync(Uint8List bytes) {
+  return Isolate.run(() => parseXlsxGrid(bytes));
+}
+
 /// 解析 xlsx 的第一个工作表为二维字符串表。
 ///
 /// 只依赖 `xl/worksheets/sheet1.xml`、`xl/sharedStrings.xml` 与
@@ -456,11 +473,10 @@ List<List<String>> parseXlsxGrid(Uint8List bytes) {
   final ssBytes = files['xl/sharedStrings.xml'];
   if (ssBytes != null) {
     final xml = utf8.decode(ssBytes);
-    for (final m in RegExp(r'<si>(.*?)</si>', dotAll: true).allMatches(xml)) {
-      final texts = RegExp(
-        r'<t[^>]*>(.*?)</t>',
-        dotAll: true,
-      ).allMatches(m.group(1)!).map((x) => _unescapeXml(x.group(1)!));
+    for (final m in _siRegex.allMatches(xml)) {
+      final texts = _tTagRegex
+          .allMatches(m.group(1)!)
+          .map((x) => _unescapeXml(x.group(1)!));
       shared.add(texts.join());
     }
   }
@@ -472,9 +488,7 @@ List<List<String>> parseXlsxGrid(Uint8List bytes) {
   if (wb != null && wbRels != null) {
     final wbXml = utf8.decode(wb);
     final relsXml = utf8.decode(wbRels);
-    final first = RegExp(
-      r'<sheet[^>]*r:id="([^"]+)"',
-    ).firstMatch(wbXml)?.group(1);
+    final first = _sheetRidRegex.firstMatch(wbXml)?.group(1);
     if (first != null) {
       final target = RegExp(
         '<Relationship[^>]*Id="$first"[^>]*Target="([^"]+)"',
@@ -482,7 +496,7 @@ List<List<String>> parseXlsxGrid(Uint8List bytes) {
       if (target != null && target.isNotEmpty) {
         sheetPath = target.startsWith('/')
             ? target.substring(1)
-            : 'xl/${target.replaceFirst(RegExp(r'^\./'), '')}';
+            : 'xl/${target.replaceFirst(_dotSlashRegex, '')}';
       }
     }
   }
@@ -493,38 +507,29 @@ List<List<String>> parseXlsxGrid(Uint8List bytes) {
   final grid = <List<String>>[];
   var maxCol = 0;
 
-  for (final rowM in RegExp(
-    r'<row[^>]*>(.*?)</row>',
-    dotAll: true,
-  ).allMatches(sheetXml)) {
+  for (final rowM in _rowRegex.allMatches(sheetXml)) {
     final row = <int, String>{};
-    for (final cM in RegExp(
-      r'<c ([^>]*?)/?>(?:(.*?)</c>)?',
-      dotAll: true,
-    ).allMatches(rowM.group(1)!)) {
+    for (final cM in _cTagRegex.allMatches(rowM.group(1)!)) {
       final attrs = cM.group(1) ?? '';
       final inner = cM.group(2) ?? '';
-      final ref = RegExp(r'r="([A-Za-z]+\d+)"').firstMatch(attrs)?.group(1);
+      final ref = _rAttrRegex.firstMatch(attrs)?.group(1);
       if (ref == null) continue;
-      final t = RegExp(r't="([^"]+)"').firstMatch(attrs)?.group(1);
+      final t = _tAttrRegex.firstMatch(attrs)?.group(1);
       String value;
       if (t == 's') {
         final idx = int.tryParse(
-          RegExp(r'<v>(.*?)</v>', dotAll: true).firstMatch(inner)?.group(1) ?? '',
+          _vTagRegex.firstMatch(inner)?.group(1) ?? '',
         );
         value = (idx != null && idx >= 0 && idx < shared.length)
             ? shared[idx]
             : '';
       } else if (t == 'inlineStr') {
-        value = RegExp(
-          r'<t[^>]*>(.*?)</t>',
-          dotAll: true,
-        ).allMatches(inner).map((x) => _unescapeXml(x.group(1)!)).join();
+        value = _tTagRegex
+            .allMatches(inner)
+            .map((x) => _unescapeXml(x.group(1)!))
+            .join();
       } else {
-        final v = RegExp(
-          r'<v>(.*?)</v>',
-          dotAll: true,
-        ).firstMatch(inner)?.group(1);
+        final v = _vTagRegex.firstMatch(inner)?.group(1);
         value = v == null ? '' : _unescapeXml(v);
       }
       final col = _colOf(ref);

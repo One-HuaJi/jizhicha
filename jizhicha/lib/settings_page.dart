@@ -7,6 +7,7 @@ import 'app_settings.dart';
 import 'campus_environment.dart';
 import 'common.dart';
 import 'credential_store.dart';
+import 'fitness_store.dart';
 import 'schedule_cache_store.dart';
 import 'schedule_time.dart';
 import 'theme.dart';
@@ -182,6 +183,12 @@ class _SettingsPageState extends State<SettingsPage> {
       // Widget data is a global file, not account-namespaced. Clear JSON and
       // alarms as part of the deletion contract to avoid prior-user disclosure.
       await WidgetScheduleStore.clear();
+      // 同理：体测计算器的最近一次成绩也是**全局单份**（不按账号分文件），
+      // 不属于 CredentialStore/UserDataCacheStore/ScheduleCacheStore 任何一个
+      // 按学号分目录的存储，必须在删除账号时显式清掉，否则下一个用户会在
+      // 综测页的「从计算器带入」里看到上一个人的体测总分。
+      // clear() 内部已吞掉所有异常（同 WidgetScheduleStore.clear），不阻塞主流程。
+      await FitnessStore.clear();
       final failures = <String>[
         // 用用户能理解的名称，而不是内部存储名（UserDataCacheStore 之类）。
         if (!credentialsDeleted) '保存的账号密码',

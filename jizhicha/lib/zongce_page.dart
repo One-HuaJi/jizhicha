@@ -29,11 +29,19 @@ import 'package:path_provider/path_provider.dart';
 
 import 'academic_calendar.dart';
 import 'credential_store.dart';
+import 'fitness_store.dart';
 import 'schedule_cache_store.dart';
 import 'zongce_academic.dart';
 import 'zongce_docx.dart';
 import 'zongce_model.dart';
 import 'zongce_share.dart';
+
+// 拆出去的 UI 用 part 挂在本库上，**不是**独立库：这样 `_NumField` /
+// `_AcademicPickDialog` 等符号的可见性完全不变（与 `lib/schedule/` 的做法一致，
+// 拆分巨石文件**不得**扩大公开 API）。
+// ⚠️ part 文件里不能写 import，本轮用到的依赖一律留在上面这段根部导入里。
+part 'zongce/zongce_dialogs.dart';
+part 'zongce/zongce_num_field.dart';
 
 class ZongcePage extends StatefulWidget {
   const ZongcePage({super.key, this.initialForm});
@@ -352,7 +360,7 @@ class _ZongcePageState extends State<ZongcePage> {
             '旧版 .xls 请在 Excel/WPS 里另存为 .xlsx 再导入';
       }
 
-      final grid = parseXlsxGrid(bytes);
+      final grid = await parseXlsxGridAsync(bytes);
       if (grid.isEmpty) throw '这个表格里没有读到数据（只支持 .xlsx）';
 
       final cols = detectColumns(grid);
@@ -403,6 +411,48 @@ class _ZongcePageState extends State<ZongcePage> {
       _toast(
         e is String ? e : '导入失败，请确认这是体测总成绩表（.xlsx）后重试',
         dur: const Duration(seconds: 4),
+      );
+    }
+  }
+
+  Future<void> _importFromFitnessCalculator() async {
+    final record = await FitnessStore.readLatestRecord();
+    if (!mounted) return;
+    if (record == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('暂无体测计算器记录，可前往「更多 → 体测计算器」测算保存')),
+      );
+      return;
+    }
+
+    final scoreStr = record.totalScore.toStringAsFixed(1);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('带入体测计算器成绩'),
+        content: Text(
+          '找到最近一次体测计算器测算结果：$scoreStr 分（${record.isMale ? "男" : "女"}）。\n是否直接带入体测成绩？',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('带入'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      setState(() {
+        _f.fitnessScore = double.tryParse(scoreStr) ?? record.totalScore;
+        _markDirty();
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已带入体测成绩：$scoreStr 分')),
       );
     }
   }
@@ -522,11 +572,14 @@ class _ZongcePageState extends State<ZongcePage> {
     List<PlatformFile> picked;
     try {
       // 允许多选：证明图常常一次要传好几张。
-      // ignore: deprecated_member_use
+      //
+      // ⚠️ 这里**不要**再加回 `allowMultiple: true`：file_picker 12.x 起该参数
+      // 已废弃，且**被实现忽略**（`pickFiles` 走平台侧的 `pickFiles`，本身就固定
+      // 多选；单选要用 `pickFile`）。传它只会让 analyze 报
+      // `deprecated_member_use`，行为与不传完全一致。
       picked = await FilePicker.pickFiles(
         dialogTitle: '选择证明图片',
         type: FileType.image,
-        allowMultiple: true,
       );
     } catch (_) {
       _toast('无法打开图片选择器，请重试');
@@ -728,10 +781,12 @@ class _ZongcePageState extends State<ZongcePage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
+        Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          spacing: 8,
+          runSpacing: 4,
           children: [
             const Text('体测成绩', style: TextStyle(fontWeight: FontWeight.w600)),
-            const SizedBox(width: 8),
             SizedBox(
               width: 84,
               child: _NumField(
@@ -744,11 +799,15 @@ class _ZongcePageState extends State<ZongcePage> {
                 },
               ),
             ),
-            const SizedBox(width: 8),
             TextButton.icon(
               onPressed: _importFitnessSheet,
               icon: const Icon(Icons.upload_file, size: 18),
               label: const Text('从表导入', style: TextStyle(fontSize: 12)),
+            ),
+            TextButton.icon(
+              onPressed: _importFromFitnessCalculator,
+              icon: const Icon(Icons.fitness_center, size: 18),
+              label: const Text('从计算器带入', style: TextStyle(fontSize: 12)),
             ),
           ],
         ),
@@ -1329,336 +1388,6 @@ class _ZongcePageState extends State<ZongcePage> {
           ),
           textAlign: TextAlign.center,
         ),
-      ],
-    );
-  }
-}
-
-/// 只接受数字（含负号与小数点）的输入框。
-class _NumField extends StatefulWidget {
-  const _NumField({
-    super.key,
-    required this.value,
-    required this.onChanged,
-    this.hint,
-  });
-
-  final double value;
-  final ValueChanged<double?> onChanged;
-  final String? hint;
-
-  @override
-  State<_NumField> createState() => _NumFieldState();
-}
-
-class _NumFieldState extends State<_NumField> {
-  late final TextEditingController _c;
-  final FocusNode _focus = FocusNode();
-
-  @override
-  void initState() {
-    super.initState();
-    _c = TextEditingController(text: _fmt(widget.value));
-  }
-
-  /// 回填外部改动（如「自动计算」写入 base）。
-  ///
-  /// ⚠️ 用户正在输入时**绝不能**覆盖：输入负数的第一个字符 `-` 会被
-  /// `double.tryParse` 解析成 null（视作 0），回填会把刚敲的 `-` 改成 `0`，
-  /// 导致根本没法输入负数。
-  @override
-  void didUpdateWidget(_NumField oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.value == oldWidget.value) return;
-    if (_focus.hasFocus) return;
-    final current = double.tryParse(_c.text.trim());
-    if (current != widget.value) {
-      _c.text = _fmt(widget.value);
-    }
-  }
-
-  static String _fmt(double v) {
-    if (v == v.roundToDouble()) return v.toInt().toString();
-    return v.toString();
-  }
-
-  @override
-  void dispose() {
-    _focus.dispose();
-    _c.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return TextField(
-      controller: _c,
-      focusNode: _focus,
-      keyboardType: const TextInputType.numberWithOptions(
-        decimal: true,
-        signed: true,
-      ),
-      inputFormatters: [
-        FilteringTextInputFormatter.allow(RegExp(r'^-?\d*\.?\d*')),
-      ],
-      decoration: InputDecoration(
-        hintText: widget.hint,
-        isDense: true,
-        border: const OutlineInputBorder(),
-      ),
-      style: const TextStyle(fontSize: 13),
-      onChanged: (v) => widget.onChanged(double.tryParse(v.trim())),
-    );
-  }
-}
-
-/// 智育自动计算的选择结果。
-class _AcademicPickResult {
-  final double score;
-  final double average;
-  final int counted;
-
-  /// 供导出用的算式说明（「共 x 科，（…）/x = 平均分」）。
-  final String detail;
-
-  const _AcademicPickResult({
-    required this.score,
-    required this.average,
-    required this.counted,
-    this.detail = '',
-  });
-}
-
-/// 课程勾选弹窗：列出候选课程，自动勾选、允许手动调整，并标出可疑项。
-class _AcademicPickDialog extends StatefulWidget {
-  const _AcademicPickDialog({required this.grades, required this.term});
-
-  final List<Map<String, String>> grades;
-  final String term;
-
-  @override
-  State<_AcademicPickDialog> createState() => _AcademicPickDialogState();
-}
-
-class _AcademicPickDialogState extends State<_AcademicPickDialog> {
-  late AcademicAutoResult _result;
-
-  @override
-  void initState() {
-    super.initState();
-    // 固定用页面所选学期，不再提供「全部学期」——综测是按学期评的。
-    _result = buildAcademicAuto(widget.grades, term: widget.term);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final avg = _result.average;
-    final score = _result.academicScore;
-    final nonNumeric = _result.selectedNonNumeric;
-
-    return AlertDialog(
-      title: const Text('从成绩自动计算学业成绩'),
-      content: SizedBox(
-        width: double.maxFinite,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              '学期：${widget.term.isEmpty ? '未选择' : widget.term}',
-              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              '已勾选 ${_result.countedCount} 门课，平均分 '
-              '${avg == null ? '—' : avg.toStringAsFixed(2)}',
-              style: const TextStyle(fontSize: 13),
-            ),
-            Text(
-              '学业成绩 = 平均分 × 90% = ${score == null ? '—' : score.toStringAsFixed(2)}',
-              style: const TextStyle(fontSize: 12),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              // 这里是普通 Text，不支持 Markdown；写 **粗体** 会原样显示出星号。
-              '细则要求排除体育课、网络通识课、公共选修课、等级课程。'
-              '已自动判断并预勾选，请核对下面的列表——'
-              '判断依据是课程名与课程性质，可能与学院口径不同。',
-              style: TextStyle(
-                fontSize: 11,
-                height: 1.5,
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
-            ),
-            if (nonNumeric.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 6),
-                child: Text(
-                  '⚠ 有 ${nonNumeric.length} 门课是文字成绩（如「良」），'
-                  '无法参与平均，请取消勾选或手动核算。',
-                  style: TextStyle(
-                    fontSize: 11,
-                    color: Theme.of(context).colorScheme.error,
-                  ),
-                ),
-              ),
-            const Divider(),
-            Flexible(
-              child: _result.courses.isEmpty
-                  ? const Padding(
-                      padding: EdgeInsets.all(16),
-                      child: Text('该学期没有可取的成绩。'),
-                    )
-                  : ListView.builder(
-                      shrinkWrap: true,
-                      itemCount: _result.courses.length,
-                      itemBuilder: (ctx, i) {
-                        final c = _result.courses[i];
-                        final suspect = !c.hasNumericScore;
-                        return CheckboxListTile(
-                          dense: true,
-                          value: c.selected,
-                          onChanged: (v) {
-                            setState(() => c.selected = v ?? false);
-                          },
-                          title: Text(
-                            c.course,
-                            style: TextStyle(
-                              fontSize: 13,
-                              color: suspect
-                                  ? Theme.of(context).colorScheme.error
-                                  : null,
-                            ),
-                          ),
-                          subtitle: Text(
-                            [
-                              if (c.courseType.isNotEmpty) c.courseType,
-                              if (c.rawGrade.isNotEmpty) '成绩 ${c.rawGrade}',
-                              if (c.excludedReason.isNotEmpty) c.excludedReason,
-                            ].join(' · '),
-                            style: const TextStyle(fontSize: 11),
-                          ),
-                        );
-                      },
-                    ),
-            ),
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
-        ),
-        FilledButton(
-          onPressed: score == null
-              ? null
-              : () => Navigator.of(context).pop(
-                  _AcademicPickResult(
-                    score: score,
-                    average: avg!,
-                    counted: _result.countedCount,
-                    detail: _result.describeCalculation(fmtNum),
-                  ),
-                ),
-          child: const Text('采用这个分数'),
-        ),
-      ],
-    );
-  }
-}
-
-/// 体测成绩导入确认弹窗：展示识别到的表头与匹配行，让用户确认后再填入。
-class _FitnessImportDialog extends StatelessWidget {
-  const _FitnessImportDialog({
-    required this.cols,
-    required this.matches,
-    required this.studentId,
-    required this.name,
-  });
-
-  final SheetColumns cols;
-  final List<FitnessSheetMatch> matches;
-  final String studentId;
-  final String name;
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('确认导入体测成绩'),
-      content: SizedBox(
-        width: double.maxFinite,
-        child: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text('识别到的表头：', style: TextStyle(fontWeight: FontWeight.w600)),
-              Text(
-                cols.headerTexts.where((e) => e.trim().isNotEmpty).join(' | '),
-                style: const TextStyle(fontSize: 12),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                '筛选条件：学号 = $studentId，姓名 = $name'
-                '（两者都必须相同，避免重名误取）',
-                style: const TextStyle(fontSize: 12),
-              ),
-              const Divider(),
-              Text(
-                matches.length == 1 ? '匹配到 1 行：' : '匹配到 ${matches.length} 行：',
-                style: const TextStyle(fontWeight: FontWeight.w600),
-              ),
-              for (final m in matches)
-                Card(
-                  margin: const EdgeInsets.only(top: 6),
-                  child: ListTile(
-                    dense: true,
-                    title: Text('${m.studentId}　${m.name}'),
-                    subtitle: Text('总分列的值：${m.rawTotal.isEmpty ? '（空）' : m.rawTotal}'),
-                    trailing: m.total == null
-                        ? const Text('非数字', style: TextStyle(fontSize: 12))
-                        : Text(
-                            '${m.total}',
-                            style: const TextStyle(fontWeight: FontWeight.w700),
-                          ),
-                  ),
-                ),
-              const SizedBox(height: 8),
-              Text(
-                '确认无误后点「采用」写入体测成绩；若表里有重复行（如补考记录），'
-                '请选总分正确的那条。',
-                style: TextStyle(
-                  fontSize: 11,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('取消'),
-        ),
-        FilledButton(
-          onPressed: matches.length == 1
-              ? () => Navigator.of(context).pop(matches.first)
-              : null,
-          // 多行匹配时这个按钮是禁用的，按不了；文案要说明"该怎么办"，
-          // 而不是旧版的"见下"（按钮上写"见下"用户找不到指向）。
-          child: Text(
-            matches.length == 1 ? '采用' : '请在下面选择正确的行',
-          ),
-        ),
-        if (matches.length > 1)
-          ...matches.asMap().entries.map(
-            (e) => TextButton(
-              onPressed: () => Navigator.of(context).pop(e.value),
-              child: Text('用第 ${e.key + 1} 行（${e.value.rawTotal}）'),
-            ),
-          ),
       ],
     );
   }
