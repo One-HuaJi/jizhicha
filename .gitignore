@@ -42,8 +42,15 @@ jizhicha-output/
 **/docs/internal/
 
 # 测试与排查产生的临时产物。约定：临时文件一律加前导下划线，
-# 截图/UI dump 不进入源码仓库（体积大且常含真实学号、课表等个人数据）。
+# 截图 / UI dump 不进入源码仓库（体积大）。
 _*
 **/_*
 *.tmpdir/
 .pin-widget-receiver*
+
+# 环境变量与证书文件：可能承载密钥或口令，绝不入库。
+.env
+.env.*
+*.env
+*.p12
+*.pfx

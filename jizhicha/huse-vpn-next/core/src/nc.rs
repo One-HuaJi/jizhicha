@@ -377,14 +377,14 @@ mod tests {
     #[test]
     fn auth_frame_matches_reverse_engineered_layout() {
         let ticket = [0x5au8; 32];
-        let frame = build_nc_auth_frame(&ticket, "202200000001").unwrap();
+        let frame = build_nc_auth_frame(&ticket, "202600000001").unwrap();
 
         assert_eq!(frame.len(), 64);
         assert_eq!(&frame[0..4], &CMD_NC_AUTH.to_be_bytes());
         assert_eq!(&frame[4..8], &56u32.to_be_bytes());
         assert_eq!(&frame[8..40], &ticket);
         assert_eq!(&frame[40..44], &12u32.to_be_bytes());
-        assert_eq!(&frame[44..56], b"202200000001");
+        assert_eq!(&frame[44..56], b"202600000001");
         assert_eq!(&frame[56..60], &1u32.to_be_bytes());
         assert_eq!(&frame[60..64], &0u32.to_be_bytes());
     }

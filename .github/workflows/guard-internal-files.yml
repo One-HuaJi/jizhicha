@@ -30,8 +30,11 @@ jobs:
           echo "OK: no internal/local/build artifacts found."
 
   # 2) Privacy guard: personal identifiers must not appear in tracked text,
-  #    commit messages, or DOCX author metadata. A real author name previously
-  #    reached a public release because only file paths were checked.
+  #    commit messages, or DOCX author metadata.
+  #
+  #    日志纪律：本 job 的日志是**公开可读**的，所以任何一步都**不得**把命中的
+  #    原文打印出来 —— 只允许打印「规则名 + 违规文件路径 / 提交 SHA」。
+  #    否则守卫一旦报错，就等于把它本该拦下的内容又公开了一遍。
   guard-privacy:
     runs-on: ubuntu-latest
     steps:
@@ -39,44 +42,44 @@ jobs:
         with:
           fetch-depth: 0
       - name: Scan tracked text for personal identifiers
+        env:
+          KNOWN_REAL_IDENTIFIERS: ${{ secrets.KNOWN_REAL_IDENTIFIERS }}
         run: |
           set -o pipefail
           fail=0
 
-          # 1) 已知的真实标识 —— 一旦出现必定是泄漏。
-          #
-          # 🔴 取值**绝对不能**写进仓库：本工作流是**公开可见**的。
-          # 它只能来自仓库 Secret `KNOWN_REAL_IDENTIFIERS`（`|` 分隔的正则片段）；
-          # 未配置该 Secret 时**跳过**这一条，只靠下面 2)3) 的形态扫描 ——
-          # 宁可少拦，也绝不把真实值放进公开仓库。
+          # 1) 已知标识清单 —— 一旦出现必定需要拦截。
+          #    清单取值不写在本文件里：本工作流公开可见，只能从仓库 Secret
+          #    `KNOWN_REAL_IDENTIFIERS`（`|` 分隔的正则片段）读取。
+          #    未配置该 Secret 时跳过这一条，只靠下面 2)3) 的形态扫描。
           if [ -n "${KNOWN_REAL_IDENTIFIERS:-}" ]; then
             hits="$(git grep -nIE "$KNOWN_REAL_IDENTIFIERS" -- . ':(exclude).github/workflows/*' || true)"
             if [ -n "$hits" ]; then
-              echo "::error::Known real personal identifiers found:"
-              echo "$hits"
+              echo "::error::Known identifiers matched in the following files:"
+              # 只回显文件路径，绝不回显命中的内容。
+              echo "$hits" | cut -d: -f1 | sort -u
               fail=1
             fi
           else
             echo "::notice::KNOWN_REAL_IDENTIFIERS 未配置，跳过「已知标识硬拦」（形态扫描仍然生效）。"
           fi
 
-          # 2) 形如真实学号的 12 位数字，但排除已文档化的合成占位号段
-          #    2024000000xx（测试 fixture 使用）。这样以后即使有人粘进新的
-          #    真实学号也仍会被拦下，而不会误报合法占位数据。
+          # 2) 形如学号的 12 位数字，排除已文档化的合成占位号段
+          #    2024000000xx（测试 fixture 使用），避免误报合法占位数据。
           ids="$(git grep -nIE '2024[0-9]{8}' -- . ':(exclude).github/workflows/*' \
                  | grep -vE '2024000000[0-9]{2}' || true)"
           if [ -n "$ids" ]; then
-            echo "::error::Student-ID-shaped values outside the 2024000000xx placeholder block:"
-            echo "$ids"
+            echo "::error::Student-ID-shaped values outside the 2024000000xx placeholder block, in:"
+            echo "$ids" | cut -d: -f1 | sort -u
             fail=1
           fi
 
-          # 3) 真实班级名形态，排除已文档化的示例班（生教2401班）。
+          # 3) 班级名形态，排除已文档化的示例班（生教2401班）。
           cls="$(git grep -nIE '生教[0-9]{4}班' -- . ':(exclude).github/workflows/*' \
                  | grep -vE '生教2401班' || true)"
           if [ -n "$cls" ]; then
-            echo "::error::Class-name-shaped values outside the documented example:"
-            echo "$cls"
+            echo "::error::Class-name-shaped values outside the documented example, in:"
+            echo "$cls" | cut -d: -f1 | sort -u
             fail=1
           fi
 
@@ -87,20 +90,21 @@ jobs:
           KNOWN_REAL_IDENTIFIERS: ${{ secrets.KNOWN_REAL_IDENTIFIERS }}
         run: |
           set -o pipefail
-          # 提交信息只查已知真实标识：合法占位数据（2024000000xx）不应导致失败。
-          # 同上前提：真实值**绝不能**写进这个公开文件，只能来自 Secret。
-          # 未配置时跳过（该值只应存在于 Secret 中）。
+          # 提交信息只查已知标识清单：合法占位数据（2024000000xx）不应导致失败。
+          # 清单同样只来自 Secret。未配置时跳过。
           if [ -z "${KNOWN_REAL_IDENTIFIERS:-}" ]; then
             echo "::notice::KNOWN_REAL_IDENTIFIERS 未配置，跳过提交信息硬拦。"
             exit 0
           fi
-          hits="$(git log --format='%h %s' | grep -E "$KNOWN_REAL_IDENTIFIERS" || true)"
-          if [ -n "$hits" ]; then
-            echo "::error::Known real personal identifiers found in commit messages:"
-            echo "$hits"
+          # git log --grep 覆盖 **subject 与 body**；命中时只打印 SHA，
+          # 不打印提交信息原文（日志是公开的）。
+          offenders="$(git log --format='%H' --extended-regexp --grep="$KNOWN_REAL_IDENTIFIERS" || true)"
+          if [ -n "$offenders" ]; then
+            echo "::error::Known identifiers matched in the message of these commits:"
+            echo "$offenders"
             exit 1
           fi
-          echo "OK: no known personal identifiers in commit messages."
+          echo "OK: no known identifiers in commit messages."
       - name: Scan DOCX assets for author metadata
         run: |
           set -o pipefail
@@ -113,7 +117,8 @@ jobs:
             creator="$(grep -oE '<dc:creator>[^<]*' /tmp/core.xml | sed 's/<dc:creator>//' || true)"
             modified="$(grep -oE '<cp:lastModifiedBy>[^<]*' /tmp/core.xml | sed 's/<cp:lastModifiedBy>//' || true)"
             if [ "$creator" != "稽之查" ] || [ "$modified" != "稽之查" ]; then
-              echo "::error::$docx embeds non-neutral author metadata (creator='$creator', lastModifiedBy='$modified')"
+              # 只报文件与字段名，不报字段值（值本身就是身份信息）。
+              echo "::error::$docx embeds non-neutral author metadata (dc:creator / cp:lastModifiedBy)"
               fail=1
             fi
           done < <(git ls-files '*.docx')
