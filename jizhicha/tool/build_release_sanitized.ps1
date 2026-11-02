@@ -9,7 +9,7 @@
     ----------------------------------
     Dart AOT 快照（Android 的 `lib/<abi>/libapp.so`、Windows 的 `data/app.so`）会把
     **构建时的工作目录绝对路径**编进去。在真实工作区里直接 `flutter build`，
-    `D:/AAAAAihaveideas/...`、`C:/Users/<账户>/...` 这类路径就随产物一起公开分发；
+    `<工作区根>/...`、`<系统用户目录>/...` 这类路径就随产物一起公开分发；
     改成从中性目录（如 `C:\build\jizhicha-<ver>-sanitize\jizhicha`）构建，
     编进去的就是中性路径，问题自然消失。这是 v1.0.2/v1.0.3 用过、
     v1.0.4 起被丢弃、需要恢复的做法。
@@ -92,7 +92,10 @@ $ExcludeFilePatterns = @('HANDOFF.md', '*.jks', '*.keystore', '*.p12', '*.pfx', 
 function Get-SafePathLabel {
     param([string]$p)
     # 日志里不打印真实工作区路径/账户名
-    return ($p -replace '(?i)AAAAAihaveideas', '<workspace-root>' -replace '(?i)([A-Z]:\\{1,2}Users\\{1,2})[^\\/]+', '${1}***')
+    # 工作区根按 RepoRoot 反推（3 层父目录），脚本里不写死任何本机路径字面量。
+    $wsRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $RepoRoot))
+    if ($wsRoot) { $p = $p -replace [regex]::Escape($wsRoot), '<workspace-root>' }
+    return ($p -replace '(?i)([A-Z]:\{1,2}Users\{1,2})[^\/]+', '${1}***')
 }
 
 function Write-Step { param([string]$m) Write-Host ""; Write-Host "== $m" -ForegroundColor Cyan }
@@ -138,6 +141,18 @@ Write-Host ("版本        : {0}" -f $Version)
 Write-Host ("脱敏构建目录: {0}" -f $workRoot)
 
 # ---------------------------------------------------------------------------
+# 0.5 源码隐私门禁（按字段形态扫描已跟踪文件）
+# ---------------------------------------------------------------------------
+Write-Step '0.5 源码隐私门禁（按字段形态扫描已跟踪文件）'
+$piiScript = Join-Path $ToolDir 'check_pii.ps1'
+if (Test-Path -LiteralPath $piiScript) {
+    & $piiScript -RepoRoot $RepoRoot
+    if ($LASTEXITCODE -ne 0) { Write-Err '源码隐私门禁未通过，已中止构建。'; exit 1 }
+} else {
+    Write-Warn '未找到 tool/check_pii.ps1，跳过源码隐私门禁（不建议）。'
+}
+
+# ---------------------------------------------------------------------------
 # 1. 签名凭据：从 User 级环境变量提升到当前进程（已启动的 shell 不会回溯继承）
 # ---------------------------------------------------------------------------
 Write-Step '1. 提升签名凭据环境变量（User 级 → 进程级）'
@@ -170,7 +185,11 @@ Write-Host '  4 个签名环境变量均已提升到进程环境（值不打印�
 Write-Step '2. 工具链环境'
 
 $env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'
-$env:PUB_CACHE = 'D:\AAAAAihaveideas\jizhicha-pub-cache'
+# PUB_CACHE 不写死本机路径：优先用调用者传入的，否则按工作区根推导。
+if (-not $env:PUB_CACHE) {
+    $wsRootGuess = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $RepoRoot))
+    if ($wsRootGuess) { $env:PUB_CACHE = Join-Path $wsRootGuess 'jizhicha-pub-cache' }
+}
 # Gradle 缓存放到中性路径：gradle 的 daemon/日志里也可能带构建目录路径
 $gradleHome = Join-Path $SanitizeRoot 'gradle-home-sanitize'
 $env:GRADLE_USER_HOME = $gradleHome
