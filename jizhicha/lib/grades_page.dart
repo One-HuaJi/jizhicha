@@ -404,6 +404,12 @@ class _GradesPageState extends State<GradesPage>
   /// - 数字得分 < 60 或 "不合格/不及格/未通过/缓考(不及格)" → "历史补考/重修"
   /// 并按「课程名称 + 学分 + 课程性质 + 课程编码 + 开课学期」五字段
   /// 合并为同一门课（同一门课可能在多个学期出现，取最高分代表成绩）。
+  ///
+  /// [gpa]（`cells[8]`，`jwxt_client.dart:1267`）跟着「代表成绩」一起走：
+  /// 只有当某条记录的成绩被选为最高分时，它的绩点才会覆盖旧值 ——
+  /// 否则会出现「成绩是 72、绩点却是 55 分那次的 0」这种错配。
+  /// 老版本缓存里没有 `gpa` 键时按空串处理（统计层会跳过该记录，见
+  /// [computeWeightedGpa]）。
   static List<_GradeArchive> _archiveGrades(List<Map<String, String>> grades) {
     const keyFields = ['course', 'credit', 'courseType', 'code', 'term'];
     final map = <String, _GradeArchive>{};
@@ -425,6 +431,7 @@ class _GradesPageState extends State<GradesPage>
           code: (g['code'] ?? '').trim(),
           term: (g['term'] ?? '').trim(),
           grade: displayGrade,
+          gpa: (g['gpa'] ?? '').trim(),
           isFail: failed,
         );
       } else {
@@ -433,12 +440,14 @@ class _GradesPageState extends State<GradesPage>
         final existingScore = double.tryParse(existing.grade);
         if (score != null && (existingScore == null || score > existingScore)) {
           existing.grade = gradeText;
+          existing.gpa = (g['gpa'] ?? '').trim();
         } else if (score == null &&
             existingScore == null &&
             displayGrade.isNotEmpty) {
           // 两边都是文字：用文字长度当排序 key（仅在两个非数字时兜底）
           if (displayGrade.length > existing.grade.length) {
             existing.grade = displayGrade;
+            existing.gpa = (g['gpa'] ?? '').trim();
           }
         }
         if (failed) existing.isFail = true;
@@ -483,6 +492,12 @@ class _GradesPageState extends State<GradesPage>
   List<_GradeArchive> _archiveAll = const [];
   List<_GradeArchive> _archiveDone = const [];
   List<_GradeArchive> _archiveRetry = const [];
+  // 统计结果：与归档同生命周期，在 _ensureArchiveCache 里一次性算完，
+  // build 只读字段（避免每次 setState 重跑加权）。
+  //   _archiveGpa = 加权平均绩点，null 表示没有可计入的记录（显示「—」）。
+  //   _archiveMajorFailCount = 专业课挂科门数（按课程身份去重，一门最多 1 门）。
+  double? _archiveGpa;
+  int _archiveMajorFailCount = 0;
 
   void _ensureArchiveCache(String? selectedTerm, bool sortByYear) {
     if (identical(_archiveSource, _grades) &&
@@ -508,6 +523,13 @@ class _GradesPageState extends State<GradesPage>
     _archiveAll = archived;
     _archiveDone = done;
     _archiveRetry = retry;
+    // 统计口径与列表一致：走同一份归档（=同一份学期筛选结果），
+    // 口径细节见文件末尾的 computeWeightedGpa / countMajorCourseFails。
+    final statRecords = archived
+        .map((a) => a.toStatRecord())
+        .toList(growable: false);
+    _archiveGpa = computeWeightedGpa(statRecords);
+    _archiveMajorFailCount = countMajorCourseFails(statRecords);
   }
 
   @override
@@ -592,6 +614,7 @@ class _GradesPageState extends State<GradesPage>
           ),
           _buildGradeUpdateControls(),
           _buildGradeTermSelector(settings),
+          _buildGradeStatsCard(),
           if (settings.gradeCategoryEnabled) ...[
             _buildArchiveSection(
               '已完成',
@@ -617,6 +640,135 @@ class _GradesPageState extends State<GradesPage>
             ),
         ],
       ),
+    );
+  }
+
+  /// 成绩统计卡（成绩页顶部，紧随学期筛选）：GPA + 挂科总数 + 专业课挂科。
+  ///
+  /// - GPA 口径：全部课程 · Σ(学分×绩点)/Σ学分（公共选修计入、重修取最高分），
+  ///   无可用数据时显示「—」。见 [computeWeightedGpa]。
+  /// - 「挂科总数」= 与下方「历史补考/重修」分组标题同一个数（全部课程，
+  ///   按归档记录条数），此处只是把它抬到显眼位置，语义未改。
+  /// - 「专业课挂科」是**独立指标**：只算课程性质含「必修」的课程，
+  ///   且按课程身份去重（一门最多 1 门），不并入上面的总数。
+  ///   见 [countMajorCourseFails] / [isMajorCourseByCourseType]。
+  Widget _buildGradeStatsCard() {
+    final colorScheme = Theme.of(context).colorScheme;
+    final gpaText = formatGpaText(_archiveGpa);
+    final totalFails = _archiveRetry.length;
+    return Card(
+      color: colorScheme.primaryContainer.withAlpha(110),
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Icon(
+                  Icons.school_outlined,
+                  size: 18,
+                  color: colorScheme.primary,
+                ),
+                const SizedBox(width: 6),
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 2),
+                  child: Text(
+                    '平均绩点 GPA',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      color: colorScheme.primary,
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  gpaText,
+                  style: TextStyle(
+                    fontSize: 26,
+                    height: 1.05,
+                    fontWeight: FontWeight.w700,
+                    color: colorScheme.primary,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 2),
+            Text(
+              '全部课程 · Σ(学分×绩点) / Σ学分 · 重修取最高分',
+              style: TextStyle(
+                fontSize: 11,
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+            Divider(height: 16, color: colorScheme.outlineVariant),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: _buildGradeStatItem(
+                    '挂科总数',
+                    '$totalFails 门',
+                    '全部课程（含重修记录）',
+                  ),
+                ),
+                Container(
+                  width: 1,
+                  height: 34,
+                  margin: const EdgeInsets.symmetric(horizontal: 10),
+                  color: colorScheme.outlineVariant,
+                ),
+                Expanded(
+                  child: _buildGradeStatItem(
+                    '专业课挂科',
+                    '$_archiveMajorFailCount 门',
+                    '必修课 · 按课程去重',
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGradeStatItem(String label, String value, String hint) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            color: colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          value,
+          style: TextStyle(
+            fontSize: 20,
+            height: 1.1,
+            fontWeight: FontWeight.w700,
+            color: colorScheme.onSurface,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          hint,
+          maxLines: 2,
+          style: TextStyle(
+            fontSize: 10,
+            height: 1.2,
+            color: colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ],
     );
   }
 
@@ -924,6 +1076,10 @@ class _GradeArchive {
   final String code;
   final String term;
   String grade;
+
+  /// 单科绩点原文（`jwxt_client.dart` 的 `cells[8]`，可能是空串或非数字）。
+  /// 与 [grade] 配对：始终是「代表成绩」那一条记录的绩点。
+  String gpa;
   bool isFail;
 
   _GradeArchive({
@@ -933,8 +1089,23 @@ class _GradeArchive {
     required this.code,
     required this.term,
     required this.grade,
+    required this.gpa,
     required this.isFail,
   });
+
+  /// 转成统计用的纯数据快照。
+  /// 本类保持 private（仓库硬约束：拆分不改可见性），跨到单测只用
+  /// [GradeStatRecord] 这个 public 类型。
+  GradeStatRecord toStatRecord() => GradeStatRecord(
+    course: course,
+    code: code,
+    credit: credit,
+    courseType: courseType,
+    grade: grade,
+    gpa: gpa,
+    isFail: isFail,
+    term: term,
+  );
 }
 
 /// 综合判断一门成绩是否"未通过"（用于成绩归档）。
@@ -951,4 +1122,214 @@ bool isGradeFail(String gradeText) {
   final score = double.tryParse(t);
   if (score != null) return score < 60;
   return true;
+}
+
+// ==================== 成绩统计（文件级纯函数，可单测） ====================
+//
+// 为什么放在 widget 外面：成绩页原本 0 个测试（历史欠账），而「绩点怎么加权」
+// 「什么算专业课」这两条口径最容易被后来的"顺手优化"改坏。抽成文件级纯函数后，
+// `test/grades_page_test.dart` 和页面**共用同一份实现**；若把逻辑留在 State 里，
+// 单测只能复刻一遍数字，真代码改回旧行为时用例仍然全绿（假绿灯）。
+// 没有为此把任何既有私有符号改成 public：`_GradeArchive` 依旧是 private，
+// 跨边界只传 [GradeStatRecord]（见其文档）。
+
+/// 统计用的单条成绩快照。
+///
+/// 字段来源：`jwxt_client.dart:1255-1283` 解析出的 `course / code / credit /
+/// gpa(cells[8]) / courseType(cells[13]) / grade / term`；[isFail] 取自归档
+/// 合并结果（同一门课**任意一次**未通过即为 true，与 `_archiveGrades` 一致），
+/// 不是用 [grade] 现算 —— 因为 [grade] 是"代表成绩"（最高分），重修通过后
+/// 它就不是不及格了，但该课程仍属于"历史补考/重修"。
+class GradeStatRecord {
+  const GradeStatRecord({
+    required this.course,
+    required this.code,
+    required this.credit,
+    required this.courseType,
+    required this.grade,
+    required this.gpa,
+    required this.isFail,
+    this.term = '',
+  });
+
+  /// 从成绩解析结果（`Map<String, String>`）直接构造，[isFail] 用
+  /// [isGradeFail] 现算（只适合"单条原始记录"场景，归档合并后的
+  /// isFail 语义更强，见类文档）。
+  factory GradeStatRecord.fromGradeMap(Map<String, String> grade) {
+    final gradeText = (grade['grade'] ?? '').trim();
+    return GradeStatRecord(
+      course: (grade['course'] ?? '').trim(),
+      code: (grade['code'] ?? '').trim(),
+      credit: (grade['credit'] ?? '').trim(),
+      courseType: (grade['courseType'] ?? '').trim(),
+      grade: gradeText,
+      gpa: (grade['gpa'] ?? '').trim(),
+      isFail: isGradeFail(gradeText),
+      term: (grade['term'] ?? '').trim(),
+    );
+  }
+
+  final String course;
+  final String code;
+  final String credit;
+  final String courseType;
+  final String grade;
+
+  /// 单科绩点原文；空串 / 非数字表示该记录没有可用绩点。
+  final String gpa;
+  final bool isFail;
+  final String term;
+}
+
+/// 课程身份键：**课程名 + 课程编码**；编码为空时只用课程名。
+///
+/// 「一门课最多算一次」就靠这个键。为什么键里**不含** term / grade / gpa：
+/// 同一门课重修时，课程名和课程编码不变，变的恰好是开课学期、成绩、绩点。
+/// 现有 `_archiveGrades` 的五字段键含 `term`，所以跨学期重修会留下**两条**
+/// 归档记录；统计层再按本键折叠一次，「重修取最高分那条记录」与
+/// 「一门最多算一次」才真正成立。
+String gradeCourseIdentity(GradeStatRecord record) {
+  final course = record.course.trim();
+  final code = record.code.trim();
+  if (code.isEmpty) return course;
+  return '$course|$code';
+}
+
+/// 按课程身份折叠：同一门课的多次记录（各学期 / 重修）合成一条。
+///
+/// - 代表成绩取「更高」的那条（数字优先，数字比大小；都是文字时已通过的优先）。
+/// - [GradeStatRecord.isFail] 取**任意一条未通过**（与 `_archiveGrades` 一致）：
+///   重修不过 ⇒ 仍是同一门课、仍算挂科，且只算 1 门。
+/// - 学分 / 课程性质 / 学期跟随代表成绩那条（同门课这些字段本就相同，
+///   代表成绩那条为空时才回退到另一条）。
+/// - 绩点**只取**代表成绩那条：决不把旧记录的绩点配到新成绩上。
+List<GradeStatRecord> collapseByCourseIdentity(
+  Iterable<GradeStatRecord> records,
+) {
+  final byIdentity = <String, GradeStatRecord>{};
+  for (final record in records) {
+    final key = gradeCourseIdentity(record);
+    final existing = byIdentity[key];
+    byIdentity[key] = existing == null
+        ? record
+        : _mergeStatRecords(existing, record);
+  }
+  return byIdentity.values.toList(growable: false);
+}
+
+GradeStatRecord _mergeStatRecords(GradeStatRecord a, GradeStatRecord b) {
+  final bWins = _isBetterRepresentativeGrade(b, a);
+  final better = bWins ? b : a;
+  final other = bWins ? a : b;
+  return GradeStatRecord(
+    course: better.course.isNotEmpty ? better.course : other.course,
+    code: better.code.isNotEmpty ? better.code : other.code,
+    credit: better.credit.isNotEmpty ? better.credit : other.credit,
+    courseType: better.courseType.isNotEmpty
+        ? better.courseType
+        : other.courseType,
+    grade: better.grade.isNotEmpty ? better.grade : other.grade,
+    gpa: better.gpa,
+    isFail: a.isFail || b.isFail,
+    term: better.term,
+  );
+}
+
+/// [candidate] 是否比 [current] 更适合当"代表成绩"。
+bool _isBetterRepresentativeGrade(
+  GradeStatRecord candidate,
+  GradeStatRecord current,
+) {
+  final candidateScore = double.tryParse(candidate.grade);
+  final currentScore = double.tryParse(current.grade);
+  if (candidateScore != null && currentScore != null) {
+    return candidateScore > currentScore;
+  }
+  if (candidateScore != null) return true; // 数字成绩优先于文字评分
+  if (currentScore != null) return false;
+  if (candidate.grade.isEmpty) return false;
+  if (current.grade.isEmpty) return true;
+  if (candidate.isFail != current.isFail) return !candidate.isFail;
+  return false;
+}
+
+/// 括号内文字优先判定：课程性质里**括号内**的文字含「必修」二字即算专业课；
+/// `courseType` 无括号时回退为"整个字符串含必修"；两者都不满足则不算。
+///
+/// 例：`学科基础课（必修）` → 是；`通识必修`（无括号）→ 是；
+/// `公共选修` → 否；`专业方向课（选修）` → 否。
+bool isMajorCourseByCourseType(String courseType) {
+  final text = courseType.trim();
+  if (text.isEmpty) return false;
+  final bracket = RegExp(r'[（(]([^（()）]*)[)）]').firstMatch(text);
+  final scope = bracket == null ? text : (bracket.group(1) ?? '').trim();
+  return scope.contains('必修');
+}
+
+/// 专业课挂科门数：按课程身份去重（一门最多 1 门），只统计
+/// [isMajorCourseByCourseType] 为真的课程。
+///
+/// 与"全部课程挂科总数"是两个独立指标：本函数**不**包含非专业课，
+/// 也不与页面上原有的补考/重修记录数（按归档记录条数）混算。
+///
+/// 判定顺序是「先按课程身份聚合，再判性质」，取**任一条**记录为准：
+/// - 该身份下**任一条**记录的课程性质含「必修」→ 这门课是专业课；
+/// - 该身份下**任一条**记录未通过 → 这门课挂过科；
+/// - 两个集合的交集大小就是返回值。
+///
+/// 为什么不是"只看挂科那条记录的性质"：`courseType` 来自 `cells[13]`，
+/// 解析器有 `cells.length > 13` 的保护（`jwxt_client.dart:1280`），单元格
+/// 少一列就得到空串 —— 只看挂科那条会把真实专业课挂科漏掉，而漏计比多计更难
+/// 被发现。同一门课在不同学期被写成不同性质（如一次`通识必修`、一次
+/// `公共选修`）时同样走这条规则：**任一条判为必修即算专业课**。
+int countMajorCourseFails(Iterable<GradeStatRecord> records) {
+  final majorIdentities = <String>{};
+  final failedIdentities = <String>{};
+  for (final record in records) {
+    final key = gradeCourseIdentity(record);
+    if (isMajorCourseByCourseType(record.courseType)) {
+      majorIdentities.add(key);
+    }
+    if (record.isFail) {
+      failedIdentities.add(key);
+    }
+  }
+  return failedIdentities.where(majorIdentities.contains).length;
+}
+
+/// 加权平均绩点：**全部课程** · Σ(学分 × 绩点) / Σ学分。
+///
+/// 口径（作者已确认）：
+/// - 全部课程都计入，**公共选修也计入**，挂科课程同样计入（其绩点一般很低/为 0）。
+/// - 重修取最高分那条记录：输入先经 [collapseByCourseIdentity] 按课程身份折叠。
+/// - 容错：绩点缺失或非数字（含 `NaN` / `Infinity` / 老缓存没有 `gpa` 键）的
+///   记录**整条跳过**，其学分**不计入分母**；学分缺失、非数字或 ≤ 0 的记录
+///   同样整条跳过。这样算出来的是"有完整绩点数据的课程"的加权平均，
+///   不会被"学分很大但绩点缺失"的课拖成虚低。
+/// - 没有任何可计入的记录时返回 `null`（页面显示「—」，绝不显示 NaN）。
+double? computeWeightedGpa(Iterable<GradeStatRecord> records) {
+  var weighted = 0.0;
+  var totalCredits = 0.0;
+  for (final record in collapseByCourseIdentity(records)) {
+    final gpa = _parseFiniteNumber(record.gpa);
+    if (gpa == null) continue;
+    final credit = _parseFiniteNumber(record.credit);
+    if (credit == null || credit <= 0) continue;
+    weighted += credit * gpa;
+    totalCredits += credit;
+  }
+  if (totalCredits <= 0) return null;
+  return weighted / totalCredits;
+}
+
+double? _parseFiniteNumber(String text) {
+  final value = double.tryParse(text.trim());
+  if (value == null || value.isNaN || value.isInfinite) return null;
+  return value;
+}
+
+/// 页面显示用：不可用（`null` / NaN / Infinity）显示「—」，否则两位小数。
+String formatGpaText(double? gpa) {
+  if (gpa == null || gpa.isNaN || gpa.isInfinite) return '—';
+  return gpa.toStringAsFixed(2);
 }
