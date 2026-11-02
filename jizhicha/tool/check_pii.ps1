@@ -65,6 +65,8 @@ if (-not $files) {
 $violations = New-Object System.Collections.Generic.List[string]
 
 foreach ($rel in $files) {
+    # 门禁脚本自身必然包含这些形态（它就是规则的载体），扫自己没有意义。
+    if ($rel -eq 'tool/check_pii.ps1') { continue }
     $ext = [System.IO.Path]::GetExtension($rel).ToLowerInvariant()
     if ($TextExtensions -notcontains $ext) { continue }
     $abs = Join-Path $RepoRoot $rel
