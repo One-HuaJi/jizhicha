@@ -96,8 +96,11 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       // 而"切回来"这一刻是唯一确定会发生的时机。
       //
       // 不 await：生命周期回调是同步的，检查/认证在后台自己跑；异常也不能冒到
-      // 框架的生命周期分发里。意图（用户主动断开后不重连）仍由
-      // `handleAppResumed()` → `_reconnectSilently()` 内部把关。
+      // 框架的生命周期分发里。意图（用户主动断开后不重连）与设置里的总闸
+      // （「打开 App 后自动连接校园网」，默认关）仍由 `handleAppResumed()`
+      // → `_reconnectSilently()` 内部把关 —— 那两处是唯一的判据来源。例外：
+      // 设置里开着总闸、但用户在系统 VPN 授权框上误点过「取消」时，
+      // `handleAppResumed()` 会解除本会话的暂停（见 `_clearSuppressionOnResume`）。
       unawaited(
         campusEnvironment.handleAppResumed().catchError((Object _) {}),
       );

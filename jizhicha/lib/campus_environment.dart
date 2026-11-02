@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart' show ChangeNotifier;
 import 'package:path_provider/path_provider.dart'
     show getApplicationDocumentsDirectory;
 
+import 'app_settings.dart';
 import 'campus_vpn.dart';
 import 'credential_store.dart';
 import 'vpn_session.dart';
@@ -96,7 +97,28 @@ class CampusKeepAliveFileStore implements CampusKeepAliveStore {
 ///   4. 维护「保持校园网存活」这个**显式意图**（见 [keepAlive]），
 ///      它决定第 2 步到底允不允许自动重认证；
 ///   5. 应用回到前台时**立刻**做一次健康检查（见 [handleAppResumed]）——
-///      第 2 步那两个定时器在后台并不可靠，不能只依赖它们。
+///      第 2 步那两个定时器在后台并不可靠，不能只依赖它们；
+///   6. 持有设置里的**总闸**「打开 App 后自动连接校园网」（见
+///      [autoConnectEnabled]）——它决定第 2/5 步允不允许**自动发起认证**。
+///
+/// ## 两层意图，各管一件事（不要混成一套真相）
+///
+/// | 层 | 存在哪 | 语义 | 谁写 |
+/// |---|---|---|---|
+/// | **总闸** `autoConnectCampus` | `app_settings.dart` 的 `settings.json` | "这个 App 允不允许自己发起认证" | 只有设置页的开关 |
+/// | **意愿** `keepAlive` | 独立的 `jizhicha_campus_keep_alive.json` | "用户上一次是想要校园网通着，还是明确断开了" | 认证成功置 true、主动登出置 false |
+///
+/// 判定顺序（[ensureCampusAlive] / [_reconnectSilently] 里逐条落地）：
+/// 1. **手动**（`silent: false` / 界面上的连接按钮）→ 一律放行，两个意图都不看；
+/// 2. **总闸关** → 所有自动路径都不发起认证（不论 [keepAlive] 是什么）；
+/// 3. 总闸开 + [keepAlive] false → 用户明确断开过，不自动连（与今天的行为一致）；
+/// 4. 总闸开 + [keepAlive] true → 照旧自动认证，并受退避阶梯与
+///    [_autoRetrySuppressed] 约束。
+///
+/// 两层**互不写对方**：关总闸不等于断网（不碰隧道、不改 [keepAlive]），
+/// 主动登出也不改总闸（用户只是这次不想要，而不是取消"以后自动连"的偏好）。
+/// 唯一的方向性例外是"总闸打开"本身不改 [keepAlive] —— 那是作者要求的
+/// "总闸开 = 现有行为"。
 ///
 /// 这样课表页、成绩页读到的 `online` 与状态机完全一致，不会再出现
 /// "一个页面说在线、另一个说离线"的矛盾。
@@ -105,9 +127,11 @@ class CampusEnvironmentController extends ChangeNotifier {
     VpnSession? session,
     this.keepAliveStore = const CampusKeepAliveFileStore(),
     this.loadVpnAccounts = _loadStoredVpnAccounts,
+    this.loadAutoConnectCampus = _loadAutoConnectCampusSetting,
   }) : session = session ?? VpnSession(probe: _missingProbe) {
     this.session.addListener(_onSessionChanged);
     _intentReady = _restoreKeepAliveIntent();
+    _autoConnectReady = _refreshAutoConnectCampus(force: true);
     startHealthMonitor();
   }
 
@@ -125,6 +149,89 @@ class CampusEnvironmentController extends ChangeNotifier {
       CredentialStore.load(StoredAccountKind.vpn);
 
   final Future<List<StoredAccount>> Function() loadVpnAccounts;
+
+  /// 读设置里的**总闸**「打开 App 后自动连接校园网」。
+  ///
+  /// 与 [loadVpnAccounts] 同理，做成可注入的**唯一**理由是让"总闸关掉之后
+  /// 自动路径一条都不许走"这件事能在宿主上被真正跑到：默认实现会读
+  /// `app_settings.dart` 的真实 `settings.json`，单测里那样会污染用户设置文件。
+  ///
+  /// 默认实现返回 `false`（[AppSettings.autoConnectCampus] 的默认值），
+  /// 所以**任何读不出来/读失败的情况都落到"不自动连"** —— 安全方向：
+  /// 宁可少自动连一次，也不要凭空替用户连上。
+  final Future<bool> Function() loadAutoConnectCampus;
+
+  static Future<bool> _loadAutoConnectCampusSetting() async {
+    try {
+      return (await AppSettings.load()).autoConnectCampus;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 总闸是否已从设置里读过一次。所有自动路径都要先等它，
+  /// 否则冷启动头几秒会把"还没读出来的 false"当成结论。
+  late final Future<void> _autoConnectReady;
+
+  /// 总闸当前值（最近一次读到的设置）。默认 `false` = 不自动连。
+  bool _autoConnectCampusEnabled = false;
+
+  /// 上次真正读设置的时刻，用于给 10 秒快探测那条路径做读取节流
+  /// （见 [_refreshAutoConnectCampus] 的 `force`）。
+  DateTime? _autoConnectReadAt;
+
+  /// 两次非强制读取之间的最小间隔。
+  ///
+  /// 为什么需要：快探测每 10 秒 tick 一次，而 `AppSettings.load()` 在 Android 上
+  /// 每次都会走一次 `path_provider` 平台通道 + 读一个小 JSON。总闸是个用户手动
+  /// 拨的开关，晚 20 秒生效没有任何实际影响，没必要每 10 秒问一次磁盘。
+  static const Duration _autoConnectRefreshInterval = Duration(seconds: 20);
+
+  /// 设置里的总闸当前是否打开（只读，供 UI/单测断言用）。
+  bool get autoConnectEnabled => _autoConnectCampusEnabled;
+
+  /// 重新读一次设置里的总闸。
+  ///
+  /// [force] 为真时无视节流 —— 只在"用户刚做了可能改过设置的动作"时用
+  /// （回到前台、启动、手动连接），保证拨完开关回到 App 立刻生效。
+  ///
+  /// 读失败**不改**当前值：`AppSettings.load()` 自己会把读不出来的文件降级成
+  /// 默认设置（总闸 false），那已经是安全方向；这里再兜一层 catch，
+  /// 避免"设置文件损坏"把控制器打成异常路径。
+  Future<void> _refreshAutoConnectCampus({bool force = false}) async {
+    if (_disposed) return;
+    final now = DateTime.now();
+    final last = _autoConnectReadAt;
+    if (!force && last != null && now.difference(last) < _autoConnectRefreshInterval) {
+      return;
+    }
+    _autoConnectReadAt = now;
+    final bool enabled;
+    try {
+      enabled = await loadAutoConnectCampus();
+    } catch (_) {
+      return;
+    }
+    if (_disposed) return;
+    if (_autoConnectCampusEnabled == enabled) return;
+    _autoConnectCampusEnabled = enabled;
+    if (enabled) {
+      // 用户刚把总闸拨到"开"：这就是一次明确的"我要它自动连"的表示，所以
+      // 立刻把本会话的暂停与退避阶梯清零 —— 否则他打开开关后仍要等 5 分钟
+      // 退避窗口（甚至要重启 App）才看见效果，开关看起来是坏的。
+      //
+      // 刻意**不动** [keepAlive]：总闸只管"允不允许自动认证"，不改写
+      // "用户上次是想要还是断开"那份记录（见类文档的优先级表）。
+      _reconnectFailures = 0;
+      _nextReconnectAt = null;
+      _autoRetrySuppressed = false;
+      _suppressedBy = null;
+      // 开关拨开但用户上次明确断开过：这时不该自己连（第 3 条优先级）。
+      // 不发通知也没法提示（设置页不在本文件的可改范围），但至少让
+      // 下一次 ensureCampusAlive 如实返回 false，不假装在努力。
+    }
+    _notify();
+  }
 
   VpnSession session;
 
@@ -196,6 +303,13 @@ class CampusEnvironmentController extends ChangeNotifier {
   /// 用户的"保持校园网连接"意愿就被**永久遗忘** —— 表现就是"明明设置过，下次
   /// 打开却再也不自动认证了"。所以：只暂停本会话，下次启动照常尝试。
   bool _autoRetrySuppressed = false;
+
+  /// 触发本次会话暂停的那一次失败类型（`null` = 没有暂停）。
+  ///
+  /// 存在的唯一原因是：[_autoRetrySuppressed] 需要**有恢复入口**，而两种
+  /// 不可重试失败的可恢复性完全不同 —— 见 [handleAppResumed] 里的
+  /// `_clearSuppressionOnResume`。
+  VpnFailure? _suppressedBy;
 
   /// 下一次允许静默重连的时刻；null 表示"还没有安排"。
   DateTime? _nextReconnectAt;
@@ -307,6 +421,7 @@ class CampusEnvironmentController extends ChangeNotifier {
       _reconnectFailures = 0;
       _nextReconnectAt = null;
       _autoRetrySuppressed = false;
+      _suppressedBy = null;
     }
     if (_keepAlive == value) return;
     _keepAlive = value;
@@ -426,10 +541,20 @@ class CampusEnvironmentController extends ChangeNotifier {
   /// 累积出来的 5 分钟退避窗口拖住。反复切前后台由 [_reconnectSilently] 内的
   /// 紧急尝试下限兜住，不会退化成高频认证。
   ///
-  /// **永远不会越过「用户主动断开」的意图**：[session] 的 [keepAlive] 为 false 时
-  /// [_reconnectSilently] 直接返回，这里不做任何例外。
+  /// **永远不会越过「用户主动断开」的意图**：[keepAlive] 为 false 时
+  /// [_reconnectSilently] 直接返回，这里不做任何例外。同理也**不会越过总闸**：
+  /// 白天把「打开 App 后自动连接校园网」关掉之后，来回切前后台不会自己认证。
+  /// 注意第 1 步的原生同步与第 3 步的复核**照旧执行** —— 那是"看"，
+  /// 不是"连"；总闸关着时若隧道被别处拆掉，界面仍要如实显示成离线。
   Future<void> handleAppResumed() async {
     if (_disposed) return;
+    // 0) 先刷新总闸。用户很可能就是去系统设置里拨完开关再切回来的，
+    //    这里不能沿用后台期间那份可能已经过时的值（`force: true` 绕过节流）。
+    await _autoConnectReady;
+    await _refreshAutoConnectCampus(force: true);
+    if (_disposed) return;
+    // 0') 给出"暂停自动认证"的恢复入口，见 [_clearSuppressionOnResume]。
+    _clearSuppressionOnResume();
     // 1) 立刻同步一次：把"隧道还在不在 / 虚拟地址还在不在"拉回来。
     await session.syncFromNative();
     if (_disposed || session.busy || _reconnecting) return;
@@ -454,6 +579,52 @@ class CampusEnvironmentController extends ChangeNotifier {
     if (status != null && status['connected'] != true) {
       await _reconnectSilently(ignoreBackoff: true);
     }
+  }
+
+  /// 回到前台时，把**可能已经被用户从外部修好**的那一类暂停清掉。
+  ///
+  /// ## 为什么需要（这是"自动连接还有问题"的一个具体失败路径）
+  ///
+  /// [_autoRetrySuppressed] 是**进程级**的：不可重试失败（
+  /// [VpnFailure.isRetryable] 为 false）会把它置 true，而只有
+  /// [clearKeepAliveIntent]、[_setKeepAlive] 成功、总闸由关变开这三件事会清它。
+  /// 于是出现这条死路：
+  ///
+  /// 1. 用户点了连接，Android 弹出系统 VPN 授权框，他没看清就按了「取消」
+  ///    → `permissionDenied` → 本次会话内**自动重连彻底停摆**；
+  /// 2. 用户随后在系统里授予了权限（或重新点一次连接成功了）；
+  /// 3. 但这条隧道之后真断了时，自动路径仍被第 1 步那个标志挡住，
+  ///    直到杀进程重启 —— 用户看到的现象是"自动连接时好时坏/干脆不连了"。
+  ///
+  /// 而 [VpnFailure.permissionDenied] 恰好是**唯一**明显可由用户在系统 UI 里
+  /// 修好的失败类型，所以每次回到前台都允许它重试一次是安全且必要的。
+  ///
+  /// ## 为什么 [VpnFailure.badCredentials] 不在此列
+  ///
+  /// 密码错不会因为"过了十分钟"或"切了一次前后台"而变对，无脑重置只会
+  /// 让 App 每隔一会儿就拿错的凭据去撞一次学校网关。学校网关是
+  /// "同账号新会话踢掉旧会话"的语义，这种无谓认证还可能顶掉别的设备
+  /// 上那条好的会话。凭据错的恢复入口是**手动连接**（
+  /// [ensureCampusAlive]`(silent: false)` 会清暂停）—— 那表示用户已经
+  /// 改过密码、真的要再试一次。
+  ///
+  /// 退避阶梯（[_reconnectFailures] / [_nextReconnectAt]）一起清零：只清暂停
+  /// 不清退避的话，用户回到前台仍要等上一个 5 分钟窗口。
+  ///
+  /// 连 [_lastAttemptAt] 也清掉：它和 [_reconnectFirstDelay] 一起构成"两次紧急
+  /// 尝试至少隔 10 秒"的下限（见 [_reconnectSilently] 的 `urgent`）。上一次尝试
+  /// 属于"用户还没授权"的那段时间，把它留着会让刚授完权的用户回到前台后仍被
+  /// 按 10 秒不连。这里不会因此变成"每次切前后台都认证一次"：暂停只可能被清
+  /// 一次 —— 清掉之后要么连成功（暂停自然消失），要么再失败一次（立刻重新置
+  /// 暂停并刷新 [_lastAttemptAt]），所以每个"暂停周期"最多多一次尝试。
+  void _clearSuppressionOnResume() {
+    if (!_autoRetrySuppressed) return;
+    if (_suppressedBy != VpnFailure.permissionDenied) return;
+    _autoRetrySuppressed = false;
+    _suppressedBy = null;
+    _reconnectFailures = 0;
+    _nextReconnectAt = null;
+    _lastAttemptAt = null;
   }
 
   /// 原生 stage 是否表示"网关会话已死、必须重新认证"。
@@ -492,6 +663,7 @@ class CampusEnvironmentController extends ChangeNotifier {
   /// 漏调的后果是那一条路径断开后会被自动连回来（一个按不掉的开关）。
   Future<void> clearKeepAliveIntent() async {
     _autoRetrySuppressed = false;
+    _suppressedBy = null;
     await _setKeepAlive(false);
   }
 
@@ -514,16 +686,47 @@ class CampusEnvironmentController extends ChangeNotifier {
   /// **绝不在用户已主动登出后连接**：那时 [keepAlive]（含从磁盘恢复的值）
   /// 为 false，直接返回 false。本方法**不会**改写这个意图。
   ///
+  /// **总闸关着就什么都不做**：[silent] 为 true 时先看设置里的
+  /// [autoConnectEnabled]（「打开 App 后自动连接校园网」，默认关）——
+  /// 关着就**连探测都不做**，立刻返回 false。这条判定放在本方法**和**
+  /// [_reconnectSilently] 两处：这里省掉启动时那次无意义的内网探测，
+  /// 那里是所有自动路径的兜底不变量（将来新增自动入口也不会漏）。
+  ///
   /// [silent] 为 true（默认）时：不弹任何 UI、不抛异常；失败只返回 false，
   /// 并把 [consumeDropDetected] 的标记置位，交由 UI 决定是否提示。
   /// 传 false 表示调用方就在界面上等结果（例如登录引导页），此时**允许**
-  /// 无视已持久化的 keep-alive 意图发起一次认证 —— 用户正看着，不算静默。
+  /// 无视总闸与已持久化的 keep-alive 意图发起一次认证 —— 用户正看着，
+  /// 不算静默；同一次调用还会清掉"本会话已暂停自动认证"的标志，
+  /// 让用户按下的"重试"是真的重试。
   ///
   /// 与周期健康检查共用同一条静默通道（[_reconnecting]），所以任意时刻调用
   /// 都不会与健康检查并发发出认证请求；也不会先 `disconnect()` 再连。
   Future<bool> ensureCampusAlive({bool silent = true}) async {
+    // 控制器已经 dispose（App 退出、`_MyAppState.dispose()` 里调过）时绝不能再
+    // 发起认证：`dispose()` 只摘掉了监听和定时器，[session] 本身还活着，此时
+    // 连一次就是"用户正在退出，后台却向学校网关发认证"。
+    if (_disposed) return false;
     await _intentReady;
-    if (silent && !_keepAlive) return false;
+    if (silent) {
+      // 总闸（设置里的「打开 App 后自动连接校园网」）是自动路径的总开关。
+      // 放在这里而不是只放在 [_reconnectSilently] 里，是为了连"探测"都不做：
+      // 启动路径（`app_bootstrap_page.dart`）的既定约束本来就是"不因为打开
+      // App 就额外向校园网发起请求"，总闸关闭时更应如此。
+      //
+      // `force: true` 的读取：这是启动/手动入口，用户可能刚在设置里拨过开关。
+      await _autoConnectReady;
+      await _refreshAutoConnectCampus(force: true);
+      if (!_autoConnectCampusEnabled) return false;
+      if (!_keepAlive) return false;
+    } else {
+      // `silent: false` = 用户正看着界面等结果（登录引导页 / 「立即连接」）。
+      // 手动路径**不受**总闸与"用户不想要"两个意图的约束，但这是唯一
+      // 允许越过它的地方。用户主动要连 = 一次明确的"再试一次"，
+      // 顺手把本会话的暂停与退避清掉，否则"手动连成功过一次之后，
+      // 自动路径仍被上一次 permissionDenied 永久挡住"。
+      _autoRetrySuppressed = false;
+      _suppressedBy = null;
+    }
     if (session.busy || _reconnecting) {
       // 已经有一次连接在跑：如实回报当前是否已经可用，不再叠一次认证。
       return session.online || session.tunnelUp;
@@ -631,7 +834,9 @@ class CampusEnvironmentController extends ChangeNotifier {
   /// 3. 节流见 [_reconnectDelayFor]：首次掉线 10 秒后试，此后翻倍、5 分钟封顶。
   ///    重复的掉线检测（快探测每 10 秒一次）**不会**把重试时间点往后推。
   ///    **紧急**调用（冷启动 / 用户刚切回前台，`ignoreBackoff: true`）可以跳过
-  ///    这段等待，但两次紧急尝试之间仍有 [_reconnectFirstDelay] 的下限。
+  ///    这段等待，但两次紧急尝试之间仍有 [_reconnectFirstDelay] 的下限；
+  ///    **手动**调用（`force: true`，用户正按着界面上的连接按钮）连这个下限
+  ///    也不受 —— 反正认证进行中按钮是禁用的，用户点了就必须有反应。
   ///
   /// 失败时设置 [_dropDetected] 让 UI 能提示，但**不会**因此永久放弃 ——
   /// 退避阶梯会一直继续，直到成功或意图被关掉。唯一的例外是
@@ -648,6 +853,22 @@ class CampusEnvironmentController extends ChangeNotifier {
   }) async {
     if (_reconnecting) return false;
     await _intentReady;
+    // ── 总闸：**所有**自动认证路径的兜底不变量 ──────────────────────────
+    //
+    // `honorIntent` 正好是"这次是自动还是手动"的判据：四个自动入口
+    // （[_fastGatewayWatch] / [_silentHealthCheck] / [handleAppResumed] /
+    // [ensureCampusAlive]`(silent: true)`）都用默认值 true，唯一的 false 来自
+    // [ensureCampusAlive]`(silent: false)` —— 也就是用户正看着界面的手动连接。
+    // 所以判定只需要写在这一处，新增自动入口也不会漏。
+    //
+    // 这里读设置时**不**带 `force`：这是最内层、调用最频繁的路径，配合
+    // [_autoConnectRefreshInterval] 节流，避免每 10 秒一次快探测都去读磁盘。
+    // 需要立刻生效的场景（启动 / 回前台 / 手动）都在更外层用 force 读过了。
+    if (honorIntent) {
+      await _autoConnectReady;
+      await _refreshAutoConnectCampus();
+      if (!_autoConnectCampusEnabled) return false;
+    }
     if (honorIntent && !_keepAlive) return false;
     // 「本会话已暂停」只拦**自动**重试；用户在界面上主动要连（force=true）
     // 必须放行，否则按钮会变成一个按不动的开关。
@@ -667,14 +888,22 @@ class CampusEnvironmentController extends ChangeNotifier {
         ignoreBackoff &&
         (lastAttempt == null ||
             now.difference(lastAttempt) >= _reconnectFirstDelay);
+    // `force` = 用户正按着界面上的连接按钮。它必须**越过退避窗口**，否则会
+    // 出现这条死路：用户在 10 秒内连点两次连接，第二次直接 `return false`，
+    // 界面上什么都没发生 —— 按钮看起来"按不动"，正是本类一直在修的那类症状。
+    //
+    // 为什么可以无条件越过：force 只来自 [ensureCampusAlive]`(silent: false)`，
+    // 也就是有人在看着界面等结果；认证进行中 `session.busy` 为真、按钮被禁用，
+    // 所以这里不可能被连点刷成高频认证。
+    final bypassBackoff = force || urgent;
     if (_nextReconnectAt == null) {
       // 掉线后的**第一次**尝试先等 10 秒：Rust 心跳自己会按 10s/20s/30s
       // 退避续期，瞬时抖动往往在这段时间内自愈，等一等能少发一次不必要的
       // 认证请求（学校网关有风控）。
       _nextReconnectAt = now.add(_reconnectDelayFor(_reconnectFailures));
-      if (!urgent) return false;
+      if (!bypassBackoff) return false;
     }
-    if (!urgent && now.isBefore(_nextReconnectAt!)) return false;
+    if (!bypassBackoff && now.isBefore(_nextReconnectAt!)) return false;
 
     _reconnecting = true;
     _lastAttemptAt = now;
@@ -704,6 +933,12 @@ class CampusEnvironmentController extends ChangeNotifier {
       if (ok) {
         _reconnectFailures = 0;
         _nextReconnectAt = null;
+        // 一次成功的认证就证明了凭据和系统授权都没问题，顺带解掉
+        // 「本会话已暂停」：这是 force（用户手动）越过暂停后成功的路径，
+        // 不解就会留下"手动连得上、自动却永远不连"的怪状态，
+        // 直到进程重启为止。
+        _autoRetrySuppressed = false;
+        _suppressedBy = null;
         return true;
       }
       _dropDetected = true;
@@ -713,6 +948,9 @@ class CampusEnvironmentController extends ChangeNotifier {
         // 刻意**不**关掉持久化意图 —— 见 [_autoRetrySuppressed] 的说明：
         // 这类失败可能是瞬时的，落盘关掉会让用户"保持校园网"的意愿被永久遗忘。
         _autoRetrySuppressed = true;
+        // 记下是**哪种**失败，[handleAppResumed] 据此判断能不能在回前台时
+        // 解除暂停（permissionDenied 可以，badCredentials 不行）。
+        _suppressedBy = failure;
         _reconnectFailures = 0;
         _nextReconnectAt = null;
         return false;
