@@ -116,6 +116,10 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // 校园地图（内嵌 WebView）：把 H5 的地理定位请求接到系统运行时权限上。
+        // 实现全部在新文件 CampusMapGeolocation.kt 里，这里只做注册。
+        CampusMapGeolocation.register(this, flutterEngine)
     }
 
     /// 通过系统分享面板发送应用私有目录里的文件。
@@ -305,6 +309,8 @@ class MainActivity : FlutterActivity() {
     ) {
         // 必须调 super：Flutter 插件（如 gal 的存储权限）也走这条回调。
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // 校园地图的定位权限（请求码 1002）由 CampusMapGeolocation 接管。
+        if (CampusMapGeolocation.onRequestPermissionsResult(requestCode, grantResults)) return
         if (requestCode != NOTIFICATION_PERMISSION_REQUEST) return
         val pending = pendingNotificationResult ?: return
         pendingNotificationResult = null

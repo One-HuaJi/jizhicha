@@ -7,6 +7,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 重启后重排上课提醒（BootReceiver）。 -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 校园地图：内嵌 WebView（webview_flutter）加载学校 GIS 高德 H5
+         https://gis.huse.edu.cn/cmipsh5/#/ ，需要定位才能显示当前位置与楼栋导航。
+         仅由 CampusMapGeolocation.kt 在用户打开地图时按需申请（Android 6+ 运行时权限），
+         不在应用启动时申请；不授予时地图仍可浏览，只是不能定位。 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <!-- Course/grade/widget caches contain personal academic data. Disable Android
          Auto Backup and device-transfer backup rather than relying on app sandbox
          storage; private files can otherwise migrate to cloud/another device. -->

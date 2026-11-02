@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'campus_map_page.dart';
 import 'fitness.dart';
-import 'widget_settings_page.dart';
 import 'zongce_page.dart';
 
 /// 「暂未开放」提示的节流时间窗：1.5 秒内不重复弹，避免连点堆积 SnackBar 卡顿。
@@ -67,12 +67,12 @@ class MorePage extends StatelessWidget {
             onTap: () => _showComingSoon(context),
           ),
           ListTile(
-            leading: const Icon(Icons.widgets),
-            title: const Text('小组件（测试）'),
-            subtitle: const Text('桌面小组件与上课提醒'),
+            leading: const Icon(Icons.map_outlined),
+            title: const Text('校园地图'),
+            subtitle: const Text('校内楼栋与地点分布'),
             trailing: const Icon(Icons.chevron_right),
             onTap: () => Navigator.of(context).push(
-              MaterialPageRoute(builder: (_) => const WidgetSettingsPage()),
+              MaterialPageRoute(builder: (_) => const CampusMapPage()),
             ),
           ),
         ],

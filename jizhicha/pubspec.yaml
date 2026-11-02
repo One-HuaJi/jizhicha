@@ -16,7 +16,9 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # v1.0.9 arm64 的 versionCode 是 12900（历史 split-per-abi 偏移）。
 # v1.1.0 当前只发单 arm64 包，最终 APK code 就是这里的值，必须严格大于 12900，
 # 否则 Android 会拒绝覆盖升级（INSTALL_FAILED_VERSION_DOWNGRADE）。
-version: 1.1.0+13000
+# v1.1.1（2026-10-08）：新增校园地图入口、错峰上课表开关、课程格子底色形状可切换；
+# 发布改走 tool\build_release_sanitized.ps1（脱敏目录构建 + 发布前断言门），code 13001 > 13000。
+version: 1.1.1+13001
 
 environment:
   sdk: ^3.12.2
@@ -49,6 +51,10 @@ dependencies:
   archive: ^4.1.0
   # 选证明图片 / 选体测成绩 Excel：两端（Android + Windows）都支持。
   file_picker: ^12.3.0
+  webview_flutter: ^4.14.1
+  # 直接调用它的平台控制器 API（setGeolocationPermissionsPromptCallbacks），
+  # 所以必须显式声明，不能只依赖 webview_flutter 的传递依赖。
+  webview_flutter_android: ^4.14.1
 dev_dependencies:
   flutter_test:
     sdk: flutter
