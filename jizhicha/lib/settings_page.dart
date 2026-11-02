@@ -8,6 +8,7 @@ import 'campus_environment.dart';
 import 'common.dart';
 import 'credential_store.dart';
 import 'fitness_store.dart';
+import 'schedule_background_setting.dart';
 import 'schedule_cache_store.dart';
 import 'schedule_time.dart';
 import 'theme.dart';
@@ -59,63 +60,62 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _refreshVersionStatus() async {
-    try {
-      final info = await fetchLatestRelease();
-      if (!mounted) return;
-      final version = info?['version'] ?? '';
-      String status;
-      if (info == null || version.isEmpty) {
-        status = '检测失败';
-      } else if (compareVersions(version, currentAppVersion) > 0) {
-        status = '有新版本 v$version';
-      } else {
-        status = '已是最新版本';
-      }
-      if (mounted) setState(() => _versionStatus = status);
-    } catch (_) {
-      if (mounted) setState(() => _versionStatus = '检测失败');
+    final result = await checkForUpdate();
+    if (!mounted) return;
+    if (result is UpdateCheckOk) {
+      setState(
+        () => _versionStatus = result.hasUpdate
+            ? '有新版本 v${result.version}'
+            : '已是最新版本',
+      );
+    } else {
+      setState(() => _versionStatus = '检测失败');
     }
   }
 
   Future<void> _checkVersion() async {
     if (_versionChecking) return;
-    setState(() => _versionChecking = true);
-    try {
-      final info = await fetchLatestRelease();
+    setState(() {
+      _versionChecking = true;
+      _versionStatus = '检测中…';
+    });
+
+    // 允许"失败 → 看原因 → 重试"的循环：手动检测不能静默失败。
+    while (mounted) {
+      final result = await checkForUpdate();
       if (!mounted) return;
-      final version = info?['version'] ?? '';
-      if (info == null || version.isEmpty) {
+      if (result is UpdateCheckOk) {
+        final hasUpdate = result.hasUpdate;
         setState(() {
           _versionChecking = false;
-          _versionStatus = '检测失败';
+          _versionStatus = hasUpdate
+              ? '有新版本 v${result.version}'
+              : '已是最新版本';
         });
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('检测失败，请检查网络')));
+        if (hasUpdate) {
+          await showUpdateDialog(context, result.version, result.downloadUrl);
+        } else {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('已是最新版本')));
+        }
         return;
       }
-      if (compareVersions(version, currentAppVersion) > 0) {
-        setState(() {
-          _versionChecking = false;
-          _versionStatus = '有新版本 v$version';
-        });
-        await showUpdateDialog(context, version, info['downloadUrl'] ?? '');
-      } else {
-        setState(() {
-          _versionChecking = false;
-          _versionStatus = '已是最新版本';
-        });
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('已是最新版本')));
-      }
-    } catch (_) {
-      if (mounted) {
-        setState(() {
-          _versionChecking = false;
-          _versionStatus = '检测失败';
-        });
-      }
+      final error = result as UpdateCheckError;
+      setState(() {
+        _versionChecking = false;
+        _versionStatus = '检测失败';
+      });
+      final retry = await showUpdateCheckFailureDialog(
+        context,
+        error: error,
+        campusAcceleratorOn: campusEnvironment.online == true,
+      );
+      if (!retry || !mounted) return;
+      setState(() {
+        _versionChecking = true;
+        _versionStatus = '检测中…';
+      });
     }
   }
 
@@ -461,6 +461,140 @@ class _SettingsPageState extends State<SettingsPage> {
                             _persist(notify: true);
                           },
                   ),
+                ),
+                const Divider(height: 1),
+                SwitchListTile(
+                  title: const Text(
+                    '错峰上课表',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: const Text(
+                    '只影响第二大节（第 3、4 小节），按课程楼栋分早/晚下课两组；'
+                    '其余小节仍按上面的季节作息。课表、日历导出与桌面小组件同步生效。',
+                  ),
+                  secondary: Icon(
+                    Icons.call_split,
+                    color: colorScheme.primary,
+                  ),
+                  value: s.peakShiftEnabled,
+                  onChanged: _settings == null
+                      ? null
+                      : (v) {
+                          setState(() => _settings!.peakShiftEnabled = v);
+                          _persist(notify: true);
+                        },
+                ),
+                const Divider(height: 1),
+                ListTile(
+                  leading: Icon(
+                    Icons.crop_square,
+                    color: colorScheme.primary,
+                  ),
+                  title: const Text('课程格子底色'),
+                  subtitle: Text(
+                    s.courseCellFill == ScheduleCellFill.filled
+                        ? '长方形铺满：底色铺满整格，保留格间细线'
+                        : '圆角：历史外观，底色四周留白',
+                  ),
+                  trailing: SegmentedButton<ScheduleCellFill>(
+                    showSelectedIcon: false,
+                    style: _scheduleSegmentedStyle(colorScheme),
+                    segments: const [
+                      ButtonSegment(
+                        value: ScheduleCellFill.filled,
+                        label: Text('铺满'),
+                      ),
+                      ButtonSegment(
+                        value: ScheduleCellFill.rounded,
+                        label: Text('圆角'),
+                      ),
+                    ],
+                    selected: {s.courseCellFill},
+                    onSelectionChanged: _settings == null
+                        ? null
+                        : (selection) {
+                            setState(
+                              () => _settings!.courseCellFill = selection.first,
+                            );
+                            _persist(notify: true);
+                          },
+                  ),
+                ),
+                const Divider(height: 1),
+                SwitchListTile(
+                  title: const Text(
+                    '一屏显示课表',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: const Text(
+                    '把课表行高按可用高度等比压缩，尽量让第一~第五大节在手机上一屏显示；'
+                    '课程太多或字号太大时会自动缩一档字号。关闭后回到内容自然撑高。',
+                  ),
+                  secondary: Icon(
+                    Icons.fit_screen,
+                    color: colorScheme.primary,
+                  ),
+                  value: s.fitToScreenEnabled,
+                  onChanged: _settings == null
+                      ? null
+                      : (v) {
+                          setState(() => _settings!.fitToScreenEnabled = v);
+                          _persist(notify: true);
+                        },
+                ),
+                const Divider(height: 1),
+                SwitchListTile(
+                  title: const Text(
+                    '课程格子彩色',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: const Text(
+                    '按课程名稳定取色，同一门课每次都是同一颜色，便于一眼分辨。默认关闭。',
+                  ),
+                  secondary: Icon(
+                    Icons.palette_outlined,
+                    color: colorScheme.primary,
+                  ),
+                  value: s.courseColorEnabled,
+                  onChanged: _settings == null
+                      ? null
+                      : (v) {
+                          setState(() => _settings!.courseColorEnabled = v);
+                          _persist(notify: true);
+                        },
+                ),
+                const Divider(height: 1),
+                ScheduleBackgroundSettingTile(settings: s),
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
+
+          // ==================== 校园网设置 ====================
+          _buildSectionHeader(Icons.wifi, '校园网设置'),
+          Card(
+            child: Column(
+              children: [
+                SwitchListTile(
+                  title: const Text(
+                    '打开 App 后自动连接校园网',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: const Text(
+                    '关闭（默认）时不在后台自动认证校园网，只有你手动连接、或用需要校内网络的'
+                    '功能时才会连；打开后每次启动与回到前台都会尝试保持连接，掉线自动重连。',
+                  ),
+                  secondary: Icon(
+                    Icons.autorenew,
+                    color: colorScheme.primary,
+                  ),
+                  value: s.autoConnectCampus,
+                  onChanged: _settings == null
+                      ? null
+                      : (v) {
+                          setState(() => _settings!.autoConnectCampus = v);
+                          _persist(notify: true);
+                        },
                 ),
               ],
             ),
