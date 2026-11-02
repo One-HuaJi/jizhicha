@@ -22,6 +22,11 @@ mixin _SchedulePageShared on State<SchedulePage>, CampusSyncHelpers<SchedulePage
   String? _selectedScheduleUpdateTerm;
   bool _scheduleToolsExpanded = false;
 
+  /// 顶部三行（账号状态 / 周次进度条 / 工具行）是否折叠成一行摘要。
+  /// 纯 UI 临时状态，刻意不持久化（见 schedule_page.dart 里
+  /// `_buildScheduleHeader` 的说明），所以不进 AppSettings。
+  bool _headerCollapsed = false;
+
   // 设置（本地持久化）：本周视图高亮 + 按周筛选，均基于手动选定的"当前周次"。
   AppSettings? _settings;
   void _refreshCampusEnvironment() {
@@ -80,18 +85,25 @@ mixin _SchedulePageShared on State<SchedulePage>, CampusSyncHelpers<SchedulePage
   // 每门课 parseWeekSpans（旧实现同一门课解析两次）→ 并查集冲突聚类 →
   // 本周视图高亮。旧实现每次 build 全部重跑，大课表上一次要几十毫秒。
   //
-  // 缓存失效条件（只有下面 4 项变化才重算，其余 setState 如冷却倒计时、
+  // 缓存失效条件（只有下面 5 项变化才重算，其余 setState 如冷却倒计时、
   // 折叠开关、错误提示都直接复用缓存）：
   //   1) _courses 整体被替换（换学期 / 重新同步 / 读到本地缓存）；
   //   2) filterByWeek —— 按周筛选开关，决定要不要过滤课程；
   //   3) currentWeek —— 当前周次，筛选与高亮都按它算；
-  //   4) highlightCurrentWeek —— 本周视图高亮开关，决定是否用 3)。
+  //   4) highlightCurrentWeek —— 本周视图高亮开关，决定是否用 3)；
+  //   5) fitToScreenEnabled —— 「一屏显示」开关（见下）。
   // 高亮粒度从"整格"下沉到"每个课块（簇）"之后，这一组条件**依然完备**：
   // 簇级高亮只由 parseWeekSpans(course['weeks'])（随 _courses 一起换）与
   // highlightWeek（= highlightCurrentWeek ? currentWeek : null，由 3)、4) 决定）
   // 算出，没有引入第五个输入 —— 它刻意不读 scheduleTextSize / showWeekend /
   // scheduleTimeMode 这类只影响渲染、不影响派生数据的设置，那些不需要进缓存键。
-  // 反过来说：如果将来有人让"某个簇是否高亮"依赖了 1)~4) 之外的任何状态，
+  //
+  // 5) 是**防守性**的：一屏压缩本身只影响渲染（行高/字号由
+  // ScheduleFitLayout 在 build 里现算，不参与派生数据），但作者明确要求
+  // "改行高/折叠后必须把相关新设置加进缓存键"。留着它是为了杜绝一类回归：
+  // 将来如果有人让"某几行要合并/隐藏"依赖了这个开关，漏加键就会变成
+  // "改了设置但课表不刷新"，而那种 bug 极难复现。
+  // 反过来说：如果将来有人让"某个簇是否高亮"依赖了 1)~5) 之外的任何状态，
   // 必须同时在这里加一个同名的可空键，否则会出现"改了设置但课表不刷新"。
   // 刻意用「可空字段 + 显式比较」而不是 late final：late final 只会算一次、
   // 之后永不刷新，换学期后会显示旧课表。
@@ -99,6 +111,7 @@ mixin _SchedulePageShared on State<SchedulePage>, CampusSyncHelpers<SchedulePage
   bool? _layoutFilterByWeek;
   int? _layoutWeek;
   bool? _layoutHighlightCurrentWeek;
+  bool? _layoutFitToScreen;
   _ScheduleTableLayout _layout = _ScheduleTableLayout.empty;
 
   _ScheduleTableLayout _scheduleLayout() {
@@ -106,7 +119,8 @@ mixin _SchedulePageShared on State<SchedulePage>, CampusSyncHelpers<SchedulePage
     if (identical(_layoutCourses, _courses) &&
         _layoutFilterByWeek == settings.filterByWeek &&
         _layoutWeek == settings.currentWeek &&
-        _layoutHighlightCurrentWeek == settings.highlightCurrentWeek) {
+        _layoutHighlightCurrentWeek == settings.highlightCurrentWeek &&
+        _layoutFitToScreen == settings.fitToScreenEnabled) {
       return _layout;
     }
 
@@ -152,6 +166,7 @@ mixin _SchedulePageShared on State<SchedulePage>, CampusSyncHelpers<SchedulePage
     _layoutFilterByWeek = settings.filterByWeek;
     _layoutWeek = settings.currentWeek;
     _layoutHighlightCurrentWeek = settings.highlightCurrentWeek;
+    _layoutFitToScreen = settings.fitToScreenEnabled;
     _layout = _ScheduleTableLayout(orderedTimes: orderedTimes, cells: cells);
     return _layout;
   }

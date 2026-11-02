@@ -146,6 +146,111 @@ class AppColors {
   static const darkDivider = Color(0xFF4A433A);
 }
 
+/// 课程格子彩色板（设置项 `AppSettings.courseColorEnabled`）。
+///
+/// 与 [AppColors] 分开：`AppColors` 是"语义色"（背景/文字/主色），这一组是
+/// **按课程名散列取色的数据色**，只给课表课块用。
+///
+/// 设计约束（全部被 `test/schedule_course_color_test.dart` 钉死，改色必须重跑）：
+///  1. **同一门课永远同色**：取色只依赖课程名的稳定散列（[indexFor]），
+///     不依赖课表顺序、周次、主题深浅，也不受 `Set`/`Map` 迭代顺序影响；
+///  2. **只有两种明度档**：8 个色相各自只有一个"很浅"的 [pale] 和一个
+///     "很深"的 [deep]。这样配套墨色永远只有两种（深墨配浅底 / 浅墨配深底），
+///     实测对比度都在 6.7:1 以上（AA 门槛 4.5:1），刻意**不做中间调**——
+///     中间调无论配深墨还是浅墨都不达标，是这个色板唯一的雷区；
+///  3. **本周高亮 = 明度跳变**：浅色主题里普通块用 pale、本周块用 deep；
+///     深色主题反过来（普通块 deep、本周块 pale）。高亮永远是"与邻居相反的
+///     那一档"，所以开着「按周筛选」（整表都是本周课）时，高亮依然压得住；
+///  4. 关闭开关时不走这里：课块继续用主题的 primaryContainer /
+///     surfaceContainerHighest（见 `ScheduleCourseColors`）。
+class CourseColors {
+  CourseColors._();
+
+  /// 色相数量。散列取模的模数，改它会改变所有课程的配色。
+  static const int paletteSize = 8;
+
+  /// 深底上用的通用浅墨（暖白，不是纯白：和整体暖色系一致）。
+  static const Color deepInk = Color(0xFFFFF6E8);
+
+  /// 浅色主题里的"很浅"档（普通块）与它的深墨。
+  static const List<Color> paleFills = [
+    Color(0xFFF7E6C4), // 琥珀
+    Color(0xFFF9DED5), // 赭红
+    Color(0xFFDDEBD8), // 鼠尾草
+    Color(0xFFD6E9E6), // 青
+    Color(0xFFDCE6F3), // 蓝
+    Color(0xFFE6E1F2), // 紫
+    Color(0xFFF6DEE4), // 玫瑰
+    Color(0xFFEAE8D0), // 橄榄
+  ];
+
+  static const List<Color> paleInks = [
+    Color(0xFF5A3C0A),
+    Color(0xFF6B2A16),
+    Color(0xFF2F4A2C),
+    Color(0xFF1F4644),
+    Color(0xFF24405F),
+    Color(0xFF3B2C55),
+    Color(0xFF5E2438),
+    Color(0xFF3F4318),
+  ];
+
+  /// 深色档（浅色主题的"本周块" / 深色主题的"普通块"）。
+  static const List<Color> deepFills = [
+    Color(0xFF7A4E12),
+    Color(0xFF7C2E17),
+    Color(0xFF2F4A33),
+    Color(0xFF224745),
+    Color(0xFF29456B),
+    Color(0xFF40305E),
+    Color(0xFF6B2B41),
+    Color(0xFF444A20),
+  ];
+
+  /// 课程名 → 稳定下标（同一门课永远同色）。
+  ///
+  /// 用 31 进制滚动散列 + 掩码，不用 `String.hashCode`：后者**不保证跨进程
+  /// 稳定**（Dart 的实现可变），一旦变了用户会觉得"颜色自己跳了"。
+  /// 空名字（占位 `(未知课程)`）固定落 0。
+  static int indexFor(String courseName) {
+    final name = courseName.trim();
+    if (name.isEmpty) return 0;
+    var hash = 0;
+    for (final unit in name.codeUnits) {
+      hash = (hash * 31 + unit) & 0x7fffffff;
+    }
+    return hash % paletteSize;
+  }
+
+  /// 课块填充色。[highlighted] 为真时取"明度跳变"的另一档。
+  static Color fillFor({
+    required String courseName,
+    required Brightness brightness,
+    required bool highlighted,
+  }) {
+    final i = indexFor(courseName);
+    final pale = paleFills[i];
+    final deep = deepFills[i];
+    // 浅色主题：普通=浅、本周=深；深色主题：普通=深、本周=浅。
+    return brightness == Brightness.dark
+        ? (highlighted ? pale : deep)
+        : (highlighted ? deep : pale);
+  }
+
+  /// 课块文字色（课名与教师/教室/错峰提示共用），与该块填充色成对出现。
+  static Color inkFor({
+    required String courseName,
+    required Brightness brightness,
+    required bool highlighted,
+  }) {
+    final i = indexFor(courseName);
+    final onPale = paleInks[i];
+    return brightness == Brightness.dark
+        ? (highlighted ? onPale : deepInk)
+        : (highlighted ? deepInk : onPale);
+  }
+}
+
 /// 应用主题构造器。
 abstract class AppTheme {
   AppTheme._();

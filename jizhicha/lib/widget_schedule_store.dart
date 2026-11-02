@@ -95,6 +95,7 @@ class WidgetScheduleStore {
           buildPayload(
             courses,
             mode: settings.scheduleTimeMode,
+            peakShift: settings.peakShiftEnabled,
             semesterStartDate: settings.semesterStartDate,
             fallbackWeek: settings.currentWeek,
             now: DateTime.now(),
@@ -120,9 +121,15 @@ class WidgetScheduleStore {
   ///
   /// [courses] 是 `parseScheduleHtml` 的原始课程行；[mode] 是用户在设置页选的模式
   /// （**固定模式必须被尊重**，只有 `automatic` 才按日期切列）；[now] 注入"写入时刻"。
+  ///
+  /// [peakShift] 为真时启用错峰上课表（设置页开关）：第 3、4 小节的时刻改为按该课
+  /// 楼栋取 A/B 组的错峰值（[SchedulePeakShift.groupForRoom]）。
+  /// Kotlin 侧**完全不用改**：`AppWidget.kt` 只按月份在 `springAutumnWinter` /
+  /// `summer` 两列之间选，所以只要把错峰增量算进**两列**，两季读到的都是错峰值。
   static Map<String, dynamic> buildPayload(
     List<Map<String, dynamic>> courses, {
     required ScheduleTimeMode mode,
+    bool peakShift = false,
     String? semesterStartDate,
     int fallbackWeek = 1,
     DateTime? now,
@@ -137,9 +144,31 @@ class WidgetScheduleStore {
       final first = sublessons.first;
       final last = sublessons.last;
 
+      // 错峰只作用于第 3、4 小节；组别由课程楼栋决定（识别不出一律 B 组）。
+      final room = c['room'] as String? ?? '';
+      final peakGroup = peakShift && SchedulePeakShift.affectsLesson(first)
+          ? SchedulePeakShift.groupForRoom(room)
+          : null;
+
       // 落盘两列各自的时刻；`start`/`end` 是与旧版 Kotlin 的唯一衔接点。
-      final base = _lessonBoundary(first, mode, start: true, now: moment);
-      final baseEnd = _lessonBoundary(last, mode, start: false, now: moment);
+      // ⚠️ 固定季节模式下不写 `times`，Kotlin 只能读 `start`/`end`，
+      // 所以错峰增量必须**同时**体现在这两个顶层字段里（否则小组件显示旧时刻）。
+      final base = _lessonBoundary(
+        first,
+        mode,
+        start: true,
+        now: moment,
+        peakShift: peakShift,
+        peakShiftGroup: peakGroup,
+      );
+      final baseEnd = _lessonBoundary(
+        last,
+        mode,
+        start: false,
+        now: moment,
+        peakShift: peakShift,
+        peakShiftGroup: peakGroup,
+      );
       if (base == null || baseEnd == null) continue;
 
       final entry = <String, dynamic>{
@@ -152,7 +181,13 @@ class WidgetScheduleStore {
         'weeks': _expandWeeks(c['weeks'] ?? ''),
       };
       if (mode == ScheduleTimeMode.automatic) {
-        entry['times'] = _timeColumns(first, last, now: moment);
+        entry['times'] = _timeColumns(
+          first,
+          last,
+          now: moment,
+          peakShift: peakShift,
+          peakShiftGroup: peakGroup,
+        );
       }
       widgetCourses.add(entry);
     }
@@ -182,10 +217,15 @@ class WidgetScheduleStore {
   ///
   /// 值一律取自 [ScheduleTimeTable]（作息表的唯一真相），这里只是把它转录成
   /// JSON 字段，**不引入第二份时刻数据**。
+  ///
+  /// [peakShift] / [peakShiftGroup]：错峰开关打开且该课落在第 3、4 小节时，
+  /// **两列都写该组的错峰时刻**（作者口径"错峰是新的时间"，与季节无关）。
   static Map<String, Map<String, String>> _timeColumns(
     int first,
     int last, {
     DateTime? now,
+    bool peakShift = false,
+    SchedulePeakShiftGroup? peakShiftGroup,
   }) {
     // start 取首个小节的开始、end 取末个小节的结束 —— 与 `start`/`end` 快照同一口径。
     // 注意 `now` 必须一透到底：它决定 automatic 模式下"哪一列算快照列"，
@@ -194,7 +234,14 @@ class WidgetScheduleStore {
       int lesson,
       ScheduleTimeMode mode, {
       required bool start,
-    }) => _lessonBoundary(lesson, mode, start: start, now: now);
+    }) => _lessonBoundary(
+      lesson,
+      mode,
+      start: start,
+      now: now,
+      peakShift: peakShift,
+      peakShiftGroup: peakShiftGroup,
+    );
 
     final sawStart = boundary(
       first,
@@ -246,8 +293,16 @@ class WidgetScheduleStore {
     ScheduleTimeMode mode, {
     required bool start,
     DateTime? now,
+    bool peakShift = false,
+    SchedulePeakShiftGroup? peakShiftGroup,
   }) {
-    final full = ScheduleTimeTable.lessonTime(lesson, mode, now: now);
+    final full = ScheduleTimeTable.lessonTime(
+      lesson,
+      mode,
+      now: now,
+      peakShift: peakShift,
+      peakShiftGroup: peakShiftGroup,
+    );
     if (full == null) return null;
     final parts = full.split(RegExp(r'[–-]'));
     if (parts.length != 2) return null;

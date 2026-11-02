@@ -110,6 +110,7 @@ mixin _ScheduleExportSection on _SchedulePageDataSection {
           courses: _courses,
           term: term,
           mode: _s.scheduleTimeMode,
+          peakShift: _s.peakShiftEnabled,
         );
         if (Platform.isAndroid) {
           final cache = await getTemporaryDirectory();

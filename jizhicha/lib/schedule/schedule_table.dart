@@ -2,6 +2,13 @@
 part of 'schedule_page.dart';
 
 mixin _ScheduleTableSection on _SchedulePageDataSection {
+  /// 本次 build 算出来的"一屏显示"行内预算；null = 不压缩（按内容自然高度）。
+  ///
+  /// 只存在于单帧渲染期间：`_buildScheduleTable` 先算好，`_buildTimeCell` /
+  /// `_buildCourseEntry` 在同一个 build 里读它。刻意**不进** `_scheduleLayout()`
+  /// 的缓存键——它由设置与可用高度现算，缓存了反而会拿到上一帧的高度。
+  ScheduleFitPlan? _rowPlan;
+
   // ==================== 课表表格 ====================
 
   /// 把课表渲染成 8 列表格：节次(行) × 周一~周日(列)。
@@ -48,15 +55,39 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
           500.0,
         );
         final tPad = isNarrow ? 4.0 : 8.0;
-        final fSize = isNarrow
+        final baseHeaderSize = isNarrow
             ? AppDimens.scheduleHeaderNarrow
             : AppDimens.scheduleHeaderWide;
         final startDate = DateTime.tryParse(_s.semesterStartDate);
         final weekOffsetDays = (_s.currentWeek - 1) * 7;
-        final numRows = orderedTimes.length + 1;
-        final cellHeight = pure && numRows > 0
-            ? (constraints.maxHeight - 2) / numRows
-            : null;
+        // 「一屏显示」：把**实际行数**（数据行 + 1 行表头，不补空大节）按可用
+        // 高度等分压缩，字号随行高降档。决策与验算都在 ScheduleFitLayout(
+        // 纯函数，单测直接调)。开关关闭 ⇒ compressed=false，回到改造前的
+        // "按内容自然高度 + 纵向滚动"。
+        final plan = ScheduleFitLayout.plan(
+          enabled: _s.fitToScreenEnabled,
+          // 扣掉表格外层 Padding 的上下内边距（pure 下为 0）与 1px 余量，
+          // 否则算出来的总高会比可用高度多出一点点，屏幕底部永远露半行。
+          availableHeight: constraints.maxHeight - (pure ? 0 : 24) - 1,
+          dataRows: orderedTimes.length,
+          narrow: isNarrow,
+          // 课表区域被 clamp 到 1.3 倍，按实际上限做预算（不是按 1.0）。
+          outerTextScale: MediaQuery.textScalerOf(context).scale(1).clamp(1, 1.3),
+          blockPaddingVertical: _courseTextPadding.vertical,
+          blockBottomMargin:
+              ScheduleCellLayout.blockMargin(_s.courseCellFill)?.bottom ?? 0,
+        );
+        _rowPlan = plan.compressed ? plan : null;
+        final cellHeight = plan.rowHeight;
+        final fSize = (baseHeaderSize * plan.textScale)
+            .clamp(9.0, baseHeaderSize)
+            .toDouble();
+
+        // 表头不需要一整行那么高：压缩态给它一个固定矮高度，省下来的
+        // 高度全部让给数据行（见 ScheduleFitLayout.headerRowHeight）。
+        final headerCellHeight = plan.compressed
+            ? ScheduleFitLayout.headerRowHeight * plan.textScale
+            : cellHeight;
 
         final tableRows = <TableRow>[];
         for (var rowIndex = 0; rowIndex < orderedTimes.length; rowIndex++) {
@@ -156,7 +187,11 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
                           ).colorScheme.surfaceContainerHighest.withAlpha(180),
                         ),
                         children: [
-                          _buildHeaderCell('节', fontSize: fSize, cellHeight: cellHeight),
+                          _buildHeaderCell(
+                            '节',
+                            fontSize: fSize,
+                            cellHeight: headerCellHeight,
+                          ),
                           for (var i = 0; i < dayOrder.length; i++)
                             _buildHeaderCell(
                               isNarrow ? dayOrder[i][1] : dayOrder[i],
@@ -165,7 +200,7 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
                                 startDate,
                                 weekOffsetDays + i,
                               ),
-                              cellHeight: cellHeight,
+                              cellHeight: headerCellHeight,
                             ),
                         ],
                       ),
@@ -230,14 +265,48 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
     final match = RegExp(
       r'^(第[一二三四五六七八九十]+(?:大)?节)(?:\s*[（(]([^）)]*)[）)])?',
     ).firstMatch(time);
-    final main = match?.group(1) ?? time;
+    final rawMain = match?.group(1) ?? time;
     final legacySub = match?.group(2) ?? '';
+    // 错峰开关打开时，节次栏「第二大节」这一格显示**基准组（B 组，早下课）**
+    // 的错峰时刻；其余小节照旧走季节表（`peakShift: false` 的那条路径）。
+    // 判据由 SchedulePeakStyle 提供（渲染与单测共用同一份）。
+    final peakShiftCell = SchedulePeakStyle.badgeVisible(
+      enabled: _peakShiftOn,
+      time: time,
+    );
     final sub = ScheduleTimeTable.formatSublessonLines(
       time,
       _s.scheduleTimeMode,
       includeLabels: false,
+      peakShift: peakShiftCell,
     );
     final colorScheme = Theme.of(context).colorScheme;
+    // 能显示几行，由「一屏显示」的行内预算决定（_rowPlan）：
+    //  - 压缩态：按行高算出来的 showTimeSub / showPeakBadge；
+    //  - 非压缩态：回到改造前的口径 —— 有 cellHeight（pure 窄屏横屏）就不显示
+    //    副文字，没 cellHeight 才显示。
+    final plan = _rowPlan;
+    // 压缩态（一屏显示）：节次栏只有约 34px 宽，"第一大节"必然折成两行，
+    // 而行内预算（ScheduleFitLayout）只算了 **一行** 大节名 —— 多出来的
+    // 那一行就是"五大节挤在一起"的直接原因。压缩态只留序号单字。
+    final main = plan == null ? rawMain : _compactPeriodLabel(rawMain);
+    final textScale = plan?.textScale ?? 1.0;
+    final showSub = plan?.showTimeSub ?? (cellHeight == null);
+    final showBadge = plan?.showPeakBadge ?? (cellHeight == null);
+    // 压缩态下行高是定死的，而节次列只有约 34px 宽：完整的
+    // "08:20–09:05" 这种区间串会被折成三行再被 ellipsis 截成
+    // "08:20 - 0…"。所以压缩态只保留「大节起 → 大节止」两行短文本。
+    // 非压缩态维持改造前的口径（原样多行），由纵向滚动兜底。
+    final rawSub = sub.isNotEmpty ? sub : legacySub;
+    final displaySub = plan == null ? rawSub : _compactTimeSpan(rawSub);
+    final mainSize = (isNarrow
+            ? AppDimens.timeCellMainNarrow
+            : AppDimens.timeCellMainWide) *
+        textScale;
+    final subSize = (isNarrow
+            ? AppDimens.timeCellSubNarrow
+            : AppDimens.timeCellSubWide) *
+        textScale;
     return Container(
       height: cellHeight,
       padding: EdgeInsets.symmetric(
@@ -255,29 +324,59 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
             main,
             style: TextStyle(
               fontWeight: FontWeight.w700,
-              fontSize: isNarrow
-                  ? AppDimens.timeCellMainNarrow
-                  : AppDimens.timeCellMainWide,
+              fontSize: mainSize,
               color: colorScheme.onSurface,
             ),
           ),
-          if (cellHeight == null && (sub.isNotEmpty || legacySub.isNotEmpty)) ...[
+          if (showSub && displaySub.isNotEmpty) ...[
             const SizedBox(height: 2),
             Text(
-              sub.isNotEmpty ? sub : legacySub,
+              displaySub,
               textAlign: TextAlign.center,
+              // 压缩态下行高是定死的，必须把行数钉住（一个大节固定两个小节
+              // ⇒ 最多两行），否则多出来的行会把整行撑破。
+              maxLines: plan == null ? null : 2,
+              overflow: plan == null ? null : TextOverflow.ellipsis,
               style: TextStyle(
-                fontSize: isNarrow
-                    ? AppDimens.timeCellSubNarrow
-                    : AppDimens.timeCellSubWide,
+                fontSize: subSize,
                 height: 1.25,
                 color: colorScheme.onSurfaceVariant,
               ),
             ),
           ],
+          if (showBadge && peakShiftCell) ...[
+            const SizedBox(height: 2),
+            SchedulePeakBadge(fontSize: subSize * 0.92),
+          ],
         ],
       ),
     );
+  }
+
+  /// 把「两个小节各一行区间」压成「大节起 → 大节止」两行短文本。
+  ///
+  /// 只给「一屏显示」的压缩态用：节次列只有约 34px 宽，完整的区间串
+  /// 放不下会被折行再被 ellipsis 截断，反而看不出时刻。
+  /// "第一大节" / "第三节" → "一" / "三"（压缩态节次栏只留序号单字）。
+  /// 识别不出来就原样返回，不做猜测。
+  String _compactPeriodLabel(String label) {
+    final m = RegExp(r'^第([一二三四五六七八九十]+)(?:大)?节$')
+        .firstMatch(label);
+    return m?.group(1) ?? label;
+  }
+
+  String _compactTimeSpan(String raw) {
+    final lines = raw
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+    if (lines.isEmpty) return '';
+    if (lines.length == 1) return lines.first;
+    final first = lines.first.split(RegExp(r'[–-]')).first.trim();
+    final last = lines.last.split(RegExp(r'[–-]')).last.trim();
+    if (first.isEmpty || last.isEmpty) return lines.first;
+    return '$first\n$last';
   }
 
   /// 渲染一个 (节次, 星期) 单元格。
@@ -345,8 +444,10 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
       }
     }
 
+    // 格子底色形状：filled（默认）时 cell 内边距归零，让课块底色铺满整格；
+    // rounded 时保留历史外观。见 [_cellPadding] 关于 pure 模式补偿的说明。
     return Container(
-      padding: EdgeInsets.all(cellHeight == null ? 6 : 2),
+      padding: _cellPadding(cellHeight),
       height: cellHeight,
       constraints: cellHeight == null
           ? BoxConstraints(minHeight: AppDimens.scheduleCellMinHeight)
@@ -406,7 +507,7 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
     return Material(
       color: Colors.transparent,
       child: InkWell(
-        borderRadius: BorderRadius.circular(9),
+        borderRadius: _cellBlockRadius(radius: 9),
         onTap: () => _showConflictDialog(courses),
         child: Container(
           padding: const EdgeInsets.fromLTRB(7, 7, 6, 7),
@@ -416,8 +517,9 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
             // —— 描边会和格内其它块、以及整格高亮的方框叠在一起"多重发亮"。
             // 底色用 errorContainer 略微加强，补偿去掉红条后损失的醒目度。
             color: colorScheme.errorContainer.withAlpha(110),
-            // 圆角与课程块统一为 8（此前这里是 9，两种块圆角不一致显得毛糙）。
-            borderRadius: BorderRadius.circular(8),
+            // 圆角与课程块统一为 8（此前这里是 9，两种块圆角不一致显得毛糙）；
+            // 格子底色选"铺满"时一起变方，见 [_cellBlockRadius]。
+            borderRadius: _cellBlockRadius(),
           ),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.start,
@@ -540,120 +642,56 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
     );
   }
 
+  /// 课块内部文字的内边距：横向固定，纵向在 pure（窄屏横屏）下压到 3。
+  ///
+  /// ⚠️ 这个值与「格子底色形状」设置**无关**。作者要的是"底色铺满"，
+  /// 不是"文字贴边"——`ScheduleCellFill.filled` 只把 cell padding / 块 margin /
+  /// borderRadius 归零，文字仍然留这圈呼吸位。
+  EdgeInsets get _courseTextPadding =>
+      ScheduleCellLayout.textPaddingFor(pure: _isPureViewport);
+
+  /// 当前是否处于 pure（窄屏 + 横屏）紧凑形态。
+  bool get _isPureViewport =>
+      MediaQuery.sizeOf(context).shortestSide < 600 &&
+      MediaQuery.orientationOf(context) == Orientation.landscape;
+
+  /// 单元格内边距。实现见 [ScheduleCellLayout.cellPadding]（渲染层与单测共用
+  /// 同一份决策，避免测试只能复刻数字）。
+  EdgeInsets _cellPadding(double? cellHeight) =>
+      ScheduleCellLayout.cellPadding(_s.courseCellFill, cellHeight);
+
+  /// 格子内块状元素（课程块／冲突块）的圆角。
+  /// 实现见 [ScheduleCellLayout.blockRadius]（`filled` ⇒ null ⇒ 方角铺满）。
+  BorderRadius? _cellBlockRadius({double radius = 8}) =>
+      ScheduleCellLayout.blockRadius(_s.courseCellFill, radius: radius);
+
+  /// 是否开启错峰上课表（设置页开关）。渲染层统一从这里取。
+  bool get _peakShiftOn => _s.peakShiftEnabled;
+
   /// 渲染一个课程块。
   ///
   /// [highlighted] 表示**这一个课块**属于"本周"（由它所在簇的
-  /// [_ScheduleCluster.highlighted] 决定，见 [_ScheduleCellData.compute]）。
-  /// 它是本块**唯一**的高亮手段：只把同一块底色加深，不画任何边框 ——
-  /// 这样高亮永远只作用在一个元素上，不会出现"整格一层 + 课块一层"的
-  /// 双重发亮（用户明确反馈过那种观感很差）。
+  /// [_ScheduleCluster.highlighted] 决定）。它是本块**唯一**的高亮手段：
+  /// 只把同一块底色加深，不画任何边框 —— 这样高亮永远只作用在一个元素上，
+  /// 不会出现"整格一层 + 课块一层"的双重发亮（用户明确反馈过那种观感很差）。
+  ///
+  /// 具体绘制搬到公开 widget [ScheduleCourseBlock]（见该文件头部的理由：
+  /// part 的私有方法测不到，而"点击课块 → 弹课程详情"必须被 widget 测试点到）。
+  /// **参数列表与返回类型保持不变**：本文件其它地方、以及 3 个既有测试文件
+  /// 都按 `(course, [isNarrow, highlighted])` 这个形状依赖它。
   Widget _buildCourseEntry(
     Map<String, String> c, [
     bool isNarrow = false,
     bool highlighted = false,
   ]) {
-    final name = (c['name'] ?? '').trim();
-    final teacher = (c['teacher'] ?? '').trim();
-    final room = (c['room'] ?? '').trim();
-    final pure =
-        MediaQuery.sizeOf(context).shortestSide < 600 &&
-        MediaQuery.orientationOf(context) == Orientation.landscape;
-    final colorScheme = Theme.of(context).colorScheme;
-    final isDark = colorScheme.brightness == Brightness.dark;
-    // 课程块配色：**全表没有任何边框**，只用"整块底色"表达。
-    //
-    // 演进留档（用户连续三轮反馈，这段历史值得留着，避免又绕回去）：
-    //   ① "只画左边"的 3px 主色竖条 → 像括号残片、还占位置；
-    //   ② 整格填充 + 格内块描边 → 两个圆角矩形嵌套同时发亮，"观感很差"；
-    //   ③ 整格 2px 琥珀色加粗方框 → "太丑，几个框重叠在一起"
-    //      （按格画框时相邻格边框必然紧挨成双线，这是该画法无法避免的）。
-    // 最终方案：**格级不画任何装饰**，高亮只作用在课块自己的底色上。
-    //
-    // 层次来自**色相差**而不是同一颜色的深浅差：
-    //   本周块  = primaryContainer（主题的暖色容器：浅=beige / 深=#5C4D2A）
-    //   普通块  = surfaceContainerHighest（同主题的中性暖灰：浅=creamDark / 深=darkSurface）
-    // 为什么不用"同一色不同 alpha"：默认开着「按周筛选」时，表里显示的全部都是
-    // 本周课，深浅差会退化成整表同色、看不出任何层次；而"暖 ↔ 中性"的差异在
-    // 整表同属本周时依然是**统一且好看**的一套色，不会显得扁平。
-    // 两个色都取自主题色板，所以自动跟随深浅主题、不存在"不搭"。
-    final courseFill = highlighted
-        ? colorScheme.primaryContainer
-        : colorScheme.surfaceContainerHighest;
-    /// 次要文字（教师/教室/占位课名）。
-    ///
-    /// 按实测对比度选（AA 门槛 4.5:1）：
-    ///   浅色：两种底上都只有 `onPrimaryContainer`(#5A5348) 够 —
-    ///         creamDark 6.7:1 / beige 5.8:1；`onSurfaceVariant`(#756D62)
-    ///         在 beige 上只有 3.9:1，不达标。
-    ///   深色：中性底用 `onSurfaceVariant`(#B8A98F) 6.6:1；
-    ///         暖底(#5C4D2A)上它只剩 3.6:1，必须换 `onPrimaryContainer`(#F2E8D5) 6.8:1。
-    final courseSubText = (!isDark || highlighted)
-        ? colorScheme.onPrimaryContainer
-        : colorScheme.onSurfaceVariant;
-    final textDelta = (_s.scheduleTextSize - 1).toDouble();
-    final nameSize = (isNarrow
-            ? AppDimens.courseNameNarrow
-            : AppDimens.courseNameWide) +
-        textDelta;
-    final subSize = (isNarrow
-            ? AppDimens.courseSubNarrow
-            : AppDimens.courseSubWide) +
-        textDelta;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 2),
-      padding: EdgeInsets.fromLTRB(7, pure ? 3 : 6, 6, pure ? 3 : 6),
-      decoration: BoxDecoration(
-        color: courseFill,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(
-            name.isNotEmpty ? name : '(未知课程)',
-            softWrap: !pure,
-            maxLines: pure ? 1 : null,
-            overflow: pure ? TextOverflow.ellipsis : null,
-            style: TextStyle(
-              fontWeight: FontWeight.w700,
-              fontSize: nameSize,
-              height: 1.25,
-              color: name.isNotEmpty ? colorScheme.onSurface : courseSubText,
-            ),
-          ),
-          if (teacher.isNotEmpty)
-            Padding(
-              padding: EdgeInsets.only(top: pure ? 1 : 2),
-              child: Text(
-                '@$teacher',
-                softWrap: !pure,
-                maxLines: pure ? 1 : null,
-                overflow: pure ? TextOverflow.ellipsis : null,
-                style: TextStyle(
-                  fontSize: subSize,
-                  height: 1.2,
-                  color: courseSubText,
-                ),
-              ),
-            ),
-          if (room.isNotEmpty)
-            Padding(
-              padding: EdgeInsets.only(top: pure ? 1 : 2),
-              child: Text(
-                room,
-                softWrap: !pure,
-                maxLines: pure ? 1 : null,
-                overflow: pure ? TextOverflow.ellipsis : null,
-                style: TextStyle(
-                  fontSize: subSize,
-                  height: 1.2,
-                  color: courseSubText,
-                ),
-              ),
-            ),
-        ],
-      ),
+    return ScheduleCourseBlock(
+      course: c,
+      isNarrow: isNarrow,
+      highlighted: highlighted,
+      settings: _s,
+      // 一屏压缩的行内预算：决定字号档位、课名行数、还要不要显示
+      // 教师/教室/错峰提示。null ⇒ 按内容自然高度。
+      density: _rowPlan,
     );
   }
 }
