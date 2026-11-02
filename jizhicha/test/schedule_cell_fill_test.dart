@@ -98,7 +98,7 @@ void main() {
   /// 「8 列 × [numRows] 行」的课表：节次栏 + 周一~周日，唯一课程块直挂 cell
   /// （单块时不套 Column —— `:379-386` 的留档：套 Column 会把圆角底色缩回去）。
   ///
-  /// [A 组课]（`room: '逸夫楼908'`）在非 pure 下会多出一行错峰提示；
+  /// [A 组课]（`room: '逸夫楼901'`）在非 pure 下会多出一行错峰提示；
   /// pure 下提示被刻意隐藏（`_buildCourseEntry` 里 `pure ? null : ...`），
   /// 本函数复刻同一条件。
   Widget replicaTable({
@@ -424,7 +424,7 @@ void main() {
 
     Map<String, dynamic> course({
       String time = '（03小节）',
-      String room = '逸夫楼908',
+      String room = '逸夫楼901',
       String day = '周一',
     }) => {
       'day': day,
@@ -472,7 +472,7 @@ void main() {
 
     test('开关打开：B 组（明德楼）第 3 小节两季列都是 10:10–10:55', () {
       final payload = build(
-        [course(room: '明德楼903（会议室）')],
+        [course(room: '明德楼901（会议室）')],
         peakShift: true,
         now: DateTime(2026, 1, 15),
       );
@@ -485,7 +485,7 @@ void main() {
     });
 
     test('开关打开：识别不出的楼栋走 B 组（早下课）', () {
-      final times = timesOf(build([course(room: '理科楼101')], peakShift: true));
+      final times = timesOf(build([course(room: '理科楼901')], peakShift: true));
       expect(times['springAutumnWinter'], {
         'start': early3Start,
         'end': early3End,
@@ -559,7 +559,7 @@ void main() {
 
     test('错峰只按该课自己的楼栋分组：同一次写入里 A/B 两组可以并存', () {
       final payload = build([
-        course(room: '逸夫楼908'),
+        course(room: '逸夫楼901'),
         course(room: '明德楼903', day: '周二'),
       ], peakShift: true);
       final list = payload['courses'] as List;

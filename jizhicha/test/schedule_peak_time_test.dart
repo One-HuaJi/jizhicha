@@ -268,28 +268,28 @@ void main() {
   group('楼名 → 分组：精确匹配，识别不出一律 B 组（早下课）', () {
     test('命中 A 组名单：逸夫楼（含教室号）走晚下课组', () {
       expect(
-        SchedulePeakShift.buildingOf('逸夫楼908'),
+        SchedulePeakShift.buildingOf('逸夫楼901'),
         '逸夫楼',
       );
       expect(
-        SchedulePeakShift.groupForRoom('逸夫楼908'),
+        SchedulePeakShift.groupForRoom('逸夫楼901'),
         SchedulePeakShiftGroup.late,
       );
     });
 
     test('明德楼属 B 组（早下课），带括号后缀也要正确剥掉', () {
       expect(
-        SchedulePeakShift.buildingOf('明德楼903（会议室）'),
+        SchedulePeakShift.buildingOf('明德楼901（会议室）'),
         '明德楼',
       );
       expect(
-        SchedulePeakShift.groupForRoom('明德楼903（会议室）'),
+        SchedulePeakShift.groupForRoom('明德楼901（会议室）'),
         SchedulePeakShiftGroup.early,
       );
     });
 
     test('识别不出来的地点一律走早下课组（B 组）', () {
-      for (final room in ['教A901', '理科楼101', '', '  ', '田径场', null]) {
+      for (final room in ['教A901', '理科楼901', '', '  ', '田径场', null]) {
         expect(
           SchedulePeakShift.groupForRoom(room),
           SchedulePeakShiftGroup.early,

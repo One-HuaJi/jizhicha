@@ -250,13 +250,13 @@ void main() {
       <tr>
         <th>第一大节<br>(01,02小节)</th>
         <td>
-          <div class="kbcontent1">分子生物学<br/><font title='周次(节次)'>1-12(周)</font><br/><font title='教室'>逸夫楼908</font><br/></div>
-          <div style="display: none;" class="kbcontent" >分子生物学<br/><font title='教师'>张三,李四</font><br/><font title='周次(节次)'>1-12(周)[01-02节]</font><br/><font title='教室'>逸夫楼908</font><br/></div>
+          <div class="kbcontent1">示例课程甲<br/><font title='周次(节次)'>1-12(周)</font><br/><font title='教室'>逸夫楼901</font><br/></div>
+          <div style="display: none;" class="kbcontent" >示例课程甲<br/><font title='教师'>张三,李四</font><br/><font title='周次(节次)'>1-12(周)[01-02节]</font><br/><font title='教室'>逸夫楼901</font><br/></div>
           <div style="display:none;" class="kbcontent" ></div>
         </td>
         <td>
-          <div class="kbcontent1">高等数学D（二）<br/><font title='周次(节次)'>1-10(周)</font><br/><font title='教室'>逸夫楼908</font><br/>----------------------<br>遗传学<br/><font title='周次(节次)'>1-10(周)</font><br/><font title='教室'>逸夫楼903</font><br/>----------------------<br>形势与政策（四）<br/><font title='周次(节次)'>11-12(周)</font><br/><font title='教室'>明德楼903（会议室）</font><br/></div>
-          <div style="display: none;" class="kbcontent">高等数学D（二）<br/><font title='教师'>赵六</font><br/><font title='周次(节次)'>1-10(周)[01-02节]</font><br/><font title='教室'>逸夫楼908</font><br/>---------------------<br>遗传学<br/><font title='教师'>王五</font><br/><font title='周次(节次)'>1-10(周)[01-02节]</font><br/><font title='教室'>逸夫楼903</font><br/>---------------------<br>形势与政策（四）<br/><font title='教师'>钱七</font><br/><font title='周次(节次)'>11-12(周)[01-02节]</font><br/><font title='教室'>明德楼903（会议室）</font><br/></div>
+          <div class="kbcontent1">示例课程乙<br/><font title='周次(节次)'>1-10(周)</font><br/><font title='教室'>逸夫楼901</font><br/>----------------------<br>示例课程丙<br/><font title='周次(节次)'>1-10(周)</font><br/><font title='教室'>逸夫楼902</font><br/>----------------------<br>示例课程丁<br/><font title='周次(节次)'>11-12(周)</font><br/><font title='教室'>明德楼901（会议室）</font><br/></div>
+          <div style="display: none;" class="kbcontent">示例课程乙<br/><font title='教师'>王五</font><br/><font title='周次(节次)'>1-10(周)[01-02节]</font><br/><font title='教室'>逸夫楼901</font><br/>---------------------<br>示例课程丙<br/><font title='教师'>赵六</font><br/><font title='周次(节次)'>1-10(周)[01-02节]</font><br/><font title='教室'>逸夫楼902</font><br/>---------------------<br>示例课程丁<br/><font title='教师'>钱七</font><br/><font title='周次(节次)'>11-12(周)[01-02节]</font><br/><font title='教室'>明德楼901（会议室）</font><br/></div>
           <div style="display:none;" class="kbcontent" ></div>
         </td>
         <td></td><td></td><td></td><td></td><td></td>
@@ -274,23 +274,23 @@ void main() {
 
     test('kbcontent1 提供名/室/周，隐藏详情卡提供教师（单引号可被解析）', () {
       final courses = parseScheduleHtml(html);
-      final mol = find(courses, '分子生物学');
+      final mol = find(courses, '示例课程甲');
       expect(mol['day'], '周一');
-      expect(mol['room'], '逸夫楼908');
+      expect(mol['room'], '逸夫楼901');
       expect(mol['weeks'], '1-12(周)');
       expect(mol['teacher'], '张三,李四'); // 来自 display:none 详情卡
     });
 
     test('周二 3 门冲突/非冲突课都带教师', () {
       final courses = parseScheduleHtml(html);
-      expect(find(courses, '高等数学D（二）')['teacher'], '赵六');
-      expect(find(courses, '遗传学')['teacher'], '王五');
-      expect(find(courses, '形势与政策（四）')['teacher'], '钱七');
-      expect(find(courses, '形势与政策（四）')['weeks'], '11-12(周)');
+      expect(find(courses, '示例课程乙')['teacher'], '王五');
+      expect(find(courses, '示例课程丙')['teacher'], '赵六');
+      expect(find(courses, '示例课程丁')['teacher'], '钱七');
+      expect(find(courses, '示例课程丁')['weeks'], '11-12(周)');
     });
 
-    test('周二格在第11周筛选后只保留形势与政策，高数/遗传学被隐藏', () {
-      // 同格 3 门课：高数/遗传学 1-10 周，形势与政策 11-12 周。
+    test('周二格在第11周筛选后只保留示例课程丁，高数/示例课程丙被隐藏', () {
+      // 同格 3 门课：高数/示例课程丙 1-10 周，示例课程丁 11-12 周。
       final courses = parseScheduleHtml(html);
       final tue = courses.where((c) => c['day'] == '周二').toList();
       expect(tue.length, 3);
@@ -298,7 +298,7 @@ void main() {
           .where((c) => weekInWeeks(c['weeks'] ?? '', 11))
           .toList();
       expect(week11.length, 1);
-      expect(week11.first['name'], '形势与政策（四）');
+      expect(week11.first['name'], '示例课程丁');
     });
   });
 
@@ -316,17 +316,17 @@ void main() {
     });
 
     test('冲突课程按周筛选：第11周只显示当周有课课程', () {
-      // 模拟真实场景：同一格有 1-10 周的高数 和 11-12 周的形势与政策
+      // 模拟真实场景：同一格有 1-10 周的高数 和 11-12 周的示例课程丁
       final courses = [
         {'name': '高等数学', 'weeks': '1-10(周)'},
-        {'name': '形势与政策', 'weeks': '11-12(周)'},
+        {'name': '示例课程丁', 'weeks': '11-12(周)'},
       ];
       final week11 = courses
           .where((c) => weekInWeeks(c['weeks']!, 11))
           .toList();
       // 第11周不应再显示 1-10 周的高数（这是用户报告的 bug）
       expect(week11.any((c) => c['name'] == '高等数学'), isFalse);
-      expect(week11.any((c) => c['name'] == '形势与政策'), isTrue);
+      expect(week11.any((c) => c['name'] == '示例课程丁'), isTrue);
     });
   });
 
@@ -356,17 +356,17 @@ void main() {
       final week11 = courses
           .where((c) => weekInWeeks(c['weeks'] ?? '', 11))
           .toList();
-      // 高等数学D（二）实际周次为 1-10 周，第11周必须被过滤掉
+      // 示例课程乙实际周次为 1-10 周，第11周必须被过滤掉
       expect(
         week11.any((c) => (c['name'] ?? '').contains('高等数学')),
         isFalse,
         reason: '第11周不应显示 1-10 周的高数',
       );
-      // 形势与政策（四）11-12 周在第11周应保留
+      // 示例课程丁11-12 周在第11周应保留
       expect(
-        week11.any((c) => (c['name'] ?? '').contains('形势与政策')),
+        week11.any((c) => (c['name'] ?? '').contains('示例课程丁')),
         isTrue,
-        reason: '第11周应保留 11-12 周的形势与政策',
+        reason: '第11周应保留 11-12 周的示例课程丁',
       );
     }, skip: html == null ? '本地无真实导出文件' : false);
   });

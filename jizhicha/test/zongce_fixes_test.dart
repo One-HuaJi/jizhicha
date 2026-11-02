@@ -165,7 +165,7 @@ void main() {
     test('单科也能正确生成两行', () {
       final r = buildAcademicAuto([
         {
-          'course': '生态学',
+          'course': '示例课程A',
           'courseType': '专业教育课程（必修）',
           'term': 't',
           'grade': '88',
@@ -173,7 +173,7 @@ void main() {
       ]);
       final lines = r.describeCalculation(fmtNum).split('\n');
       expect(lines[0], '共 1 科，（88）/1 = 88');
-      expect(lines[1], '生态学 88');
+      expect(lines[1], '示例课程A 88');
     });
 
     test('无有效课程时返回空串（不生成残缺文案）', () {

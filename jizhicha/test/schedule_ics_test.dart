@@ -9,7 +9,7 @@ void main() {
         {
           'name': '高等数学',
           'teacher': '张老师',
-          'room': '理科楼101',
+          'room': '理科楼901',
           'weeks': '1-2(周)',
           'day': '1', // 周一
           'time': '第一大节 (01,02小节)',
@@ -26,7 +26,7 @@ void main() {
       expect(ics, contains('VERSION:2.0'));
       expect(ics, contains('PRODID:-//One-HuaJi//Jizhicha Campus Helper//CN'));
       expect(ics, contains('SUMMARY:高等数学'));
-      expect(ics, contains('LOCATION:理科楼101'));
+      expect(ics, contains('LOCATION:理科楼901'));
       expect(ics, contains('教师：张老师'));
       expect(ics, contains('第 1 周 (第 1-2 节)'));
       expect(ics, contains('第 2 周 (第 1-2 节)'));

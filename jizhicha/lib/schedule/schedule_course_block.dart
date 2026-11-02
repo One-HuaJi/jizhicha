@@ -67,7 +67,7 @@ class ScheduleCourseBlock extends StatelessWidget {
     final nameMaxLines = plan?.nameMaxLines ?? 1;
     // 压缩态（一屏显示、竖屏）：**纵向折行 + 整体等比缩小**，不再用"单行+省略号"。
     // 实测 7 天并列时一块只有约 32~37 逻辑像素宽，课名一行只放得下 3 个汉字，
-    // 单行省略号必然把「逸夫楼907」「中学学科课程标准与教材研究」砍掉
+    // 单行省略号必然把「逸夫楼903」「一门名字很长的课程」砍掉
     // （作者 2026-11-02："还会存在显示不完全的问题"）。
     // pure（窄屏横屏）保持原口径：那一行本来就只有一行的高度。
     final wrapCompact = plan != null && !pure;
