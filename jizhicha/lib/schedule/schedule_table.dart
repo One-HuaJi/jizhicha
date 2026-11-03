@@ -300,8 +300,14 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
     final rawSub = sub.isNotEmpty ? sub : legacySub;
     // 作者 2026-11-03：节次栏要显示**每个小节自己的**完整区间
     // （`08:20–09:05` 换行 `09:15–10:00`），而不是"大节起→大节止"。
-    // 所以这里不再压缩，原样输出；宽度不够由下面的 FittedBox 等比缩小兜底。
-    final displaySub = rawSub;
+    //
+    // 但 34px 的窄列放不下 `08:20–09:05` 这种 11 字符的整行 —— FittedBox 一缩，
+    // 字号只剩约 5px，肉眼几乎看不清（作者："字太小了，允许分段"）。
+    // 所以这里**允许分段**：把区间的连接号换成换行，每行只放 5 个字符
+    // （`08:20` / `09:05`），字号就能保持原尺寸，不再被压缩。
+    final displaySub = rawSub
+        .replaceAll('–', '\n')
+        .replaceAll('—', '\n');
     final mainSize = (isNarrow
             ? AppDimens.timeCellMainNarrow
             : AppDimens.timeCellMainWide) *
@@ -333,9 +339,9 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
           ),
           if (showSub && displaySub.isNotEmpty) ...[
             const SizedBox(height: 2),
-            // 34px 的窄列放不下 `08:20–09:05` 这种 11 字符的区间，
-            // 用 FittedBox 等比缩小 —— **绝不能用 ellipsis**，那会把时刻
-            // 截成 `08:20 - 0…`（2026-11-01 踩过）。
+            // 已经按 5 字符一段分好行，正常字号就能放下；FittedBox 只作为
+            // 极端情况（超大系统字号）的兜底，平时不参与缩放。
+            // **绝不能用 ellipsis** —— 那会把时刻截成 `08:20 - 0…`（2026-11-01 踩过）。
             SizedBox(
               width: double.infinity,
               child: FittedBox(
@@ -343,9 +349,11 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
                 child: Text(
                   displaySub,
                   textAlign: TextAlign.center,
+                  maxLines: 8,
                   style: TextStyle(
                     fontSize: subSize,
-                    height: 1.25,
+                    height: 1.22,
+                    fontWeight: FontWeight.w500,
                     color: colorScheme.onSurfaceVariant,
                   ),
                 ),
