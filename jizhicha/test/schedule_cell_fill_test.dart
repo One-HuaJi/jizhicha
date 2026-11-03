@@ -528,12 +528,18 @@ void main() {
       );
     });
 
-    test('开关打开：不受错峰影响的小节（第 1 小节）载荷一字不变', () {
+    // 合同变更（作者 2026-11-03：「错峰模式下第一节课冬夏都是一个时间」）：
+    // 错峰表只有春秋冬季口径，所以开关打开后整张表按春秋冬季算，
+    // 第 1 小节不再跟随夏季列变成 08:10。
+    test('开关打开：第 1 小节冬夏同一个时间（08:20–09:05）', () {
       final off = timesOf(build([course(time: '（01小节）')]));
       final on = timesOf(build([course(time: '（01小节）')], peakShift: true));
-      expect(on, off, reason: '错峰只作用于第 3、4 小节，第 1 小节必须纹丝不动');
+      // 关：跟随季节。
       expect(off['springAutumnWinter'], {'start': '08:20', 'end': '09:05'});
       expect(off['summer'], {'start': '08:10', 'end': '08:55'});
+      // 开：两列一致，冬夏同一个时间。
+      expect(on['springAutumnWinter'], {'start': '08:20', 'end': '09:05'});
+      expect(on['summer'], {'start': '08:20', 'end': '09:05'});
     });
 
     test('固定季节模式不写 times，但顶层 start/end 必须已含错峰增量', () {

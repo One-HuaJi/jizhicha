@@ -271,6 +271,13 @@ class ScheduleTimeTable {
         peakShiftGroup ?? SchedulePeakShift.baselineGroup,
       );
       if (shifted != null) return shifted;
+      // 暂行办法（作者 2026-10-08 定、2026-11-03 再次确认）：错峰表只有
+      // **春秋冬季**口径，所以开了错峰就整体按春秋冬季看。
+      // 绝不能回落到夏季列 —— 夏季上午比春秋冬季早 10 分钟
+      // （08:10–08:55 / 09:05–09:50），混进来就会出现"错峰模式下
+      // 第一大节变成 8:10"这种自相矛盾的显示。
+      return _lessonTimes[lesson]
+          ?.forMode(ScheduleTimeMode.springAutumnWinter, now: now);
     }
     return _lessonTimes[lesson]?.forMode(mode, now: now);
   }

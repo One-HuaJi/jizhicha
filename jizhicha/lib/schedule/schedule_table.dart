@@ -298,7 +298,10 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
     // "08:20 - 0…"。所以压缩态只保留「大节起 → 大节止」两行短文本。
     // 非压缩态维持改造前的口径（原样多行），由纵向滚动兜底。
     final rawSub = sub.isNotEmpty ? sub : legacySub;
-    final displaySub = plan == null ? rawSub : _compactTimeSpan(rawSub);
+    // 作者 2026-11-03：节次栏要显示**每个小节自己的**完整区间
+    // （`08:20–09:05` 换行 `09:15–10:00`），而不是"大节起→大节止"。
+    // 所以这里不再压缩，原样输出；宽度不够由下面的 FittedBox 等比缩小兜底。
+    final displaySub = rawSub;
     final mainSize = (isNarrow
             ? AppDimens.timeCellMainNarrow
             : AppDimens.timeCellMainWide) *
@@ -330,17 +333,22 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
           ),
           if (showSub && displaySub.isNotEmpty) ...[
             const SizedBox(height: 2),
-            Text(
-              displaySub,
-              textAlign: TextAlign.center,
-              // 压缩态下行高是定死的，必须把行数钉住（一个大节固定两个小节
-              // ⇒ 最多两行），否则多出来的行会把整行撑破。
-              maxLines: plan == null ? null : 2,
-              overflow: plan == null ? null : TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: subSize,
-                height: 1.25,
-                color: colorScheme.onSurfaceVariant,
+            // 34px 的窄列放不下 `08:20–09:05` 这种 11 字符的区间，
+            // 用 FittedBox 等比缩小 —— **绝不能用 ellipsis**，那会把时刻
+            // 截成 `08:20 - 0…`（2026-11-01 踩过）。
+            SizedBox(
+              width: double.infinity,
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(
+                  displaySub,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: subSize,
+                    height: 1.25,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
               ),
             ),
           ],
@@ -353,30 +361,13 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
     );
   }
 
-  /// 把「两个小节各一行区间」压成「大节起 → 大节止」两行短文本。
-  ///
-  /// 只给「一屏显示」的压缩态用：节次列只有约 34px 宽，完整的区间串
-  /// 放不下会被折行再被 ellipsis 截断，反而看不出时刻。
+
+
   /// "第一大节" / "第三节" → "一" / "三"（压缩态节次栏只留序号单字）。
   /// 识别不出来就原样返回，不做猜测。
   String _compactPeriodLabel(String label) {
-    final m = RegExp(r'^第([一二三四五六七八九十]+)(?:大)?节$')
-        .firstMatch(label);
+    final m = RegExp(r'^第([一二三四五六七八九十]+)(?:大)?节$').firstMatch(label);
     return m?.group(1) ?? label;
-  }
-
-  String _compactTimeSpan(String raw) {
-    final lines = raw
-        .split('\n')
-        .map((line) => line.trim())
-        .where((line) => line.isNotEmpty)
-        .toList();
-    if (lines.isEmpty) return '';
-    if (lines.length == 1) return lines.first;
-    final first = lines.first.split(RegExp(r'[–-]')).first.trim();
-    final last = lines.last.split(RegExp(r'[–-]')).last.trim();
-    if (first.isEmpty || last.isEmpty) return lines.first;
-    return '$first\n$last';
   }
 
   /// 渲染一个 (节次, 星期) 单元格。

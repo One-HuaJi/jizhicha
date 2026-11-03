@@ -146,7 +146,10 @@ Write-Host ("脱敏构建目录: {0}" -f $workRoot)
 Write-Step '0.5 源码隐私门禁（按字段形态扫描已跟踪文件）'
 $piiScript = Join-Path $ToolDir 'check_pii.ps1'
 if (Test-Path -LiteralPath $piiScript) {
-    & $piiScript -RepoRoot $RepoRoot
+    # 用独立进程跑：门禁脚本里有大量脚本级变量，跟构建脚本同会话跑会互相污染
+    # （实测在构建脚本里调用会报 "找不到属性 Count"）。
+    $pwshExe = (Get-Process -Id $PID).Path
+    & $pwshExe -NoProfile -File $piiScript -RepoRoot $RepoRoot
     if ($LASTEXITCODE -ne 0) { Write-Err '源码隐私门禁未通过，已中止构建。'; exit 1 }
 } else {
     Write-Warn '未找到 tool/check_pii.ps1，跳过源码隐私门禁（不建议）。'

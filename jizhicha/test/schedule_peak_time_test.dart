@@ -174,7 +174,9 @@ void main() {
       );
     });
 
-    test('automatic 模式跨季节：月份切换只影响错峰范围内的值', () {
+    // 合同变更（作者 2026-11-03）：错峰表只有春秋冬季口径，开关打开后
+    // 整张表按春秋冬季算 —— 第一节课（及其它非 3/4 小节）冬夏同一个时间。
+    test('automatic 模式跨季节：错峰开启后全表按春秋冬季，冬夏同一时间', () {
       for (final lesson in [1, 2, 5, 6, 7, 8, 9, 10, 11]) {
         expect(
           ScheduleTimeTable.lessonTime(
@@ -185,10 +187,10 @@ void main() {
           ),
           ScheduleTimeTable.lessonTime(
             lesson,
-            ScheduleTimeMode.automatic,
+            ScheduleTimeMode.springAutumnWinter,
             now: november,
           ),
-          reason: '11 月（春秋冬季）：第 $lesson 小节不该被错峰改动',
+          reason: '第 $lesson 小节在错峰模式下应等于春秋冬季表',
         );
         expect(
           ScheduleTimeTable.lessonTime(
@@ -200,11 +202,23 @@ void main() {
           ScheduleTimeTable.lessonTime(
             lesson,
             ScheduleTimeMode.automatic,
-            now: june,
+            now: november,
+            peakShift: true,
           ),
-          reason: '6 月（夏季）：第 $lesson 小节不该被错峰改动',
+          reason: '第 $lesson 小节 6 月与 11 月必须同一个时间',
         );
       }
+      // 第 3、4 小节走基准组（B 组，早下课），跨季节也不变。
+      expect(
+        ScheduleTimeTable.lessonTime(3, ScheduleTimeMode.automatic,
+            now: june, peakShift: true),
+        '10:10–10:55',
+      );
+      expect(
+        ScheduleTimeTable.lessonTime(4, ScheduleTimeMode.automatic,
+            now: june, peakShift: true),
+        '11:05–11:50',
+      );
     });
   });
 
