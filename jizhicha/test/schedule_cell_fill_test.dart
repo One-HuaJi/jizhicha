@@ -531,15 +531,15 @@ void main() {
     // 合同变更（作者 2026-11-03：「错峰模式下第一节课冬夏都是一个时间」）：
     // 错峰表只有春秋冬季口径，所以开关打开后整张表按春秋冬季算，
     // 第 1 小节不再跟随夏季列变成 08:10。
-    test('开关打开：第 1 小节冬夏同一个时间（08:20–09:05）', () {
+    test('开关打开：第 1 小节冬夏都固定 08:10–08:55', () {
       final off = timesOf(build([course(time: '（01小节）')]));
       final on = timesOf(build([course(time: '（01小节）')], peakShift: true));
       // 关：跟随季节。
       expect(off['springAutumnWinter'], {'start': '08:20', 'end': '09:05'});
       expect(off['summer'], {'start': '08:10', 'end': '08:55'});
-      // 开：两列一致，冬夏同一个时间。
-      expect(on['springAutumnWinter'], {'start': '08:20', 'end': '09:05'});
-      expect(on['summer'], {'start': '08:20', 'end': '09:05'});
+      // 开：两列一致 —— 错峰表上午第 1 小节固定 8:10（作者 2026-11-03 确认）。
+      expect(on['springAutumnWinter'], {'start': '08:10', 'end': '08:55'});
+      expect(on['summer'], {'start': '08:10', 'end': '08:55'});
     });
 
     test('固定季节模式不写 times，但顶层 start/end 必须已含错峰增量', () {

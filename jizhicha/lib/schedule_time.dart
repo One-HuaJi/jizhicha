@@ -90,6 +90,10 @@ class SchedulePeakShift {
   /// 错峰涉及的唯一大节：第二大节 = 第 3、4 小节。
   static const lessons = <int>[3, 4];
 
+  /// 错峰表里上午第 1、2 小节固定为 08:10–08:55 / 09:05–09:50（与夏季列同值），
+  /// **冬夏完全一致**；下午的节次仍按季节走（作者 2026-11-03 确认）。
+  static const fixedMorningLessons = <int>{1, 2};
+
   /// A 组（晚下课）。名单照抄学校原表。
   static const lateBuildings = <String>[
     '尚美楼',
@@ -271,13 +275,16 @@ class ScheduleTimeTable {
         peakShiftGroup ?? SchedulePeakShift.baselineGroup,
       );
       if (shifted != null) return shifted;
-      // 暂行办法（作者 2026-10-08 定、2026-11-03 再次确认）：错峰表只有
-      // **春秋冬季**口径，所以开了错峰就整体按春秋冬季看。
-      // 绝不能回落到夏季列 —— 夏季上午比春秋冬季早 10 分钟
-      // （08:10–08:55 / 09:05–09:50），混进来就会出现"错峰模式下
-      // 第一大节变成 8:10"这种自相矛盾的显示。
-      return _lessonTimes[lesson]
-          ?.forMode(ScheduleTimeMode.springAutumnWinter, now: now);
+      // 错峰表口径（作者 2026-11-03 最终确认，见 HANDOFF §9.27）：
+      //   * 上午第 1、2 小节**冬夏都一样** —— 固定 08:10–08:55 / 09:05–09:50，
+      //     这两个值与夏季列同值，所以直接取夏季列；
+      //     （我此前误判成"错峰表只有春秋冬季口径"，把第一大节改成了 8:20，
+      //      作者纠正："错峰表是正确的，第一大节改回 8:10"。）
+      //   * 下午（第 5 小节起）**仍随季节变**，所以回落到当前 mode。
+      if (SchedulePeakShift.fixedMorningLessons.contains(lesson)) {
+        return _lessonTimes[lesson]?.forMode(ScheduleTimeMode.summer, now: now);
+      }
+      return _lessonTimes[lesson]?.forMode(mode, now: now);
     }
     return _lessonTimes[lesson]?.forMode(mode, now: now);
   }

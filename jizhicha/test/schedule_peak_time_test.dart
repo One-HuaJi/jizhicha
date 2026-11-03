@@ -146,9 +146,23 @@ void main() {
     });
   });
 
-  group('开关打开：其余小节完全不受影响（禁止把错峰表上午的值搬进来）', () {
-    test('显式春秋冬季模式下，第 1、2、5～11 小节与不开开关完全相同', () {
-      for (final lesson in [1, 2, 5, 6, 7, 8, 9, 10, 11]) {
+  group('开关打开：上午第 1、2 小节固定，其余小节不受影响', () {
+    // 错峰表上午第一、二节写的就是 08:10–08:55 / 09:05–09:50，冬夏一致
+    // （作者 2026-11-03 纠正："错峰表是正确的，第一大节改回 8:10"）。
+    test('第 1、2 小节固定成 08:10–08:55 / 09:05–09:50（冬夏一致）', () {
+      for (final mode in [
+        ScheduleTimeMode.springAutumnWinter,
+        ScheduleTimeMode.summer,
+      ]) {
+        expect(ScheduleTimeTable.lessonTime(1, mode, peakShift: true),
+            '08:10–08:55');
+        expect(ScheduleTimeTable.lessonTime(2, mode, peakShift: true),
+            '09:05–09:50');
+      }
+    });
+
+    test('显式春秋冬季模式下，第 5～11 小节与不开开关完全相同', () {
+      for (final lesson in [5, 6, 7, 8, 9, 10, 11]) {
         final off = ScheduleTimeTable.lessonTime(
           lesson,
           ScheduleTimeMode.springAutumnWinter,
@@ -174,10 +188,25 @@ void main() {
       );
     });
 
-    // 合同变更（作者 2026-11-03）：错峰表只有春秋冬季口径，开关打开后
-    // 整张表按春秋冬季算 —— 第一节课（及其它非 3/4 小节）冬夏同一个时间。
-    test('automatic 模式跨季节：错峰开启后全表按春秋冬季，冬夏同一时间', () {
-      for (final lesson in [1, 2, 5, 6, 7, 8, 9, 10, 11]) {
+    // 错峰表口径（作者 2026-11-03）：上午第 1、2 小节**冬夏都一样**
+    // （08:10–08:55 / 09:05–09:50）；下午（第 5 小节起）仍按季节走。
+    test('automatic 模式跨季节：错峰下上午固定、下午随季节', () {
+      for (final row in [(1, '08:10–08:55'), (2, '09:05–09:50')]) {
+        for (final now in [november, june]) {
+          expect(
+            ScheduleTimeTable.lessonTime(
+              row.$1,
+              ScheduleTimeMode.automatic,
+              now: now,
+              peakShift: true,
+            ),
+            row.$2,
+            reason: '第 ${row.$1} 小节在错峰模式下冬夏都应为 ${row.$2}',
+          );
+        }
+      }
+      // 下午跟随季节：11 月按春秋冬季、6 月按夏季。
+      for (final lesson in [5, 6, 7, 8, 9, 10, 11]) {
         expect(
           ScheduleTimeTable.lessonTime(
             lesson,
@@ -190,7 +219,7 @@ void main() {
             ScheduleTimeMode.springAutumnWinter,
             now: november,
           ),
-          reason: '第 $lesson 小节在错峰模式下应等于春秋冬季表',
+          reason: '第 $lesson 小节 11 月应按春秋冬季',
         );
         expect(
           ScheduleTimeTable.lessonTime(
@@ -201,11 +230,10 @@ void main() {
           ),
           ScheduleTimeTable.lessonTime(
             lesson,
-            ScheduleTimeMode.automatic,
-            now: november,
-            peakShift: true,
+            ScheduleTimeMode.summer,
+            now: june,
           ),
-          reason: '第 $lesson 小节 6 月与 11 月必须同一个时间',
+          reason: '第 $lesson 小节 6 月应按夏季',
         );
       }
       // 第 3、4 小节走基准组（B 组，早下课），跨季节也不变。
@@ -389,16 +417,21 @@ void main() {
       );
     });
 
-    test('第 1、2 小节在错峰开关下仍显示季节表时刻', () {
-      expect(
-        ScheduleTimeTable.formatSublessonLines(
-          '第一大节 (01,02小节)',
-          ScheduleTimeMode.springAutumnWinter,
-          includeLabels: false,
-          peakShift: true,
-        ),
-        '08:20–09:05\n09:15–10:00',
-      );
+    test('第 1、2 小节在错峰开关下显示 08:10 / 09:05（冬夏一致）', () {
+      for (final mode in [
+        ScheduleTimeMode.springAutumnWinter,
+        ScheduleTimeMode.summer,
+      ]) {
+        expect(
+          ScheduleTimeTable.formatSublessonLines(
+            '第一大节 (01,02小节)',
+            mode,
+            includeLabels: false,
+            peakShift: true,
+          ),
+          '08:10–08:55\n09:05–09:50',
+        );
+      }
     });
 
     test('课块内提示行只给 A 组：hintFor 逐行给时刻，且**不带** `03小节：` 前缀', () {
