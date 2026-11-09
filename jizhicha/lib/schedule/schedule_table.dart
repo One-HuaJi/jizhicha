@@ -267,9 +267,11 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
     ).firstMatch(time);
     final rawMain = match?.group(1) ?? time;
     final legacySub = match?.group(2) ?? '';
-    // 错峰开关打开时，节次栏「第二大节」这一格显示**基准组（B 组，早下课）**
-    // 的错峰时刻；其余小节照旧走季节表（`peakShift: false` 的那条路径）。
-    // 判据由 SchedulePeakStyle 提供（渲染与单测共用同一份）。
+    // 错峰开关打开时，**整列时刻都要按错峰口径算**（作者 2026-11-03：
+    // 错峰表上午第 1、2 小节就是 08:10–08:55 / 09:05–09:50，冬夏一致；
+    // 第 3、4 小节给基准组 B 的时刻）。所以这里必须传 `_peakShiftOn`，
+    // 不能传 `peakShiftCell` —— 后者只表示"这一格要不要显示错峰徽标"，
+    // 若拿它当计算开关，第一大节就会被算成季节表的 08:20（我踩过这个坑）。
     final peakShiftCell = SchedulePeakStyle.badgeVisible(
       enabled: _peakShiftOn,
       time: time,
@@ -278,7 +280,7 @@ mixin _ScheduleTableSection on _SchedulePageDataSection {
       time,
       _s.scheduleTimeMode,
       includeLabels: false,
-      peakShift: peakShiftCell,
+      peakShift: _peakShiftOn,
     );
     final colorScheme = Theme.of(context).colorScheme;
     // 能显示几行，由「一屏显示」的行内预算决定（_rowPlan）：
