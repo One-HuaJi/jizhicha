@@ -1,0 +1,52 @@
+# 行尾与二进制规则（2026-11-12 审计修复第③批）
+#
+# 背景：Windows 上 Git 的系统级配置是 core.autocrlf=true，同一份源码在不同
+# 机器上会被检出成 CRLF 或 LF，导致「整文件 diff」假象（AndroidManifest.xml
+# 曾因此显示 236 行改动，实际只有 4 行）。这里把规则固定进仓库，不再依赖
+# 每台机器的本地配置。
+
+* text=auto
+
+# 源码与配置：index 与工作区统一 LF
+*.dart     text eol=lf
+*.kt       text eol=lf
+*.kts      text eol=lf
+*.java     text eol=lf
+*.gradle   text eol=lf
+*.rs       text eol=lf
+*.toml     text eol=lf
+*.lock     text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.md       text eol=lf
+*.json     text eol=lf
+*.sh       text eol=lf
+
+# Windows 脚本保持 CRLF（cmd/PowerShell 对 LF 的兼容性不稳）
+*.ps1      text eol=crlf
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+
+# 二进制：禁止行尾转换，也禁止文本 diff 展开
+*.apk      binary
+*.aab      binary
+*.jar      binary
+*.dll      binary
+*.so       binary
+*.exe      binary
+*.msi      binary
+*.pdb      binary
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.webp     binary
+*.ico      binary
+*.gif      binary
+*.ttf      binary
+*.otf      binary
+*.wav      binary
+*.mp3      binary
+*.mp4      binary
+*.docx     binary
+*.xlsx     binary
+*.zip      binary
