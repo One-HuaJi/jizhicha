@@ -93,6 +93,11 @@ class _CampusNavigatorPageState extends State<CampusNavigatorPage> {
       // 后者只做 `session.disconnect()`，少了这一步，而且 busy 时会直接 return。
       await campusEnvironment.clearKeepAliveIntent();
       await CampusVpnLauncher().logout();
+      // launcher 是绕过状态机直接拆的隧道（为了 Windows 上那次网关旧会话清理），
+      // 状态机不会自己知道。这里补一次同步，把 phase / virtualIp / 源地址一起收敛
+      // 到"已断开"——否则界面继续显示"校园网在线"，最长要等一个 60 秒健康检查
+      // 周期才纠正，期间点任何同步按钮都只报"校园网尚未就绪"。
+      await campusEnvironment.detect();
       await JwxtClient().resetSession();
       if (!mounted) return;
       Navigator.of(context).pushAndRemoveUntil(

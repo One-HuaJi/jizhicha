@@ -31,6 +31,10 @@ void main() {
         resetSession: () => JwxtClient().resetSession(),
         onTunnelEstablished: (ip) => JwxtClient().setVpnSourceAddress(ip),
       );
+      // 让教务客户端能问一句"这条隧道现在还活着吗"。只依赖源地址非空，会在
+      // 原生隧道悄悄死掉时继续往一个不存在的虚拟网卡发包，错误信息完全对不上
+      // 用户的实际处境（见 JwxtClient.tunnelAlive 的注释）。
+      JwxtClient().tunnelAlive = () => campusEnvironment.acceleratorUp;
       runApp(const MyApp());
     },
     (e, st) {

@@ -521,6 +521,19 @@ class JwxtClient {
   String? _kbjcmsidCache; // 缓存从表单动态读取的节次模式ID，避免每次查询重复 GET
   String? _vpnSourceAddress;
 
+  /// 由 main.dart 注入：这条隧道**此刻**是否还算「在」。
+  ///
+  /// 只判断 [_vpnSourceAddress] 非空是不够的。地址是状态机回调写进来的，
+  /// 而原生隧道可能在两次健康检查之间死掉（驱动崩溃、系统回收前台服务、
+  /// 用户从系统设置里掐断 VPN）。那时地址还在，_vpnSourceAddress != null
+  /// 依然成立，请求就会拿一个已经不存在的虚拟网卡当源地址发包，
+  /// 底层报 EADDRNOTAVAIL，用户看到的是「验证码加载失败」这种无从下手的
+  /// 错误，而不是「校园网已断开，请重连」。
+  ///
+  /// 注入方给的是状态机的实时判断（CampusEnvironmentController.acceleratorUp）；
+  /// 未注入（测试或尚未接线）时退化为原来的「只看地址非空」。
+  bool Function()? tunnelAlive;
+
   JwxtClient._internal() {
     _dio = _newDio();
   }
@@ -599,6 +612,13 @@ class JwxtClient {
     oldDio.close(force: true);
   }
 
+  /// 仅测试用：跑一遍"隧道是否就绪"的判定，不就绪时抛出与线上一致的用户提示。
+  /// 线上从不直接调用它——它只是让守卫逻辑能在不联网的前提下被断言。
+  void debugAssertCampusTunnelReady() => _requireVerifiedCampusTunnel();
+
+  /// 当前绑定的隧道源地址；仅供诊断与测试断言使用。
+  String? get vpnSourceAddress => _vpnSourceAddress;
+
   HttpClient _newDirectHttpClient() {
     final client = HttpClient();
     client.connectionTimeout = const Duration(seconds: 8);
@@ -631,6 +651,12 @@ class JwxtClient {
   /// pinned Gateway certificate and assigned a tunnel source address. The
   /// HTTP packets then travel inside that verified encrypted tunnel.
   void _requireVerifiedCampusTunnel() {
+    final alive = tunnelAlive;
+    if (_vpnSourceAddress != null && alive != null && !alive()) {
+      // 状态机已经判定隧道不在了，但绑定地址还留着：先清掉，避免后续请求
+      // 继续绑定死掉的虚拟网卡（清除会重建传输层，见 setVpnSourceAddress）。
+      setVpnSourceAddress(null);
+    }
     if (_vpnSourceAddress == null) {
       // 用户视角只需要知道"校园网没就绪、要重新连"，不需要"网关身份校验""隧道"
       // 这些实现概念。
