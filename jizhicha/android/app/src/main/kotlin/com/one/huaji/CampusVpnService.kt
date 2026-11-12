@@ -335,6 +335,19 @@ class CampusVpnService : VpnService() {
                     if (prefix in 1..32) builder.addRoute(address, prefix)
                 }
             }
+            // DNS：NC 下发的服务器必须显式加进 Builder。否则 Android 会继续用
+            // 系统默认 resolver，而 VPN 路由生效后它多半已不可达 —— 用户看到的是
+            // 「隧道已连接但所有域名解析失败」。搜索域（dns_suffix）在
+            // VpnService.Builder 上没有对应 API，这里**明确不支持**，不装作支持。
+            val dnsServers = status.optJSONArray("dns_servers")
+            if (dnsServers != null) {
+                for (index in 0 until dnsServers.length()) {
+                    val server = dnsServers.optString(index)
+                    if (server.isBlank()) continue
+                    runCatching { builder.addDnsServer(server) }
+                        .onFailure { android.util.Log.w(TAG, "ignoring invalid DNS server from Gateway") }
+                }
+            }
             val descriptor = builder.establish()
                 ?: throw IllegalStateException("Android system network permission was not granted")
             val fd = descriptor.detachFd()

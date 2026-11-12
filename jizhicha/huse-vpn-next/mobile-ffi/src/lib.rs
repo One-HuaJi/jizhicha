@@ -216,6 +216,10 @@ struct MobileStatus {
     virtual_ip: Option<String>,
     connected_since: Option<String>,
     routes: Vec<String>,
+    /// DNS servers handed down by NC auth. Android's `VpnService.Builder` must
+    /// be told these explicitly, otherwise the platform resolver is used over
+    /// the VPN route and every lookup fails even though the tunnel is up.
+    dns_servers: Vec<String>,
     required_route_count: usize,
     sac: Option<SacDiagnostics>,
     error: Option<String>,
@@ -235,6 +239,7 @@ impl Default for MobileStatus {
             virtual_ip: None,
             connected_since: None,
             routes: Vec::new(),
+            dns_servers: Vec::new(),
             required_route_count: REQUIRED_TARGETS.len(),
             sac: None,
             error: None,
@@ -476,6 +481,7 @@ async fn prepare_inner(
         return;
     }
     let routes = route_prefixes(&reply);
+    let dns_servers = reply.dns_servers.clone();
     let virtual_ip = reply.virtual_ip.clone();
     *state
         .session
@@ -493,6 +499,7 @@ async fn prepare_inner(
         status.username = Some(username);
         status.virtual_ip = Some(virtual_ip);
         status.routes = routes;
+        status.dns_servers = dns_servers;
         status.required_route_count = REQUIRED_TARGETS.len();
         status.error = None;
     });
@@ -525,6 +532,7 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
     let ticket = pending.ticket;
     let username = pending.username;
     let routes = route_prefixes(&reply);
+    let dns_servers = reply.dns_servers.clone();
     let virtual_ip = reply.virtual_ip.clone();
     let state = host.state.clone();
     let tunnel_session = SessionWriter::new(state.clone(), generation);
@@ -640,6 +648,7 @@ fn start_tunnel(host: &'static MobileHost, tun_fd: RawFd) -> i32 {
             virtual_ip: Some(virtual_ip),
             connected_since: Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
             routes,
+            dns_servers,
             required_route_count: REQUIRED_TARGETS.len(),
             sac,
             error: None,
