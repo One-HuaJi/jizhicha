@@ -1,7 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+
+import 'campus_map_controller.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 
 /// 校园地图地址（学校官方 GIS 站点，高德 H5，公网可达，不需要校园加速器）。
@@ -71,6 +75,9 @@ class _CampusMapPageState extends State<CampusMapPage> {
 
   bool _embedding = false;
   bool _loading = true;
+  /// 首屏迟迟不完成时给用户的提示（不是错误，只是"慢"）。
+  bool _slowHint = false;
+  Timer? _slowTimer;
   bool _locationDenied = false;
   int _progress = 0;
   String? _loadError;
@@ -85,8 +92,9 @@ class _CampusMapPageState extends State<CampusMapPage> {
       _loading = false;
       return;
     }
-    _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+    // 复用进程内的同一个 WebView（见 campus_map_controller.dart）：
+    // 第二次打开不再重新加载，直接显示上次那张图 —— 这是"打开一次后本地保存"的主要手段。
+    _controller = CampusMapController.instance.obtain(campusMapUrl)
       ..setNavigationDelegate(
         NavigationDelegate(
           onProgress: _onProgress,
@@ -102,6 +110,9 @@ class _CampusMapPageState extends State<CampusMapPage> {
 
   @override
   void dispose() {
+    _slowTimer?.cancel();
+    // 只 detach，不销毁：控制器留给下次打开复用（空闲超时才真正释放）。
+    CampusMapController.instance.release();
     _controller = null;
     super.dispose();
   }
@@ -158,13 +169,32 @@ class _CampusMapPageState extends State<CampusMapPage> {
     setState(() => _locationDenied = !granted);
   }
 
-  Future<void> _loadMap() async {
+  /// 加载地图。[force] 为 true 时强制重新拉取（下拉/刷新按钮）。
+  Future<void> _loadMap({bool force = false}) async {
     final WebViewController? controller = _controller;
     if (controller == null) return;
+    // 已经加载过且不是强制刷新 ⇒ 直接复用内存里的页面，秒开。
+    if (!force && CampusMapController.instance.isLoaded) {
+      setState(() {
+        _loading = false;
+        _progress = 100;
+        _loadError = null;
+        _slowHint = false;
+      });
+      return;
+    }
     setState(() {
       _loading = true;
       _progress = 0;
       _loadError = null;
+      _slowHint = false;
+    });
+    // 首屏要拉高德 JS SDK（约 350KB）与瓦片，出网慢时十几秒都可能。
+    // 超过 15 秒还没完成就浮出一条"慢"提示，让用户知道不是卡死。
+    _slowTimer?.cancel();
+    _slowTimer = Timer(const Duration(seconds: 15), () {
+      if (!mounted || !_loading) return;
+      setState(() => _slowHint = true);
     });
     await controller.loadRequest(Uri.parse(campusMapUrl));
   }
@@ -208,7 +238,11 @@ class _CampusMapPageState extends State<CampusMapPage> {
     if (!mounted) return;
     setState(() {
       _progress = progress;
-      if (progress >= 100) _loading = false;
+      if (progress >= 100) {
+        _loading = false;
+        _slowHint = false;
+        _slowTimer?.cancel();
+      }
     });
   }
 
@@ -221,6 +255,11 @@ class _CampusMapPageState extends State<CampusMapPage> {
   }
 
   void _onPageFinished(String url) {
+    _slowTimer?.cancel();
+    // 登记"已经加载过"，下次进页面直接复用。
+    if (isCampusMapHost(Uri.tryParse(url)?.host ?? '')) {
+      CampusMapController.instance.markLoaded(url);
+    }
     if (!mounted) return;
     // 只收掉加载指示；错误态由 _onWebResourceError 决定，不能在这里清掉。
     setState(() => _loading = false);
@@ -278,6 +317,77 @@ class _CampusMapPageState extends State<CampusMapPage> {
             child: Stack(
               children: <Widget>[
                 WebViewWidget(controller: _controller!),
+                // 加载中不要给用户一块纯白：盖一层说明 + 进度。
+                // （作者 2026-11-09："白屏""每次打开都要等好久"）
+                if (_loading && _loadError == null)
+                  Positioned.fill(
+                    child: ColoredBox(
+                      color: colorScheme.surface,
+                      child: Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            const SizedBox(
+                              width: 26,
+                              height: 26,
+                              child: CircularProgressIndicator(strokeWidth: 2.5),
+                            ),
+                            const SizedBox(height: 14),
+                            Text(
+                              '正在加载校园地图…',
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              _progress > 0
+                                  ? '已加载 $_progress%'
+                                  : '首次打开需要十几秒，之后会快很多',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: colorScheme.onSurfaceVariant
+                                    .withValues(alpha: 0.75),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                // 慢提示必须在"还在加载"时可见：_slowHint 由加载中的 15s 定时器置真，
+                // 一旦加载结束 _onPageFinished/_onProgress 就会把它清掉。
+                if (_slowHint && _loadError == null)
+                  Positioned(
+                    left: 12,
+                    right: 12,
+                    bottom: 12,
+                    child: Material(
+                      color: colorScheme.secondaryContainer,
+                      borderRadius: BorderRadius.circular(10),
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                        child: Row(
+                          children: <Widget>[
+                            Expanded(
+                              child: Text(
+                                '地图加载较慢，可以稍等，或用浏览器打开',
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  color: colorScheme.onSecondaryContainer,
+                                ),
+                              ),
+                            ),
+                            TextButton(
+                              onPressed: _openInBrowser,
+                              child: const Text('浏览器打开'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
                 if (_loadError != null)
                   Positioned.fill(
                     child: ColoredBox(
@@ -287,7 +397,7 @@ class _CampusMapPageState extends State<CampusMapPage> {
                         title: '地图加载失败',
                         message: _loadError!,
                         primaryLabel: '重试',
-                        onPrimary: _loadMap,
+                        onPrimary: () => _loadMap(force: true),
                         onSecondary: _openInBrowser,
                       ),
                     ),
