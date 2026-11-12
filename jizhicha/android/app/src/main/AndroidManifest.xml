@@ -55,8 +55,12 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="school accelerator tunnel" />
         </service>
+        <!-- 小组件当前**禁用**（作者 2026-11-09：「没删的话保持禁用吧」）。
+             代码与 AppWidget 实现都保留，只把 receiver 关掉：系统小组件选择器里
+             不再出现「稽之查·下一节课」，用户也加不出来。以后要用改回 true 即可。 -->
         <receiver
             android:name=".AppWidget"
+            android:enabled="false"
             android:exported="true"
             android:label="稽之查·下一节课">
             <intent-filter>
