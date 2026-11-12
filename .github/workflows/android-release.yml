@@ -1,0 +1,133 @@
+name: android-release
+
+# 发布前守卫：真的把 release APK 构建出来，再从产物里读 versionCode / ABI / 签名证书。
+# 只做静态 grep 的守卫挡不住「versionCode 没涨」「签名回落到 debug key」这类事故，
+# 因为它们只在构建产物里才看得见。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # 便宜的先跑：版本号三处一致性。任何一处忘了改，下面的重活就没必要做。
+  guard-version-metadata:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: pubspec 版本与 update_check.dart 必须一致
+        run: |
+          set -euo pipefail
+          pubspec_version=$(sed -n 's/^version:[[:space:]]*\([^+]*\)+\([0-9][0-9]*\).*/\1 \2/p' jizhicha/pubspec.yaml)
+          if [ -z "$pubspec_version" ]; then
+            echo "::error file=jizhicha/pubspec.yaml::找不到 version: X.Y.Z+N 形式的版本号"
+            exit 1
+          fi
+          version_name=${pubspec_version% *}
+          version_code=${pubspec_version#* }
+          echo "pubspec: versionName=$version_name versionCode=$version_code"
+          grep -q "currentAppVersion = '$version_name'" jizhicha/lib/update_check.dart || {
+            echo "::error file=jizhicha/lib/update_check.dart::currentAppVersion 与 pubspec 的 $version_name 不一致，更新检查会误报"
+            exit 1
+          }
+          {
+            echo "version_name=$version_name"
+            echo "version_code=$version_code"
+          } >> "$GITHUB_ENV"
+
+  build-and-verify:
+    needs: guard-version-metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.8'
+          channel: stable
+          cache: true
+
+      # rust-toolchain.toml 已固定 1.98.1 与 4 个 target，这里显式再装一次，
+      # 免得未来 rustup 对 toolchain 文件的解析差异让 CI 静默用错版本。
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.98.1'
+          targets: aarch64-linux-android
+
+      - uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 平台 / build-tools / NDK
+        run: |
+          set -euo pipefail
+          # 版本必须与 jizhicha/android/app/build.gradle.kts 的 compileSdk 和
+          # Flutter 3.44.8 的 flutter.ndkVersion 对齐，否则 Gradle 会在配置阶段失败。
+          sdkmanager --install "platforms;android-37" "build-tools;36.0.0" "ndk;28.2.13676358" > /dev/null
+          yes | sdkmanager --licenses > /dev/null
+
+      # GITHUB_ENV 是按 job 隔离的，上一个 job 导出的版本号在这里读不到，重算一次。
+      - name: 读出本次构建的版本号
+        run: |
+          set -euo pipefail
+          read -r version_name version_code <<< "$(sed -n 's/^version:[[:space:]]*\([^+]*\)+\([0-9][0-9]*\).*/\1 \2/p' jizhicha/pubspec.yaml)"
+          {
+            echo "version_name=$version_name"
+            echo "version_code=$version_code"
+          } >> "$GITHUB_ENV"
+          echo "构建版本：$version_name ($version_code)"
+
+      - name: 预取依赖（锁文件为准）
+        working-directory: jizhicha
+        run: flutter pub get --enforce-lockfile
+
+      # CI 没有正式签名密钥，也不该有。生成一次性密钥只为验证「签名配置这条路能跑通」，
+      # 并让 apksigner 的证书指纹有确定的期望值：若 release 签名静默回落到 debug key，
+      # 指纹对不上，这一步就会失败。
+      - name: 生成一次性 CI 签名密钥
+        run: |
+          set -euo pipefail
+          store_pass="$(openssl rand -hex 16)"
+          {
+            echo "JIZHICHA_KEYSTORE_FILE=$PWD/ci-release.jks"
+            echo "JIZHICHA_STORE_PASSWORD=$store_pass"
+            echo "JIZHICHA_KEY_ALIAS=ci"
+            echo "JIZHICHA_KEY_PASSWORD=$store_pass"
+          } >> "$GITHUB_ENV"
+          keytool -genkeypair -v -keystore ci-release.jks -storetype PKCS12 \
+            -alias ci -keyalg RSA -keysize 2048 -validity 3650 \
+            -storepass "$store_pass" -keypass "$store_pass" \
+            -dname "CN=CI Only, O=jizhicha, C=CN" > /dev/null
+          # 证书 SHA-256 指纹（DER），与 apksigner 打印的 digest 是同一个东西。
+          cert_sha256="$(keytool -exportcert -rfc -keystore ci-release.jks -alias ci -storepass "$store_pass" \
+            | openssl x509 -outform der | openssl dgst -sha256 -r | cut -d' ' -f1 | tr 'a-f' 'A-F')"
+          echo "CI_CERT_SHA256=$cert_sha256" >> "$GITHUB_ENV"
+
+      - name: 构建 release APK（仅 arm64-v8a）
+        working-directory: jizhicha
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: 校验 APK 元数据与签名
+        run: |
+          set -euo pipefail
+          pwsh -NoProfile -File tool/verify_release_apk.ps1 \
+            -Apk "jizhicha/build/app/outputs/flutter-apk/app-release.apk" \
+            -ExpectedVersionName "$version_name" \
+            -ExpectedVersionCode "$version_code" \
+            -ExpectedCertSha256 "$CI_CERT_SHA256"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-release-apk
+          path: jizhicha/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: ignore
+          retention-days: 7
