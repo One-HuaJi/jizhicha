@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:jizhicha/campus_map_controller.dart';
 import 'package:jizhicha/campus_map_page.dart';
 import 'package:jizhicha/more_page.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -22,6 +23,24 @@ void main() {
       // 这两个字面量必须与 CampusMapGeolocation.kt 完全一致，写成断言防走样。
       expect(campusMapChannelName, 'com.one.huaji/campus_map');
       expect(campusMapHostSuffix, 'huse.edu.cn');
+    });
+  });
+
+  group('CampusMapController（进程内复用 / 预热）', () {
+    test('没有 WebView 平台时预热是安全空转', () async {
+      // 测试环境 WebViewPlatform.instance == null，预热必须直接返回，
+      // 不能去构造 WebViewController（那会抛 UnsupportedError）。
+      await CampusMapController.instance.prewarm(campusMapUrl);
+      expect(CampusMapController.instance.isLoaded, isFalse);
+      expect(CampusMapController.instance.isLoading, isFalse);
+    });
+
+    test('空闲保留时间够长，切出去回来不重载', () {
+      expect(
+        CampusMapController.idleTtl >= const Duration(minutes: 20),
+        isTrue,
+        reason: '太短会退化成每次进来都从白屏重新加载',
+      );
     });
   });
 

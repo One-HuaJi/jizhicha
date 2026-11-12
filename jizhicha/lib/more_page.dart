@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'campus_map_controller.dart';
 import 'campus_map_page.dart';
 import 'fitness.dart';
 import 'zongce_page.dart';
@@ -26,8 +27,24 @@ void _showComingSoon(BuildContext context) {
 }
 
 /// 更多工具页：体测计算器 + 后续规划中的实用工具入口。
-class MorePage extends StatelessWidget {
+class MorePage extends StatefulWidget {
   const MorePage({super.key});
+
+  @override
+  State<MorePage> createState() => _MorePageState();
+}
+
+class _MorePageState extends State<MorePage> {
+  @override
+  void initState() {
+    super.initState();
+    // 「更多」是进入校园地图的**唯一**入口，用户进来后通常还要找一下才点地图。
+    // 趁这几秒在后台把地图 WebView 建好、请求发出去，点进去时往往已经画完；
+    // 没有 WebView 平台实现（Windows / 单测）时 prewarm 内部会直接返回。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      CampusMapController.instance.prewarm(campusMapUrl);
+    });
+  }
 
   @override
   Widget build(BuildContext context) {

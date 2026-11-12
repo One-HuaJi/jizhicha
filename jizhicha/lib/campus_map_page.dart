@@ -92,6 +92,9 @@ class _CampusMapPageState extends State<CampusMapPage> {
       _loading = false;
       return;
     }
+    // 进程里已经有一张加载好的图（上次进来过，或「更多」页预热过）⇒ 不要先闪一层
+    // 骨架再收掉，直接显示。
+    _loading = !CampusMapController.instance.isLoaded;
     // 复用进程内的同一个 WebView（见 campus_map_controller.dart）：
     // 第二次打开不再重新加载，直接显示上次那张图 —— 这是"打开一次后本地保存"的主要手段。
     _controller = CampusMapController.instance.obtain(campusMapUrl)
@@ -173,8 +176,9 @@ class _CampusMapPageState extends State<CampusMapPage> {
   Future<void> _loadMap({bool force = false}) async {
     final WebViewController? controller = _controller;
     if (controller == null) return;
+    final CampusMapController cache = CampusMapController.instance;
     // 已经加载过且不是强制刷新 ⇒ 直接复用内存里的页面，秒开。
-    if (!force && CampusMapController.instance.isLoaded) {
+    if (!force && cache.isLoaded) {
       setState(() {
         _loading = false;
         _progress = 100;
@@ -189,14 +193,22 @@ class _CampusMapPageState extends State<CampusMapPage> {
       _loadError = null;
       _slowHint = false;
     });
-    // 首屏要拉高德 JS SDK（约 350KB）与瓦片，出网慢时十几秒都可能。
-    // 超过 15 秒还没完成就浮出一条"慢"提示，让用户知道不是卡死。
+    _startSlowTimer();
+    // 预热（「更多」页发起）还没跑完：不要重复 loadRequest，那会把它推倒重来。
+    // 页面的回调是在控制器上注册的，加载完成时照样会收到 onPageFinished。
+    if (!force && cache.isLoading) return;
+    cache.noteRequest(campusMapUrl);
+    await controller.loadRequest(Uri.parse(campusMapUrl));
+  }
+
+  /// 首屏要拉高德 JS SDK（约 350KB）与瓦片，出网慢时十几秒都可能。
+  /// 超过 15 秒还没完成就浮出一条"慢"提示，让用户知道不是卡死。
+  void _startSlowTimer() {
     _slowTimer?.cancel();
     _slowTimer = Timer(const Duration(seconds: 15), () {
       if (!mounted || !_loading) return;
       setState(() => _slowHint = true);
     });
-    await controller.loadRequest(Uri.parse(campusMapUrl));
   }
 
   Future<void> _refresh() async {
