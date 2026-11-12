@@ -11,6 +11,12 @@ pub mod tunnel;
 #[cfg(target_os = "android")]
 pub mod tunnel_android;
 
+/// Descriptor flags for OS handles passed in from the platform layer. Only
+/// Unix targets have `fcntl`; Android is the only caller, but keeping the
+/// helper compiled on every Unix target lets CI test it on Linux.
+#[cfg(unix)]
+pub mod tun_fd;
+
 pub use error::{HuseVpnError, Result};
 
 /// Whether verbose packet/record telemetry is enabled.

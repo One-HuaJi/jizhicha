@@ -18,7 +18,16 @@ use tokio::io::unix::AsyncFd;
 /// closes. `tun_fd` is an owned descriptor detached from a
 /// `ParcelFileDescriptor`; this function takes responsibility for closing it.
 pub async fn run_android_tunnel(tls: RawTlsClient, tun_fd: RawFd) -> Result<()> {
+    // Take ownership first: every early return below must close the descriptor
+    // exactly once (Kotlin has already detached it from its ParcelFileDescriptor).
     let tun = unsafe { File::from_raw_fd(tun_fd) };
+    // `AsyncFd` needs a non-blocking descriptor. Kotlin's `detachFd()` hands
+    // over a blocking one, and registering that with epoll lets a single `read`
+    // with no packet ready park the runtime worker thread — taking the downlink
+    // with it. Set the flag before the descriptor is watched.
+    crate::tun_fd::set_nonblocking(tun.as_raw_fd()).map_err(|error| {
+        HuseVpnError::Tunnel(format!("failed to make Android TUN non-blocking: {error}"))
+    })?;
     let tun_reader = AsyncFd::new(tun.try_clone().map_err(|error| {
         HuseVpnError::Tunnel(format!("failed to duplicate Android TUN: {error}"))
     })?)

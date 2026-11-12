@@ -552,6 +552,19 @@ fn encrypt_fragments(
     (out, used)
 }
 
+/// Convert a value that goes on the wire as a 16-bit length field without
+/// ever truncating it.
+///
+/// `as u16` silently wraps: a wrapped record length desynchronizes the peer's
+/// record parser permanently (it then reads the next record's ciphertext as
+/// this record's body). The only reason this cannot fire in practice is that
+/// every caller pre-fragments to `MAX_TLS_PLAINTEXT`, so the invariant is
+/// asserted rather than assumed.
+fn wire_u16(len: usize, what: &str) -> u16 {
+    u16::try_from(len)
+        .unwrap_or_else(|_| panic!("{what} length {len} does not fit its 16-bit wire field"))
+}
+
 fn encrypt_record(
     content_type: u8,
     key: &[u8; 16],
@@ -559,7 +572,10 @@ fn encrypt_record(
     sequence: u64,
     plaintext: &[u8],
 ) -> Vec<u8> {
-    debug_assert!(
+    // `assert!` and not `debug_assert!`: release builds must not be the ones
+    // that get a wrapped record length just because a caller forgot to
+    // pre-fragment.
+    assert!(
         plaintext.len() <= MAX_TLS_PLAINTEXT,
         "encrypt_record must only receive pre-fragmented plaintext"
     );
@@ -571,7 +587,7 @@ fn encrypt_record(
     let encrypted = AesCbc::new(key).enc(&iv, &fragment);
     let mut record = vec![content_type];
     record.extend_from_slice(&V12);
-    record.extend_from_slice(&(encrypted.len() as u16).to_be_bytes());
+    record.extend_from_slice(&wire_u16(encrypted.len(), "TLS record").to_be_bytes());
     record.extend_from_slice(&encrypted);
     record
 }
@@ -672,7 +688,7 @@ fn record_mac(secret: &[u8; 20], sequence: u64, content_type: u8, plaintext: &[u
     let mut mac_input = sequence.to_be_bytes().to_vec();
     mac_input.push(content_type);
     mac_input.extend_from_slice(&V12);
-    mac_input.extend_from_slice(&(plaintext.len() as u16).to_be_bytes());
+    mac_input.extend_from_slice(&wire_u16(plaintext.len(), "TLS MAC plaintext").to_be_bytes());
     mac_input.extend_from_slice(plaintext);
     hmac_sha1(secret, &mac_input)
 }
@@ -943,7 +959,7 @@ fn bs(ty: u8, body: &[u8]) -> Vec<u8> {
 async fn wr(s: &mut TcpStream, ct: u8, body: &[u8]) -> Result<()> {
     let mut r = vec![ct];
     r.extend_from_slice(&V12);
-    r.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    r.extend_from_slice(&wire_u16(body.len(), "handshake record").to_be_bytes());
     r.extend_from_slice(body);
     s.write_all(&r)
         .await
@@ -1356,6 +1372,16 @@ mod tests {
         }
         assert_eq!(offset, records.len(), "record 必须精确首尾相接");
         assert_eq!(seen, used, "解析出的 record 数必须等于消耗的序列号数");
+    }
+
+    /// The record length is a 16-bit field. `encrypt_record` is only reachable
+    /// with pre-fragmented plaintext, and this test pins that invariant in
+    /// release builds too (`assert!`, not `debug_assert!`).
+    #[test]
+    #[should_panic(expected = "pre-fragmented")]
+    fn encrypt_record_refuses_oversized_plaintext() {
+        let oversized = vec![0u8; MAX_TLS_PLAINTEXT + 1];
+        let _ = encrypt_record(0x17, &[0u8; 16], &[0u8; 20], 0, &oversized);
     }
 
     #[test]
