@@ -79,8 +79,9 @@ jobs:
           # 版本必须与 jizhicha/android/app/build.gradle.kts 的 compileSdk 和
           # Flutter 3.44.8 的 flutter.ndkVersion 对齐，否则 Gradle 会在配置阶段失败。
           # 注意包名是 android-37.0（Android 17），写成 android-37 会找不到包。
-          "$SM" --install "platforms;android-37.0" "build-tools;36.0.0" "ndk;28.2.13676358" > /dev/null
-          yes | "$SM" --licenses > /dev/null
+          "$SM" --install "platforms;android-37.0" "build-tools;36.0.0" "ndk;28.2.13676358"
+          # yes 在 sdkmanager 退出时收到 SIGPIPE；pipefail 下不能只凭管道状态判失败。
+          yes | "$SM" --licenses > /dev/null || test "${PIPESTATUS[1]}" -eq 0
 
       # GITHUB_ENV 是按 job 隔离的，上一个 job 导出的版本号在这里读不到，重算一次。
       - name: 读出本次构建的版本号
