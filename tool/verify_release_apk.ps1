@@ -90,11 +90,15 @@ $verifyOutput = & $apksigner verify --verbose --print-certs $Apk 2>&1
 if ($LASTEXITCODE -ne 0) { Fail "apksigner verify 失败：$verifyOutput" }
 $certLine = $verifyOutput | Where-Object { $_ -match 'certificate SHA-256 digest:' } | Select-Object -First 1
 if (-not $certLine) { Fail 'apksigner 输出里没有证书 SHA-256' }
-$certSha256 = ($certLine -split ':', 2)[1].Trim().Replace(':','').ToUpperInvariant()
+# apksigner 输出的标签本身含冒号：`Signer #1 certificate SHA-256 digest: AB:CD…`。
+# 必须取**最后一个**冒号后的值；用 -split 2 会把 `CERTIFICATE SHA-256 DIGEST …` 也留下。
+$certSha256 = ($certLine -split ':')[-1].Trim().Replace(':','').ToUpperInvariant()
+if ($certSha256 -notmatch '^[0-9A-F]{64}$') { Fail "无法解析签名证书 SHA-256：$certLine" }
 Write-Host "signer SHA256: $certSha256"
 
 if (-not [string]::IsNullOrWhiteSpace($ExpectedCertSha256)) {
     $expected = $ExpectedCertSha256.Replace(':','').ToUpperInvariant()
+    if ($expected -notmatch '^[0-9A-F]{64}$') { Fail 'ExpectedCertSha256 必须是 64 位十六进制指纹。' }
     if ($certSha256 -ne $expected) { Fail "签名证书不符：期望 $expected，实际 $certSha256" }
 }
 
