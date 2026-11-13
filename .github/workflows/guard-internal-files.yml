@@ -77,6 +77,10 @@ jobs:
 
           [ "$fail" -eq 0 ] || exit 1
           echo "OK: no personal identifiers in tracked text."
+      # 扫描器自己也要有回归：单行文件的 Get-Content 标量陷阱让它曾整份漏扫，
+      # 只跑「扫描通过」是看不出这类退化的 —— 必须用已知违规夹具断言它真能拦住。
+      - name: Self-test the PII scanner
+        run: pwsh -NoProfile -File jizhicha/tool/test_check_pii.ps1
       - name: Scan commit messages for personal identifiers
         env:
           KNOWN_REAL_IDENTIFIERS: ${{ secrets.KNOWN_REAL_IDENTIFIERS }}

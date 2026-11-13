@@ -66,6 +66,7 @@ if (-not $files) {
 }
 
 $violations = New-Object System.Collections.Generic.List[string]
+$scanned = 0
 
 foreach ($rel in $files) {
     # 门禁脚本自身必然包含这些形态（它就是规则的载体），扫自己没有意义。
@@ -75,7 +76,10 @@ foreach ($rel in $files) {
     $abs = Join-Path $RepoRoot $rel
     if (-not (Test-Path -LiteralPath $abs)) { continue }
 
-    $lines = Get-Content -LiteralPath $abs -Encoding utf8
+    # 必须 @()：单行文件下 Get-Content 返回的是**字符串标量**，不是数组，
+    # 此时 $lines[$i] 会取到第 i 个字符（只有 '/'），整份文件等于没扫。
+    $lines = @(Get-Content -LiteralPath $abs -Encoding utf8)
+    $scanned++
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $line = $lines[$i]
         $lineNo = $i + 1
@@ -129,7 +133,7 @@ foreach ($rel in $files) {
 Write-Host ''
 Write-Host '=== 源码隐私门禁（按字段形态扫描已跟踪文件） ===' -ForegroundColor Cyan
 if ($violations.Count -eq 0) {
-    Write-Host ('[ OK ] 扫描 {0} 个文本文件，未发现个人数据形态。' -f $files.Count) -ForegroundColor Green
+    Write-Host ('[ OK ] 扫描 {0} 个文本文件，未发现个人数据形态。' -f $scanned) -ForegroundColor Green
     exit 0
 }
 
