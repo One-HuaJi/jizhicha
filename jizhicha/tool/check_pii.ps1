@@ -23,7 +23,10 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$RepoRoot = (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
+    [string]$RepoRoot = (Split-Path -Parent (Split-Path -Parent $PSCommandPath)),
+    # CI 用：违规只打印「路径:行号 [规则名]」，不打印命中原文。
+    # CI 日志公开可读，打印原文等于把守卫该拦下的内容又公开一次。
+    [switch]$NoValueInOutput
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,7 +69,7 @@ $violations = New-Object System.Collections.Generic.List[string]
 
 foreach ($rel in $files) {
     # 门禁脚本自身必然包含这些形态（它就是规则的载体），扫自己没有意义。
-    if ($rel -eq 'tool/check_pii.ps1') { continue }
+    if ($rel -eq 'tool/check_pii.ps1' -or $rel -like '*/tool/check_pii.ps1') { continue }
     $ext = [System.IO.Path]::GetExtension($rel).ToLowerInvariant()
     if ($TextExtensions -notcontains $ext) { continue }
     $abs = Join-Path $RepoRoot $rel
@@ -97,7 +100,11 @@ foreach ($rel in $files) {
                     }
                 }
                 if (-not $ok) {
-                    $violations.Add(('{0}:{1}: [{2}] {3}' -f $rel, $lineNo, $rule['Name'], $hit))
+                    if ($NoValueInOutput) {
+                        $violations.Add(('{0}:{1}: [{2}]' -f $rel, $lineNo, $rule['Name']))
+                    } else {
+                        $violations.Add(('{0}:{1}: [{2}] {3}' -f $rel, $lineNo, $rule['Name'], $hit))
+                    }
                 }
             }
         }
@@ -108,7 +115,11 @@ foreach ($rel in $files) {
             foreach ($n in $names) {
                 $n = $n.Trim()
                 if ($n -and ($AllowedTeacherNames -notcontains $n)) {
-                    $violations.Add(('{0}:{1}: [teacher-name] {2}' -f $rel, $lineNo, $n))
+                    if ($NoValueInOutput) {
+                        $violations.Add(('{0}:{1}: [teacher-name]' -f $rel, $lineNo))
+                    } else {
+                        $violations.Add(('{0}:{1}: [teacher-name] {2}' -f $rel, $lineNo, $n))
+                    }
                 }
             }
         }

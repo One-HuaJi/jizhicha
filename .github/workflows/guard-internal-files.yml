@@ -64,22 +64,14 @@ jobs:
             echo "::notice::KNOWN_REAL_IDENTIFIERS 未配置，跳过「已知标识硬拦」（形态扫描仍然生效）。"
           fi
 
-          # 2) 形如学号的 12 位数字，排除已文档化的合成占位号段
-          #    2024000000xx（测试 fixture 使用），避免误报合法占位数据。
-          ids="$(git grep -nIE '2024[0-9]{8}' -- . ':(exclude).github/workflows/*' \
-                 | grep -vE '2024000000[0-9]{2}' || true)"
-          if [ -n "$ids" ]; then
-            echo "::error::Student-ID-shaped values outside the 2024000000xx placeholder block, in:"
-            echo "$ids" | cut -d: -f1 | sort -u
-            fail=1
-          fi
-
-          # 3) 班级名形态，排除已文档化的示例班（生教2401班）。
-          cls="$(git grep -nIE '生教[0-9]{4}班' -- . ':(exclude).github/workflows/*' \
-                 | grep -vE '生教2401班' || true)"
-          if [ -n "$cls" ]; then
-            echo "::error::Class-name-shaped values outside the documented example, in:"
-            echo "$cls" | cut -d: -f1 | sort -u
+          # 2)+3) 形态扫描（学号 / 班级 / 会话 IP / 本机路径 / 房号 / 教师名）统一交给
+          #    jizhicha/tool/check_pii.ps1 —— 与本地 `pwsh -File tool/check_pii.ps1` 同一份规则。
+          #    以前这里内联了两条 grep，排除号段写的是 2024000000xx，而脚本的允许号段是
+          #    2024000xxxxx；测试夹具 2024000001xx 落在两者之间，于是本地门禁通过、CI 长期红
+          #    （2026-11-13 定位并修）。规则只留一份，避免再次漂移。
+          #    -NoValueInOutput：日志里只出现「路径:行号 [规则名]」，不出现命中原文。
+          if ! pwsh -NoProfile -File jizhicha/tool/check_pii.ps1 -NoValueInOutput; then
+            echo "::error::Personal-identifier-shaped values found in tracked text (paths listed above)."
             fail=1
           fi
 
