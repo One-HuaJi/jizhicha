@@ -18,6 +18,22 @@ const String campusMapHostSuffix = 'huse.edu.cn';
 /// 通信的 Channel 名。必须是两端字面量一致。
 const String campusMapChannelName = 'com.one.huaji/campus_map';
 
+/// 页面内看门狗回报用的 JS Channel 名。
+///
+/// 为什么需要它（2026-11-12 实测）：站点 HTML 本身是 200，但页内数据接口
+/// `cmccr-server` 会挂满 60 秒再回 404/504，前端把全屏加载遮罩一直挂着 ——
+/// WebView 视角"页面加载完成"，用户视角是**一片白**。
+/// 所以 `onPageFinished` 之后要注入一段探测脚本，把"页面到了但地图没渲染"回报上来，
+/// 否则我们只能一直转圈到用户自己退出。
+const String campusMapJsChannel = 'CampusMapBridge';
+
+/// 看门狗消息前缀（脚本回报形如 `stalled:overlay`）。
+const String campusMapStallPrefix = 'stalled';
+
+/// 这条 JS 消息是不是「页面到了但地图没渲染」的卡死信号。
+bool isCampusMapStallSignal(String message) =>
+    message.startsWith(campusMapStallPrefix);
+
 /// 主机是否属于学校域名（`huse.edu.cn` 或其子域）。
 ///
 /// 单独抽成纯函数是为了可单测：它是「应用内导航白名单」和「原生层定位放行白名单」
@@ -78,6 +94,10 @@ class _CampusMapPageState extends State<CampusMapPage> {
   /// 首屏迟迟不完成时给用户的提示（不是错误，只是"慢"）。
   bool _slowHint = false;
   Timer? _slowTimer;
+  /// 整页硬超时：连 `onPageFinished` 都不来（DNS 挂住 / TCP 半开）时的兜底。
+  Timer? _hardTimeout;
+  /// 已经注入过看门狗，避免重复注入。
+  bool _watchdogInstalled = false;
   bool _locationDenied = false;
   int _progress = 0;
   String? _loadError;
@@ -98,6 +118,10 @@ class _CampusMapPageState extends State<CampusMapPage> {
     // 复用进程内的同一个 WebView（见 campus_map_controller.dart）：
     // 第二次打开不再重新加载，直接显示上次那张图 —— 这是"打开一次后本地保存"的主要手段。
     _controller = CampusMapController.instance.obtain(campusMapUrl)
+      ..addJavaScriptChannel(
+        campusMapJsChannel,
+        onMessageReceived: _onWebMessage,
+      )
       ..setNavigationDelegate(
         NavigationDelegate(
           onProgress: _onProgress,
@@ -114,6 +138,7 @@ class _CampusMapPageState extends State<CampusMapPage> {
   @override
   void dispose() {
     _slowTimer?.cancel();
+    _hardTimeout?.cancel();
     // 只 detach，不销毁：控制器留给下次打开复用（空闲超时才真正释放）。
     CampusMapController.instance.release();
     _controller = null;
@@ -179,6 +204,8 @@ class _CampusMapPageState extends State<CampusMapPage> {
     final CampusMapController cache = CampusMapController.instance;
     // 已经加载过且不是强制刷新 ⇒ 直接复用内存里的页面，秒开。
     if (!force && cache.isLoaded) {
+      _slowTimer?.cancel();
+      _hardTimeout?.cancel();
       setState(() {
         _loading = false;
         _progress = 100;
@@ -187,6 +214,7 @@ class _CampusMapPageState extends State<CampusMapPage> {
       });
       return;
     }
+    _watchdogInstalled = false;
     setState(() {
       _loading = true;
       _progress = 0;
@@ -194,6 +222,7 @@ class _CampusMapPageState extends State<CampusMapPage> {
       _slowHint = false;
     });
     _startSlowTimer();
+    _startHardTimeout();
     // 预热（「更多」页发起）还没跑完：不要重复 loadRequest，那会把它推倒重来。
     // 页面的回调是在控制器上注册的，加载完成时照样会收到 onPageFinished。
     if (!force && cache.isLoading) return;
@@ -211,14 +240,94 @@ class _CampusMapPageState extends State<CampusMapPage> {
     });
   }
 
+  /// 整页硬超时：45 秒还没 `onPageFinished` 就认定失败，不再无限转圈。
+  void _startHardTimeout() {
+    _hardTimeout?.cancel();
+    _hardTimeout = Timer(const Duration(seconds: 45), () {
+      if (!mounted || !_loading) return;
+      _hardTimeout = null;
+      setState(() {
+        _loading = false;
+        _loadError = '地图加载超时（45 秒内没有完成）。'
+            '学校地图服务器可能不稳定，请稍后重试，或用系统浏览器打开。';
+      });
+    });
+  }
+
+  /// 页面加载完成后注入看门狗：确认地图真的渲染出来了。
+  ///
+  /// 站点最坑的一点是"HTML 到了但地图没到"：数据接口挂了以后，前端把全屏遮罩
+  /// 一直挂着，`onPageFinished` 却照常触发 —— 只靠 WebView 回调发现不了白屏。
+  /// 这里每 500ms 探一次，15 秒仍看不到画布/遮罩没撤，就回报 `stalled:*`。
+  Future<void> _installStallWatchdog() async {
+    final WebViewController? controller = _controller;
+    if (controller == null) return;
+    if (_watchdogInstalled) return;
+    _watchdogInstalled = true;
+    const String script = '''
+(function () {
+  if (window.__jzStallWatch) return;
+  window.__jzStallWatch = true;
+  var ticks = 0;
+  var timer = setInterval(function () {
+    ticks += 1;
+    var map = document.querySelector('canvas, .amap-container, .amap-maps');
+    if (map) { clearInterval(timer); return; }
+    var overlay = null;
+    var nodes = document.querySelectorAll('div');
+    for (var i = 0; i < nodes.length; i++) {
+      var s = nodes[i].style;
+      if (s && s.position === 'fixed' && (s.zIndex === '999' || s.zIndex === '9999')) {
+        if (getComputedStyle(nodes[i]).display !== 'none') { overlay = nodes[i]; break; }
+      }
+    }
+    var text = (document.body.innerText || '').trim();
+    if (ticks >= 30 && overlay) {
+      clearInterval(timer);
+      window.$campusMapJsChannel.postMessage('$campusMapStallPrefix:overlay');
+      return;
+    }
+    if (ticks >= 30 && text.length < 40) {
+      clearInterval(timer);
+      window.$campusMapJsChannel.postMessage('$campusMapStallPrefix:empty');
+      return;
+    }
+    if (ticks > 120) clearInterval(timer);
+  }, 500);
+})();
+''';
+    try {
+      await controller.runJavaScript(script);
+    } on Exception {
+      // 注入失败不影响浏览（只是没有白屏探测）。
+    }
+  }
+
+  /// 接收页面内看门狗的消息。
+  void _onWebMessage(JavaScriptMessage message) {
+    if (!mounted) return;
+    if (!isCampusMapStallSignal(message.message)) return;
+    if (_loadError != null) return;
+    setState(() {
+      _loading = false;
+      _slowHint = false;
+      _loadError = '地图页面已经打开，但学校站点的数据接口没有响应，'
+          '地图没有渲染出来（不是你的网络问题）。'
+          '请稍后重试，或用系统浏览器打开。';
+    });
+  }
+
   Future<void> _refresh() async {
     final WebViewController? controller = _controller;
     if (controller == null) return;
+    _watchdogInstalled = false;
     setState(() {
       _loading = true;
       _progress = 0;
       _loadError = null;
     });
+    _startSlowTimer();
+    _startHardTimeout();
     await controller.reload();
   }
 
@@ -254,6 +363,7 @@ class _CampusMapPageState extends State<CampusMapPage> {
         _loading = false;
         _slowHint = false;
         _slowTimer?.cancel();
+        _hardTimeout?.cancel();
       }
     });
   }
@@ -268,6 +378,7 @@ class _CampusMapPageState extends State<CampusMapPage> {
 
   void _onPageFinished(String url) {
     _slowTimer?.cancel();
+    _hardTimeout?.cancel();
     // 登记"已经加载过"，下次进页面直接复用。
     if (isCampusMapHost(Uri.tryParse(url)?.host ?? '')) {
       CampusMapController.instance.markLoaded(url);
@@ -275,6 +386,9 @@ class _CampusMapPageState extends State<CampusMapPage> {
     if (!mounted) return;
     // 只收掉加载指示；错误态由 _onWebResourceError 决定，不能在这里清掉。
     setState(() => _loading = false);
+    // 页面"到"了不等于地图"画出来了"：挂上看门狗，白屏时回报 stalled。
+    _watchdogInstalled = false;
+    unawaited(_installStallWatchdog());
   }
 
   /// 主文档加载失败才展示错误页；子资源（图片/瓦片）失败不打扰用户。

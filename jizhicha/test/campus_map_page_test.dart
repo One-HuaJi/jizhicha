@@ -26,6 +26,24 @@ void main() {
     });
   });
 
+  group('白屏看门狗信号', () {
+    test('stalled:* 视为卡死信号', () {
+      expect(isCampusMapStallSignal('stalled:overlay'), isTrue);
+      expect(isCampusMapStallSignal('stalled:empty'), isTrue);
+    });
+
+    test('其它消息不当作卡死（避免把正常交互误判成失败）', () {
+      expect(isCampusMapStallSignal(''), isFalse);
+      expect(isCampusMapStallSignal('ready'), isFalse);
+      expect(isCampusMapStallSignal(' stalled:overlay'), isFalse);
+    });
+
+    test('Channel 名与脚本前缀固定（JS 与 Dart 两侧字面量必须一致）', () {
+      expect(campusMapJsChannel, 'CampusMapBridge');
+      expect(campusMapStallPrefix, 'stalled');
+    });
+  });
+
   group('CampusMapController（进程内复用 / 预热）', () {
     test('没有 WebView 平台时预热是安全空转', () async {
       // 测试环境 WebViewPlatform.instance == null，预热必须直接返回，
